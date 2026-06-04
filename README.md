@@ -275,6 +275,75 @@ Run multiple `spanner-etcd` replicas behind a load balancer:
 
 All replicas are stateless — no coordination needed. Spanner guarantees external consistency (linearizability) across all replicas. Each replica independently reads the `kv_changes` Change Stream, so Watch events are delivered to clients of any replica within ~10–50ms of the write committing.
 
+## Multi-Region Setup
+
+Spanner supports multi-region instance configurations out of the box — no changes to spanner-etcd are needed. Just choose the right instance config when creating your Spanner instance.
+
+### Instance configs
+
+| Config | Regions | RPO | Write latency | Use case |
+|--------|---------|-----|---------------|---------|
+| `regional-asia-northeast1` | Tokyo only | 0 (single region) | ~5ms | Dev / single-zone HA |
+| `asia1` | Tokyo + Osaka | 0 (synchronous) | ~10ms | Asia multi-region |
+| `nam4` | N. Virginia + S. Carolina | 0 (synchronous) | ~10ms | US multi-region |
+| `eur3` | Belgium + Netherlands | 0 (synchronous) | ~10ms | EU multi-region |
+| `nam-eur-asia1` | US + EU + Asia | 0 (synchronous) | ~30ms | Global |
+
+Multi-region configs replicate writes synchronously across all regions before acknowledging. `RPO=0` means **zero data loss** even if an entire region fails — stronger than etcd's single-region Raft.
+
+### Creating a multi-region instance
+
+```bash
+# Asia multi-region (Tokyo + Osaka)
+gcloud spanner instances create k8s-etcd \
+  --config=asia1 \
+  --description="spanner-etcd multi-region" \
+  --processing-units=1000 \
+  --project=MY_PROJECT
+
+gcloud spanner databases create etcd \
+  --instance=k8s-etcd \
+  --project=MY_PROJECT
+```
+
+Then point spanner-etcd at it:
+
+```bash
+spanner-etcd \
+  --spanner-database=projects/MY_PROJECT/instances/k8s-etcd/databases/etcd
+```
+
+### Horizontal scaling with multi-region
+
+```
+Region: asia-northeast1 (Tokyo)          Region: asia-northeast2 (Osaka)
+┌──────────────────────────┐             ┌──────────────────────────┐
+│  spanner-etcd replica 1  │             │  spanner-etcd replica 2  │
+│  spanner-etcd replica 2  │             │  spanner-etcd replica 3  │
+└────────────┬─────────────┘             └─────────────┬────────────┘
+             │                                         │
+             └──────────────┬──────────────────────────┘
+                            │
+                   Google Cloud Spanner
+                   (asia1 multi-region)
+                   synchronous replication
+```
+
+Clients in Tokyo connect to Tokyo replicas (~1ms), clients in Osaka connect to Osaka replicas (~1ms). All replicas read from and write to the same Spanner database. Watch events via Change Streams are delivered independently per replica with ~10–50ms latency.
+
+### Processing units
+
+Spanner is billed by processing units (PUs). For Kubernetes etcd workloads:
+
+| Cluster size | Recommended PUs | Notes |
+|---|---|---|
+| < 100 nodes | 100 PUs | Minimum for regional |
+| 100–1000 nodes | 500–1000 PUs | |
+| 1000–10000 nodes | 1000–3000 PUs | |
+| 65000 nodes (GKE scale) | 5000+ PUs | Google's internal estimate |
+
+Multi-region configs have a minimum of 1000 PUs.
+
 ## Monitoring
 
 `spanner-etcd` exposes standard gRPC health check on the same port:
@@ -309,7 +378,7 @@ Slow RPCs (>500ms) are logged at `info` level with method name and elapsed time.
 - [x] Deployed and tested on GKE with real Spanner — 33/33 etcd operations pass
 - [x] Integration tests against Spanner emulator — 38 tests, full stack coverage
 - [ ] etcd auth passthrough
-- [ ] Multi-region Spanner configuration examples
+- [x] Multi-region Spanner configuration and scaling guidance
 - [ ] Spanner Change Streams for emulator (currently uses poll fallback)
 
 ## Testing
