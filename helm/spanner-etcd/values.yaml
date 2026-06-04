@@ -1,0 +1,115 @@
+# Default values for spanner-etcd.
+
+replicaCount: 3
+
+image:
+  repository: asia-docker.pkg.dev/onepoint-paas-tardis-4492/docker-paas-tardis-asia-1/spanner-etcd
+  pullPolicy: IfNotPresent
+  tag: ""  # defaults to Chart.appVersion
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Google Cloud Spanner database path.
+# Format: projects/PROJECT/instances/INSTANCE/databases/DATABASE
+spannerDatabase: ""
+
+# ServiceAccount configuration.
+# spanner-etcd authenticates to Spanner via Workload Identity Federation.
+# Two WIF modes are supported:
+#
+#   1. Direct IAM binding (no annotation needed):
+#      gcloud iam service-accounts add-iam-policy-binding GSA_EMAIL \
+#        --role=roles/iam.workloadIdentityUser \
+#        --member="serviceAccount:PROJECT.svc.id.goog[NAMESPACE/spanner-etcd]"
+#
+#   2. With GSA annotation (older GKE WIF):
+#      serviceAccount:
+#        annotations:
+#          iam.gke.io/gcp-service-account: GSA_EMAIL
+#
+serviceAccount:
+  # annotations are added verbatim to the ServiceAccount.
+  # Use this to attach a GSA via the annotation-based WIF method.
+  annotations: {}
+    # iam.gke.io/gcp-service-account: spanner-etcd@my-project.iam.gserviceaccount.com
+
+  # gsaEmail is only used to print the IAM setup hint in NOTES.txt.
+  gsaEmail: ""
+
+# TLS configuration.
+# Provide an existing Secret with keys: tls.crt, tls.key, ca.crt
+# If empty, TLS is disabled (not recommended for production).
+tls:
+  existingSecret: ""
+  # Or let the chart create a self-signed cert (dev only):
+  selfSigned: false
+
+# etcd gRPC listen address.
+listenAddr: "0.0.0.0:2379"
+
+# Prometheus metrics HTTP listen address.
+metricsAddr: "0.0.0.0:2381"
+
+# Log level: debug | info | warn | error
+logLevel: info
+
+service:
+  type: ClusterIP
+  port: 2379
+  metricsPort: 2381
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  fsGroup: 65534
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+# Affinity rules to spread replicas across nodes/zones.
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: spanner-etcd
+          topologyKey: topology.kubernetes.io/zone
+
+nodeSelector: {}
+tolerations: []
+
+# ServiceMonitor for Prometheus Operator.
+serviceMonitor:
+  enabled: false
+  namespace: ""
+  interval: 30s
+  scrapeTimeout: 10s
+  additionalLabels: {}
+
+# PodDisruptionBudget — keep at least 2 replicas available during disruptions.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2

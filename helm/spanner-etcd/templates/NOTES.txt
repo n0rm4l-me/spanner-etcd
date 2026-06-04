@@ -1,0 +1,27 @@
+spanner-etcd has been deployed.
+
+etcd endpoint:
+  {{ include "spanner-etcd.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+
+Metrics:
+  {{ include "spanner-etcd.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.metricsPort }}/metrics
+
+{{- if .Values.serviceAccount.gsaEmail }}
+
+Workload Identity setup (run once):
+  gcloud iam service-accounts add-iam-policy-binding \
+    {{ .Values.serviceAccount.gsaEmail }} \
+    --role=roles/iam.workloadIdentityUser \
+    --member="serviceAccount:PROJECT.svc.id.goog[{{ .Release.Namespace }}/{{ include "spanner-etcd.fullname" . }}]"
+
+  gcloud projects add-iam-policy-binding PROJECT \
+    --member="serviceAccount:{{ .Values.serviceAccount.gsaEmail }}" \
+    --role=roles/spanner.databaseUser
+{{- end }}
+
+{{- if not .Values.tls.existingSecret }}
+
+WARNING: TLS is not configured. For production, provide:
+  --set tls.existingSecret=my-tls-secret
+The Secret must contain: tls.crt, tls.key, ca.crt
+{{- end }}

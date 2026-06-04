@@ -1,5 +1,5 @@
-# Binary
-spanner-etcd
+# Binary (root-level only, not helm chart subdirectory)
+/spanner-etcd
 /cmd/server/spanner-etcd
 
 # TLS certificates (never commit private keys)

@@ -1,0 +1,16 @@
+apiVersion: v2
+name: spanner-etcd
+description: etcd v3 API server backed by Google Cloud Spanner
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - etcd
+  - spanner
+  - kubernetes
+  - storage
+home: https://github.com/n0rm4l-me/spanner-etcd
+sources:
+  - https://github.com/n0rm4l-me/spanner-etcd
+maintainers:
+  - name: PaaS Team
