@@ -126,7 +126,19 @@ CREATE TABLE kv_cs_cursors (
 
 **Append-only log**: Like etcd, we never update rows in `kv`. Each write appends a new row. Compaction physically deletes old rows asynchronously.
 
-**Change Streams for Watch**: Instead of polling every second, each replica opens a long-lived streaming SQL query per partition of `kv_changes`. Spanner pushes records as writes commit (~10–50ms). Partition cursors are flushed to `kv_cs_cursors` every 5s so replicas resume from the correct position after a restart. The poll loop (1s) runs in parallel during the transition window and as a fallback when Change Streams are unavailable (emulator, older instances).
+**Change Streams for Watch**: Instead of polling every second, each replica opens a long-lived streaming SQL query per partition of `kv_changes`. Spanner pushes records as writes commit (~10–50ms). The initial query uses `NULL` partition token to discover active partitions; subsequent queries use tokens returned in `ChildPartitionsRecord` entries. Partition cursors are flushed to `kv_cs_cursors` every 5s so replicas resume from the correct position after a restart.
+
+The poll loop (1s) runs in parallel as a safety net during the Change Stream startup window (first 10s) and falls back automatically when Change Streams are unavailable (Spanner emulator does not support the TVF).
+
+**Change Stream SQL syntax** (real Spanner only):
+```sql
+-- Initial: NULL token discovers partitions
+SELECT ChangeRecord FROM READ_kv_changes(@start, NULL, NULL, @heartbeat_ms)
+
+-- Per-partition streaming read (token from ChildPartitionsRecord)
+SELECT ChangeRecord FROM READ_kv_changes(@start, NULL, @token, @heartbeat_ms)
+```
+Must be executed via `client.Single().Query()` — Spanner rejects CS queries on regular `ExecuteSql`.
 
 ## Performance
 
@@ -272,7 +284,7 @@ Slow RPCs (>500ms) are logged at `info` level with method name and elapsed time.
 | Feature | etcd | spanner-etcd |
 |---------|------|-------------|
 | Watch latency | <10ms | ~10–50ms (Change Streams) |
-| Watch latency (emulator) | <10ms | ~1s (poll fallback) |
+| Watch latency (emulator) | <10ms | ~1s (poll, CS not supported) |
 | Lease keepalive | Streaming | Streaming ✅ |
 | DeleteRange (bare gRPC) | ✅ | Via Txn only |
 | Defrag / Snapshot | ✅ | Not implemented |
@@ -280,11 +292,14 @@ Slow RPCs (>500ms) are logged at `info` level with method name and elapsed time.
 
 ### Roadmap
 
-- [x] Spanner Change Streams for sub-second Watch latency
-- [ ] Prometheus metrics endpoint
-- [ ] Helm chart for Kubernetes deployment
+- [x] Spanner Change Streams for sub-second Watch latency (10–50ms, real Spanner)
+- [x] Prometheus metrics (`/metrics` on `:2381`)
+- [x] Helm chart with WIF, PDB, HPA, ServiceMonitor
+- [x] Deployed and tested on GKE with real Spanner — 33/33 etcd operations pass
+- [ ] Unit tests with Spanner emulator
 - [ ] etcd auth passthrough
 - [ ] Multi-region Spanner configuration examples
+- [ ] Spanner Change Streams for emulator (currently uses poll fallback)
 
 ## Development
 

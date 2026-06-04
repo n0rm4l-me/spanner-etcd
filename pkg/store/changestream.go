@@ -1,147 +1,72 @@
 // Package store — Change Stream reader for low-latency Watch delivery.
 //
-// # How Spanner Change Streams work
+// # Spanner Change Streams API
 //
-// A Change Stream is a logical CDC log attached to one or more tables. Spanner
-// shards it into partitions (one per Spanner split). Each partition is read via
-// a streaming SQL query that blocks until new records arrive, delivering them
-// with ~10–50 ms latency.
+// Change Streams are read via the SQL TVF READ_{stream_name}:
 //
-// Partitions are dynamic: as data volume grows Spanner splits partitions, and
-// as it shrinks it merges them. The reader must track these lifecycle events:
+//	READ_kv_changes(start_timestamp, end_timestamp, partition_token, heartbeat_millis)
 //
-//	Initial query → list of initial partition tokens
-//	Per-partition streaming read → DataChangeRecord | HeartbeatRecord | ChildPartitionsRecord
-//	ChildPartitionsRecord → stop current partition, start reading child partitions
+// The initial call uses NULL as the partition_token. Spanner returns one or more
+// ChildPartitionsRecord entries per row containing partition token strings.
+// Subsequent calls use those tokens for per-partition streaming reads.
 //
-// # Resumability
+// The query must run via client.Single().Query() which creates a single-use
+// strong read-only transaction — the only mode Spanner accepts for CS queries.
 //
-// Each partition is identified by a token and has an associated commit timestamp.
-// We persist (replica_id, partition_token, resume_timestamp) in kv_cs_cursors so
-// that after a restart the reader can resume from where it left off instead of
-// re-delivering old events.
+// # ChangeRecord decoding
 //
-// # Fan-out to Watch subscribers
-//
-// The ChangeStreamReader converts DataChangeRecords into store.Event values and
-// calls the provided dispatchFn. In watch.go, dispatchFn routes each event to
-// all matching subscriber channels. Because every spanner-etcd replica runs its
-// own reader against the same stream, scaling out does not increase Spanner load
-// linearly — each replica independently streams the same partitions.
+// The TVF column "ChangeRecord" is ARRAY<STRUCT<data_change_record, heartbeat_record,
+// child_partitions_record>>. All nested fields are also ARRAY<STRUCT> with many
+// columns that vary by Spanner version. We use spanner.GenericColumnValue to decode
+// the raw protobuf and extract only the fields we need, avoiding breakage when
+// Spanner adds new columns to the struct schema.
 package store
 
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"cloud.google.com/go/spanner"
+	sppb "cloud.google.com/go/spanner/apiv1/spannerpb"
 	"go.uber.org/zap"
 	"google.golang.org/api/iterator"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/paas/spanner-etcd/pkg/metrics"
 )
 
 const (
-	// heartbeatInterval is passed to the Change Stream query so that Spanner
-	// sends a heartbeat record even when there are no data changes.
-	// This lets us detect that a partition is alive and advance its resume cursor.
-	heartbeatInterval = 2000 // milliseconds
-
-	// cursorFlushInterval controls how often we persist resume cursors to
-	// kv_cs_cursors. Flushing on every record would add write overhead; once
-	// per flush interval is a good trade-off between durability and performance.
+	heartbeatInterval   = 2000 // ms
 	cursorFlushInterval = 5 * time.Second
-
-	// partitionWorkersBuf is the size of the channel used to hand off newly
-	// discovered child partitions to the partition manager goroutine.
 	partitionWorkersBuf = 64
 )
 
-// DispatchFunc is called for every DataChangeRecord decoded from the stream.
-// Implementations must be non-blocking or handle their own buffering.
+// DispatchFunc is called for every batch of events decoded from the stream.
 type DispatchFunc func(events []*Event)
 
-// csChangeRecord mirrors the structure Spanner returns for each row in the
-// Change Stream result set. We unmarshal the JSON column manually because the
-// Spanner Go client returns Change Stream records as a JSON string column named
-// "ChangeRecord".
-type csChangeRecord struct {
-	DataChangeRecords     []csDataChangeRecord     `json:"data_change_records"`
-	HeartbeatRecords      []csHeartbeatRecord      `json:"heartbeat_records"`
-	ChildPartitionsRecords []csChildPartitionsRecord `json:"child_partitions_records"`
-}
-
-type csDataChangeRecord struct {
-	CommitTimestamp    time.Time      `json:"commit_timestamp"`
-	RecordSequence     string         `json:"record_sequence"`
-	TableName          string         `json:"table_name"`
-	ModType            string         `json:"mod_type"` // INSERT | UPDATE | DELETE
-	ColumnTypes        []csColumnType `json:"column_types"`
-	Mods               []csMod        `json:"mods"`
-	IsLastRecordInTxn  bool           `json:"is_last_record_in_transaction_in_partition"`
-	NumberOfRecordsInTxn int64        `json:"number_of_records_in_transaction"`
-	NumberOfPartitionsInTxn int64     `json:"number_of_partitions_in_transaction"`
-	TransactionTag     string         `json:"transaction_tag"`
-}
-
-type csColumnType struct {
-	Name            string `json:"name"`
-	Type            csType `json:"type"`
-	IsPrimaryKey    bool   `json:"is_primary_key"`
-	OrdinalPosition int64  `json:"ordinal_position"`
-}
-
-type csType struct {
-	Code string `json:"code"`
-}
-
-type csMod struct {
-	Keys      map[string]interface{} `json:"keys"`
-	NewValues map[string]interface{} `json:"new_values"`
-	OldValues map[string]interface{} `json:"old_values"`
-}
-
-type csHeartbeatRecord struct {
-	Timestamp time.Time `json:"timestamp"`
-}
-
-type csChildPartitionsRecord struct {
-	StartTimestamp  time.Time        `json:"start_timestamp"`
-	RecordSequence  string           `json:"record_sequence"`
-	ChildPartitions []csChildPartition `json:"child_partitions"`
-}
-
-type csChildPartition struct {
-	Token              string   `json:"token"`
-	ParentPartitionTokens []string `json:"parent_partition_tokens"`
-}
-
-// partitionState tracks a single Change Stream partition.
+// partitionState tracks one active Change Stream partition.
 type partitionState struct {
 	token           string
 	startTimestamp  time.Time
-	resumeTimestamp time.Time // last confirmed read position
+	resumeTimestamp time.Time
 }
 
-// ChangeStreamReader reads all partitions of the kv_changes Change Stream
-// and delivers events to the provided DispatchFunc. It is safe for concurrent
-// use and handles partition splits transparently.
+// ChangeStreamReader reads all partitions of the kv_changes Change Stream.
 type ChangeStreamReader struct {
-	client     *spanner.Client
-	replicaID  string
-	dispatch   DispatchFunc
-	log        *zap.Logger
+	client    *spanner.Client
+	replicaID string
+	dispatch  DispatchFunc
+	log       *zap.Logger
 
-	mu         sync.Mutex
-	active     map[string]*partitionState // token → state
-	pending    chan *partitionState       // newly discovered partitions
-	stopCh     chan struct{}
-	stopped    chan struct{}
+	mu      sync.Mutex
+	active  map[string]*partitionState
+	pending chan *partitionState
+	stopCh  chan struct{}
+	stopped chan struct{}
 }
 
 // NewChangeStreamReader creates a reader. Call Start to begin streaming.
@@ -163,27 +88,20 @@ func NewChangeStreamReader(
 	}
 }
 
-// Start begins reading the Change Stream. It loads persisted cursors, queries
-// for initial partitions, and launches a goroutine per partition. Blocks until
-// ctx is cancelled.
+// Start begins reading the Change Stream. Blocks until ctx is cancelled.
 func (r *ChangeStreamReader) Start(ctx context.Context) error {
 	defer close(r.stopped)
 
-	// Load persisted cursors so we can resume partitions.
 	cursors, err := r.loadCursors(ctx)
 	if err != nil {
 		r.log.Warn("failed to load CS cursors, starting from now", zap.Error(err))
 		cursors = map[string]time.Time{}
 	}
 
-	// Query the Change Stream for its initial partition list.
-	startTime := time.Now().Add(-time.Second) // slight overlap to avoid missing events at startup
-	if len(cursors) > 0 {
-		// If we have cursors pick the earliest resume point so no partition is missed.
-		for _, t := range cursors {
-			if t.Before(startTime) {
-				startTime = t
-			}
+	startTime := time.Now().Add(-time.Second)
+	for _, t := range cursors {
+		if t.Before(startTime) {
+			startTime = t
 		}
 	}
 
@@ -196,7 +114,6 @@ func (r *ChangeStreamReader) Start(ctx context.Context) error {
 		zap.Time("start", startTime),
 	)
 
-	// Seed pending channel with initial partitions.
 	for _, p := range initialPartitions {
 		if resume, ok := cursors[p.token]; ok {
 			p.resumeTimestamp = resume
@@ -206,7 +123,6 @@ func (r *ChangeStreamReader) Start(ctx context.Context) error {
 		r.pending <- p
 	}
 
-	// Partition manager: spawns a goroutine per partition.
 	var wg sync.WaitGroup
 	for {
 		select {
@@ -220,7 +136,7 @@ func (r *ChangeStreamReader) Start(ctx context.Context) error {
 			r.mu.Lock()
 			if _, exists := r.active[p.token]; exists {
 				r.mu.Unlock()
-				continue // already reading this partition
+				continue
 			}
 			r.active[p.token] = p
 			r.mu.Unlock()
@@ -247,13 +163,9 @@ func (r *ChangeStreamReader) Stop() {
 	<-r.stopped
 }
 
-// readPartition streams one partition until it receives a ChildPartitionsRecord
-// (meaning this partition has been split/merged and we should read its children)
-// or ctx is cancelled.
 func (r *ChangeStreamReader) readPartition(ctx context.Context, p *partitionState) {
-	log := r.log.With(zap.String("partition", p.token[:min(8, len(p.token))]+"…"))
+	log := r.log.With(zap.String("token", shortToken(p.token)))
 	log.Debug("starting partition reader", zap.Time("resume", p.resumeTimestamp))
-
 	lastFlush := time.Now()
 
 	for {
@@ -265,42 +177,44 @@ func (r *ChangeStreamReader) readPartition(ctx context.Context, p *partitionStat
 		default:
 		}
 
-		err := r.streamPartition(ctx, p, &lastFlush)
-		if err == nil {
-			// Normal termination: ChildPartitionsRecord received, partition is done.
+		done, err := r.streamPartition(ctx, p, &lastFlush)
+		if done {
 			return
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return
 		}
-		// Transient error — backoff and retry.
-		metrics.CSPartitionRestarts.Inc()
-		log.Warn("partition read error, retrying", zap.Error(err))
-		select {
-		case <-time.After(2 * time.Second):
-		case <-ctx.Done():
-			return
-		case <-r.stopCh:
-			return
+		if err != nil {
+			metrics.CSPartitionRestarts.Inc()
+			log.Warn("partition read error, retrying", zap.Error(err))
+			select {
+			case <-time.After(2 * time.Second):
+			case <-ctx.Done():
+				return
+			case <-r.stopCh:
+				return
+			}
 		}
 	}
 }
 
-// streamPartition executes the streaming SQL query for one partition and
-// processes records until the partition ends or ctx is cancelled.
-// Returns nil when the partition is exhausted (ChildPartitionsRecord received).
-func (r *ChangeStreamReader) streamPartition(ctx context.Context, p *partitionState, lastFlush *time.Time) error {
+// streamPartition executes one streaming query for a partition.
+// Returns (done=true, nil) when the partition ends normally.
+func (r *ChangeStreamReader) streamPartition(ctx context.Context, p *partitionState, lastFlush *time.Time) (bool, error) {
+	tokenParam := spanner.NullString{Valid: false}
+	if p.token != "" {
+		tokenParam = spanner.NullString{StringVal: p.token, Valid: true}
+	}
+
 	stmt := spanner.Statement{
-		SQL: `SELECT ChangeRecord FROM READ_kv_changes(
-			start_timestamp  => @start,
-			end_timestamp    => NULL,
-			partition_token  => @token,
-			heartbeat_millis => @hb
-		)`,
+		SQL: `SELECT ChangeRecord
+		      FROM READ_kv_changes(
+		        @start_time, NULL, @partition_token, @heartbeat_millis
+		      )`,
 		Params: map[string]interface{}{
-			"start": p.resumeTimestamp,
-			"token": p.token,
-			"hb":    heartbeatInterval,
+			"start_time":      p.resumeTimestamp,
+			"partition_token": tokenParam,
+			"heartbeat_millis": int64(heartbeatInterval),
 		},
 	}
 
@@ -310,225 +224,264 @@ func (r *ChangeStreamReader) streamPartition(ctx context.Context, p *partitionSt
 	for {
 		row, err := iter.Next()
 		if errors.Is(err, iterator.Done) {
-			return nil
+			return false, nil
 		}
 		if err != nil {
-			return fmt.Errorf("next record: %w", err)
+			return false, fmt.Errorf("next: %w", err)
 		}
 
-		// The Change Stream result has a single JSON column named "ChangeRecord".
-		var jsonStr string
-		if err := row.Column(0, &jsonStr); err != nil {
-			return fmt.Errorf("decode column: %w", err)
+		// Decode via GenericColumnValue to handle evolving schema without breakage.
+		var gcv spanner.GenericColumnValue
+		if err := row.Column(0, &gcv); err != nil {
+			r.log.Warn("decode ChangeRecord column failed", zap.Error(err))
+			continue
 		}
 
-		var cr csChangeRecord
-		if err := json.Unmarshal([]byte(jsonStr), &cr); err != nil {
-			return fmt.Errorf("unmarshal change record: %w", err)
+		done, ts, events, children := r.decodeRecord(&gcv)
+		if len(events) > 0 {
+			r.dispatch(events)
 		}
-
-		// Process DataChangeRecords — these are actual kv mutations.
-		for i := range cr.DataChangeRecords {
-			events := r.convertDataRecord(&cr.DataChangeRecords[i])
-			if len(events) > 0 {
-				r.dispatch(events)
-				// Advance cursor to the commit timestamp of the last record.
-				if ts := cr.DataChangeRecords[i].CommitTimestamp; ts.After(p.resumeTimestamp) {
-					p.resumeTimestamp = ts
-				}
+		if ts.After(p.resumeTimestamp) {
+			p.resumeTimestamp = ts
+		}
+		for _, child := range children {
+			select {
+			case r.pending <- child:
+				r.log.Debug("queued child partition", zap.String("token", shortToken(child.token)))
+			case <-ctx.Done():
+				return true, nil
 			}
 		}
-
-		// Process HeartbeatRecords — advance cursor even when no data changed.
-		for i := range cr.HeartbeatRecords {
-			if ts := cr.HeartbeatRecords[i].Timestamp; ts.After(p.resumeTimestamp) {
-				p.resumeTimestamp = ts
-			}
+		if done {
+			_ = r.flushCursor(ctx, p)
+			return true, nil
 		}
 
-		// Flush cursors periodically.
 		if time.Since(*lastFlush) > cursorFlushInterval {
 			if err := r.flushCursor(ctx, p); err != nil {
 				r.log.Warn("cursor flush failed", zap.Error(err))
 			}
 			*lastFlush = time.Now()
 		}
-
-		// Process ChildPartitionsRecords — partition is splitting/merging.
-		// Queue child partitions and return so this goroutine exits cleanly.
-		for _, cpRecord := range cr.ChildPartitionsRecords {
-			for _, child := range cpRecord.ChildPartitions {
-				childState := &partitionState{
-					token:           child.Token,
-					startTimestamp:  cpRecord.StartTimestamp,
-					resumeTimestamp: cpRecord.StartTimestamp,
-				}
-				r.log.Debug("child partition discovered",
-					zap.String("token", child.Token[:min(8, len(child.Token))]+"…"),
-				)
-				select {
-				case r.pending <- childState:
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			}
-			// Final flush before exiting this partition.
-			_ = r.flushCursor(ctx, p)
-			return nil // partition is done
-		}
 	}
 }
 
-// convertDataRecord maps a Spanner DataChangeRecord for the kv table to
-// one or more store.Event values. Returns nil if the record is for an
-// internal/fill row that Watch subscribers don't care about.
-func (r *ChangeStreamReader) convertDataRecord(dr *csDataChangeRecord) []*Event {
-	if dr.TableName != "kv" {
-		return nil
+// decodeRecord decodes a ChangeRecord GenericColumnValue.
+// Returns: (partitionDone, maxTimestamp, events, childPartitions).
+//
+// The ChangeRecord column is ARRAY<STRUCT<data_change_record, heartbeat_record,
+// child_partitions_record>>. We navigate the protobuf Value tree manually to
+// avoid issues with nested ARRAY<STRUCT> decoding in the Spanner Go client.
+func (r *ChangeStreamReader) decodeRecord(gcv *spanner.GenericColumnValue) (
+	done bool, maxTS time.Time, events []*Event, children []*partitionState,
+) {
+	// The outer value should be a list (ARRAY).
+	outerList := gcv.Value.GetListValue()
+	if outerList == nil {
+		return
+	}
+
+	for _, outerVal := range outerList.Values {
+		// Each element is a STRUCT with 3 fields: data_change_record, heartbeat_record, child_partitions_record.
+		structVal := outerVal.GetListValue()
+		if structVal == nil || len(structVal.Values) < 3 {
+			continue
+		}
+
+		// Field 0: data_change_record (ARRAY<STRUCT<...>>)
+		if dcrs := structVal.Values[0].GetListValue(); dcrs != nil {
+			for _, dcr := range dcrs.Values {
+				ev, ts := r.decodeDataChangeRecord(dcr)
+				if ev != nil {
+					events = append(events, ev...)
+				}
+				if ts.After(maxTS) {
+					maxTS = ts
+				}
+			}
+		}
+
+		// Field 1: heartbeat_record (ARRAY<STRUCT<timestamp>>)
+		if hbs := structVal.Values[1].GetListValue(); hbs != nil {
+			for _, hb := range hbs.Values {
+				if ts := r.decodeHeartbeat(hb); ts.After(maxTS) {
+					maxTS = ts
+				}
+			}
+		}
+
+		// Field 2: child_partitions_record (ARRAY<STRUCT<...>>)
+		if cprs := structVal.Values[2].GetListValue(); cprs != nil && len(cprs.Values) > 0 {
+			for _, cpr := range cprs.Values {
+				children = append(children, r.decodeChildPartitions(cpr)...)
+			}
+			done = true
+		}
+	}
+	return
+}
+
+// decodeDataChangeRecord extracts events from one data_change_record struct.
+// Schema: commit_timestamp, record_sequence, server_transaction_id,
+//         is_last_record_in_transaction_in_partition, table_name,
+//         column_types, mods, mod_type, value_capture_type,
+//         number_of_records_in_transaction, number_of_partitions_in_transaction,
+//         transaction_tag, is_system_transaction
+func (r *ChangeStreamReader) decodeDataChangeRecord(v *structpb.Value) ([]*Event, time.Time) {
+	fields := v.GetListValue()
+	if fields == nil || len(fields.Values) < 8 {
+		return nil, time.Time{}
+	}
+
+	// Field 0: commit_timestamp (STRING in RFC3339)
+	commitTSStr := fields.Values[0].GetStringValue()
+	commitTS, err := time.Parse(time.RFC3339Nano, commitTSStr)
+	if err != nil {
+		r.log.Debug("parse commit_timestamp failed", zap.String("ts", commitTSStr), zap.Error(err))
+		return nil, time.Time{}
+	}
+
+	// Field 4: table_name
+	tableName := fields.Values[4].GetStringValue()
+	if tableName != "kv" {
+		return nil, commitTS
+	}
+
+	// Field 7: mod_type (INSERT | UPDATE | DELETE)
+	modType := fields.Values[7].GetStringValue()
+
+	// Field 6: mods (ARRAY<STRUCT<keys JSON, new_values JSON, old_values JSON>>)
+	modsArr := fields.Values[6].GetListValue()
+	if modsArr == nil {
+		return nil, commitTS
 	}
 
 	var events []*Event
-	for _, mod := range dr.Mods {
-		kv := r.modToKV(mod.NewValues, mod.OldValues, dr.CommitTimestamp)
+	for _, modVal := range modsArr.Values {
+		modFields := modVal.GetListValue()
+		if modFields == nil || len(modFields.Values) < 3 {
+			continue
+		}
+
+		// keys, new_values, old_values — all JSON strings
+		newValStr := modFields.Values[1].GetStringValue()
+		oldValStr := modFields.Values[2].GetStringValue()
+
+		newVals := parseJSONMap(newValStr)
+		oldVals := parseJSONMap(oldValStr)
+
+		kv := extractKV(newVals, oldVals, commitTS)
 		if kv == nil {
 			continue
 		}
+
 		evType := EventPut
-		if kv.Deleted {
+		if modType == "DELETE" || kv.Deleted {
 			evType = EventDelete
 		}
 		events = append(events, &Event{KV: kv, Type: evType})
 	}
-	return events
+	return events, commitTS
 }
 
-// modToKV extracts a KV from the new/old value maps in a Change Stream mod.
-// The column names match the kv table schema.
-func (r *ChangeStreamReader) modToKV(newVals, oldVals map[string]interface{}, ts time.Time) *KV {
-	kv := &KV{}
-
-	// Helper to read a string value from the map.
-	str := func(m map[string]interface{}, col string) string {
-		if v, ok := m[col]; ok {
-			if s, ok := v.(string); ok {
-				return s
-			}
-		}
-		return ""
+// decodeHeartbeat extracts the timestamp from a heartbeat_record struct.
+// Schema: timestamp
+func (r *ChangeStreamReader) decodeHeartbeat(v *structpb.Value) time.Time {
+	fields := v.GetListValue()
+	if fields == nil || len(fields.Values) < 1 {
+		return time.Time{}
 	}
-	// Helper to read an int64 from the map (Spanner JSON encodes INT64 as string).
-	i64 := func(m map[string]interface{}, col string) int64 {
-		if v, ok := m[col]; ok {
-			switch t := v.(type) {
-			case string:
-				var n int64
-				fmt.Sscan(t, &n)
-				return n
-			case float64:
-				return int64(t)
-			}
-		}
-		return 0
-	}
-	// Helper to read bytes (base64-encoded in Spanner JSON).
-	byt := func(m map[string]interface{}, col string) []byte {
-		if v, ok := m[col]; ok {
-			if s, ok := v.(string); ok && s != "" {
-				// Spanner encodes BYTES as base64 in JSON change records.
-				b, _ := base64.StdEncoding.DecodeString(s)
-				return b
-			}
-		}
-		return nil
-	}
-	bool_ := func(m map[string]interface{}, col string) bool {
-		if v, ok := m[col]; ok {
-			if b, ok := v.(bool); ok {
-				return b
-			}
-		}
-		return false
-	}
-
-	src := newVals
-	if src == nil {
-		src = oldVals
-	}
-	if src == nil {
-		return nil
-	}
-
-	kv.Key = str(src, "key")
-	if kv.Key == "" {
-		return nil
-	}
-	kv.Rev = i64(src, "rev")
-	kv.Value = byt(src, "value")
-	kv.Deleted = bool_(src, "deleted")
-	kv.Created = bool_(src, "created")
-	kv.CreateRevision = i64(src, "create_revision")
-	kv.PrevRevision = i64(src, "prev_revision")
-	kv.LeaseID = i64(src, "lease_id")
-	kv.OldValue = byt(oldVals, "value")
-
-	return kv
+	ts, _ := time.Parse(time.RFC3339Nano, fields.Values[0].GetStringValue())
+	return ts
 }
 
-// queryInitialPartitions calls the Change Stream API to get the starting
-// partition list for the given timestamp.
+// decodeChildPartitions extracts partition states from a child_partitions_record struct.
+// Schema: start_timestamp, record_sequence, child_partitions ARRAY<STRUCT<token, parent_partition_tokens>>
+func (r *ChangeStreamReader) decodeChildPartitions(v *structpb.Value) []*partitionState {
+	fields := v.GetListValue()
+	if fields == nil || len(fields.Values) < 3 {
+		return nil
+	}
+
+	startTS, _ := time.Parse(time.RFC3339Nano, fields.Values[0].GetStringValue())
+
+	childrenArr := fields.Values[2].GetListValue()
+	if childrenArr == nil {
+		return nil
+	}
+
+	var result []*partitionState
+	for _, childVal := range childrenArr.Values {
+		childFields := childVal.GetListValue()
+		if childFields == nil || len(childFields.Values) < 1 {
+			continue
+		}
+		token := childFields.Values[0].GetStringValue()
+		if token == "" {
+			continue
+		}
+		result = append(result, &partitionState{
+			token:           token,
+			startTimestamp:  startTS,
+			resumeTimestamp: startTS,
+		})
+	}
+	return result
+}
+
+// queryInitialPartitions runs the NULL-token discovery query.
 func (r *ChangeStreamReader) queryInitialPartitions(ctx context.Context, startTime time.Time) ([]*partitionState, error) {
 	stmt := spanner.Statement{
-		SQL: `SELECT PartitionToken, StartTimestamp, EndTimestamp
-		      FROM READ_kv_changes_PARTITION(
-		        start_timestamp => @start,
-		        end_timestamp   => NULL,
-		        heartbeat_millis => 0
+		SQL: `SELECT ChangeRecord
+		      FROM READ_kv_changes(
+		        @start_time, NULL, NULL, @heartbeat_millis
 		      )`,
-		Params: map[string]interface{}{"start": startTime},
+		Params: map[string]interface{}{
+			"start_time":      startTime,
+			"heartbeat_millis": int64(1000),
+		},
 	}
 
 	iter := r.client.Single().Query(ctx, stmt)
 	defer iter.Stop()
 
 	var partitions []*partitionState
+
 	for {
 		row, err := iter.Next()
 		if errors.Is(err, iterator.Done) {
 			break
 		}
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("initial partition query: %w", err)
 		}
-		var token string
-		var start time.Time
-		if err := row.Columns(&token, &start, new(interface{})); err != nil {
-			return nil, err
+
+		var gcv spanner.GenericColumnValue
+		if err := row.Column(0, &gcv); err != nil {
+			r.log.Warn("decode initial partition record failed", zap.Error(err))
+			continue
 		}
-		partitions = append(partitions, &partitionState{
-			token:           token,
-			startTimestamp:  start,
-			resumeTimestamp: startTime,
-		})
+
+		done, _, _, children := r.decodeRecord(&gcv)
+		partitions = append(partitions, children...)
+		if done {
+			break
+		}
 	}
 
-	// If the Change Stream returns no partitions at all (e.g. on the emulator
-	// which has limited CS support), fall back to a sentinel empty-token that
-	// triggers the poll-based fallback in the Watcher.
 	if len(partitions) == 0 {
-		return nil, fmt.Errorf("no partitions returned — Change Streams may not be supported by this Spanner backend")
+		return nil, fmt.Errorf("no partitions returned — Change Streams may not be available")
 	}
 	return partitions, nil
 }
 
-// loadCursors reads persisted resume positions from kv_cs_cursors.
+// ─── cursor persistence ───────────────────────────────────────────────────────
+
 func (r *ChangeStreamReader) loadCursors(ctx context.Context) (map[string]time.Time, error) {
 	stmt := spanner.Statement{
-		SQL: `SELECT partition_token, resume_timestamp
-		      FROM kv_cs_cursors
-		      WHERE replica_id = @rid`,
+		SQL:    `SELECT partition_token, resume_timestamp FROM kv_cs_cursors WHERE replica_id = @rid`,
 		Params: map[string]interface{}{"rid": r.replicaID},
 	}
-
 	iter := r.client.Single().Query(ctx, stmt)
 	defer iter.Stop()
 
@@ -551,7 +504,6 @@ func (r *ChangeStreamReader) loadCursors(ctx context.Context) (map[string]time.T
 	return cursors, nil
 }
 
-// flushCursor persists the current resume position for a partition.
 func (r *ChangeStreamReader) flushCursor(ctx context.Context, p *partitionState) error {
 	_, err := r.client.Apply(ctx, []*spanner.Mutation{
 		spanner.InsertOrUpdate("kv_cs_cursors",
@@ -562,9 +514,110 @@ func (r *ChangeStreamReader) flushCursor(ctx context.Context, p *partitionState)
 	return err
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+func shortToken(t string) string {
+	if len(t) > 12 {
+		return t[:12] + "…"
 	}
-	return b
+	return t
 }
+
+// parseJSONMap parses a Spanner JSON value string into a map.
+// Spanner returns JSON columns as a JSON string in Change Stream records.
+func parseJSONMap(s string) map[string]interface{} {
+	if s == "" || s == "null" {
+		return nil
+	}
+	var m map[string]interface{}
+	// Use structpb to parse the JSON safely.
+	sv := &structpb.Struct{}
+	if err := sv.UnmarshalJSON([]byte(s)); err != nil {
+		return nil
+	}
+	m = make(map[string]interface{}, len(sv.Fields))
+	for k, v := range sv.Fields {
+		m[k] = v.AsInterface()
+	}
+	return m
+}
+
+// extractKV builds a KV from new/old value maps.
+func extractKV(newV, oldV map[string]interface{}, commitTS time.Time) *KV {
+	src := newV
+	if src == nil {
+		src = oldV
+	}
+	if src == nil {
+		return nil
+	}
+
+	kv := &KV{}
+	kv.Key = strField(src, "key")
+	if kv.Key == "" {
+		return nil
+	}
+	kv.Rev = i64Field(src, "rev")
+	kv.Value = bytesField(src, "value")
+	kv.Deleted = boolField(src, "deleted")
+	kv.Created = boolField(src, "created")
+	kv.CreateRevision = i64Field(src, "create_revision")
+	kv.PrevRevision = i64Field(src, "prev_revision")
+	kv.LeaseID = i64Field(src, "lease_id")
+	kv.OldValue = bytesField(oldV, "value")
+	return kv
+}
+
+func strField(m map[string]interface{}, k string) string {
+	if v, ok := m[k]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+func i64Field(m map[string]interface{}, k string) int64 {
+	if m == nil {
+		return 0
+	}
+	if v, ok := m[k]; ok {
+		switch t := v.(type) {
+		case string:
+			var n int64
+			fmt.Sscan(t, &n)
+			return n
+		case float64:
+			return int64(t)
+		}
+	}
+	return 0
+}
+
+func bytesField(m map[string]interface{}, k string) []byte {
+	if m == nil {
+		return nil
+	}
+	if v, ok := m[k]; ok {
+		if s, ok := v.(string); ok && s != "" {
+			b, _ := base64.StdEncoding.DecodeString(s)
+			return b
+		}
+	}
+	return nil
+}
+
+func boolField(m map[string]interface{}, k string) bool {
+	if m == nil {
+		return false
+	}
+	if v, ok := m[k]; ok {
+		if b, ok := v.(bool); ok {
+			return b
+		}
+	}
+	return false
+}
+
+// ensure sppb is used (for GenericColumnValue type info in future).
+var _ = sppb.TypeCode_ARRAY
