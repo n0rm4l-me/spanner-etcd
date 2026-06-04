@@ -1,0 +1,29 @@
+# Binary
+spanner-etcd
+/cmd/server/spanner-etcd
+
+# TLS certificates (never commit private keys)
+certs/
+*.key
+*.crt
+*.csr
+*.pem
+*.p12
+*.srl
+
+# Go build cache
+/vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test artifacts
+/tmp/
+coverage.out
+coverage.html
+
+# macOS
+.DS_Store
