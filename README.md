@@ -25,25 +25,32 @@ Kubernetes API Server (or any etcd client)
          │  etcd v3 gRPC (TLS / mTLS)
          ▼
     spanner-etcd
-    ┌─────────────────────────────────┐
-    │  KVServer     WatchServer       │
-    │  LeaseServer  ClusterServer     │
-    │  MaintenanceServer              │
-    │           │                     │
-    │      SpannerStore               │
-    │   ┌───────────────────────┐     │
-    │   │  Write: RW txn        │     │
-    │   │  bump rev + insert kv │     │
-    │   │                       │     │
-    │   │  Watch: poll loop     │     │
-    │   │  + fan-out broadcaster│     │
-    │   │                       │     │
-    │   │  Lease: TTL goroutine │     │
-    │   └───────────────────────┘     │
-    └──────────────┬──────────────────┘
+    ┌───────────────────────────────────────┐
+    │  KVServer     WatchServer             │
+    │  LeaseServer  ClusterServer           │
+    │  MaintenanceServer                    │
+    │           │                           │
+    │      SpannerStore                     │
+    │   ┌───────────────────────────────┐   │
+    │   │  Write: RW txn                │   │
+    │   │  UPDATE kv_rev THEN RETURN    │   │
+    │   │  + INSERT INTO kv             │   │
+    │   │                               │   │
+    │   │  Watch: Change Stream reader  │   │
+    │   │  (10–50ms) with poll fallback │   │
+    │   │  (1s) for emulator/older DBs  │   │
+    │   │                               │   │
+    │   │  Lease: TTL goroutine         │   │
+    │   └───────────────────────────────┘   │
+    └──────────────┬────────────────────────┘
                    │  Spanner gRPC
                    ▼
          Google Cloud Spanner
+         ├── kv table
+         ├── kv_rev (revision counter)
+         ├── kv_lease (TTL leases)
+         ├── kv_cs_cursors (CS resume points)
+         └── kv_changes (Change Stream)
 ```
 
 Multiple `spanner-etcd` replicas can run concurrently — all state lives in Spanner. No consensus, no leader election between replicas.
@@ -97,15 +104,29 @@ CREATE TABLE kv_lease (
   ttl_sec    INT64 NOT NULL,
   granted_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp = true)
 ) PRIMARY KEY (lease_id);
+
+-- Change Stream: captures all mutations to kv for Watch delivery.
+CREATE CHANGE STREAM kv_changes FOR kv
+  OPTIONS (retention_period = '7d', value_capture_type = 'NEW_ROW');
+
+-- Per-replica cursor store: enables resume after restart.
+CREATE TABLE kv_cs_cursors (
+  replica_id       STRING(128) NOT NULL,
+  partition_token  STRING(MAX) NOT NULL,
+  resume_timestamp TIMESTAMP  NOT NULL,
+  updated_at       TIMESTAMP  NOT NULL OPTIONS (allow_commit_timestamp = true)
+) PRIMARY KEY (replica_id, partition_token);
 ```
 
 ### Design decisions
 
-**`id` vs `rev`**: The physical primary key (`id`) uses `bit_reversed_positive` sequence to distribute writes across Spanner splits and avoid hot spots. The logical revision (`rev`) is a simple monotonic integer from `kv_rev`. etcd clients see `rev` as `ModRevision`.
+**`id` vs `rev`**: The physical PK (`id`) uses `bit_reversed_positive` to distribute writes across Spanner splits and avoid hotspots. The logical revision (`rev`) is a monotonic integer from `kv_rev`. etcd clients see `rev` as `ModRevision`.
 
-**Atomic revision bump**: Every write does `UPDATE kv_rev SET rev = rev + 1 WHERE id = 1 THEN RETURN rev` — a single DML statement that both increments and returns the new value, avoiding the two-RPC read-modify-write pattern.
+**Atomic revision bump**: Every write does `UPDATE kv_rev SET rev = rev + 1 WHERE id = 1 THEN RETURN rev` — a single server-side DML statement that both increments and reads the counter, avoiding the two-RPC read-modify-write pattern that serialises concurrent transactions.
 
 **Append-only log**: Like etcd, we never update rows in `kv`. Each write appends a new row. Compaction physically deletes old rows asynchronously.
+
+**Change Streams for Watch**: Instead of polling every second, each replica opens a long-lived streaming SQL query per partition of `kv_changes`. Spanner pushes records as writes commit (~10–50ms). Partition cursors are flushed to `kv_cs_cursors` every 5s so replicas resume from the correct position after a restart. The poll loop (1s) runs in parallel during the transition window and as a fallback when Change Streams are unavailable (emulator, older instances).
 
 ## Performance
 
@@ -114,11 +135,12 @@ CREATE TABLE kv_lease (
 | Get (single key) | ~5ms | ~20ms |
 | Put (create) | ~10ms | ~100ms |
 | List (prefix, 100 keys) | ~10ms | ~30ms |
-| Watch event delivery | ~1s (poll interval) | ~1s |
+| Watch event delivery (Change Streams) | **~10–50ms** | N/A (fallback to poll) |
+| Watch event delivery (poll fallback) | ~1s | ~1s |
 
-Write latency is bounded by Spanner RW transaction: one DML `UPDATE kv_rev THEN RETURN` + one `INSERT INTO kv`. Both happen in a single Spanner transaction.
+Write latency is bounded by one Spanner RW transaction: `UPDATE kv_rev THEN RETURN` + `INSERT INTO kv`. Both are buffered and committed atomically.
 
-Watch uses 1-second polling by default. For lower latency, implement [Spanner Change Streams](https://cloud.google.com/spanner/docs/change-streams) (not yet implemented).
+Watch latency with Change Streams is ~10–50ms because Spanner pushes DataChangeRecords as soon as a write commits. The poll fallback (1s) is used automatically on the Spanner emulator or when Change Streams are not available.
 
 ## Installation
 
@@ -228,7 +250,7 @@ Run multiple `spanner-etcd` replicas behind a load balancer:
                 Google Cloud Spanner
 ```
 
-All replicas are stateless — no coordination needed. Spanner guarantees external consistency (linearizability) across all replicas. Watch events are delivered independently per replica via the poll loop; each replica polls Spanner every second.
+All replicas are stateless — no coordination needed. Spanner guarantees external consistency (linearizability) across all replicas. Each replica independently reads the `kv_changes` Change Stream, so Watch events are delivered to clients of any replica within ~10–50ms of the write committing.
 
 ## Monitoring
 
@@ -241,21 +263,25 @@ grpc_health_probe -addr=localhost:2379 -tls \
 
 Slow RPCs (>500ms) are logged at `info` level with method name and elapsed time. Set `--log-level=debug` to log all RPCs.
 
+## Why not kine?
+
+[kine](https://github.com/k3s-io/kine) is a popular etcd shim that translates the etcd API to SQL. It works well with PostgreSQL and MySQL, but is a poor fit for Spanner: kine's `generic.Dialect` assumes `MAX(id)` equals the global revision, which breaks with Spanner's `bit_reversed_positive` sequences; it relies on `LIKE ... ESCAPE` which Spanner doesn't support; and its query aliases (`AS current`, `AS compact`) collide with Spanner reserved words. The result is that almost every query needs to be overridden, at which point you're better off implementing the etcd `server.Backend` interface directly — which is what this project does.
+
 ## Limitations vs etcd
 
 | Feature | etcd | spanner-etcd |
 |---------|------|-------------|
-| Watch latency | <10ms | ~1s (poll-based) |
+| Watch latency | <10ms | ~10–50ms (Change Streams) |
+| Watch latency (emulator) | <10ms | ~1s (poll fallback) |
 | Lease keepalive | Streaming | Streaming ✅ |
-| DeleteRange (bare) | ✅ | Via Txn only |
+| DeleteRange (bare gRPC) | ✅ | Via Txn only |
 | Defrag / Snapshot | ✅ | Not implemented |
 | Auth (RBAC) | ✅ | Not implemented |
-| Watch latency <100ms | ✅ | Requires Change Streams |
 
 ### Roadmap
 
-- [ ] Spanner Change Streams for sub-second Watch latency
-- [ ] Metrics (Prometheus endpoint)
+- [x] Spanner Change Streams for sub-second Watch latency
+- [ ] Prometheus metrics endpoint
 - [ ] Helm chart for Kubernetes deployment
 - [ ] etcd auth passthrough
 - [ ] Multi-region Spanner configuration examples
