@@ -112,6 +112,64 @@ func (k *KVServer) Put(ctx context.Context, r *etcdserverpb.PutRequest) (*etcdse
 	return &etcdserverpb.PutResponse{Header: header(rev)}, nil
 }
 
+// DeleteRange handles bare delete-range requests (e.g. from etcdctl del).
+// Kubernetes always deletes via Txn, but etcdctl and other clients use this.
+func (k *KVServer) DeleteRange(ctx context.Context, r *etcdserverpb.DeleteRangeRequest) (*etcdserverpb.DeleteRangeResponse, error) {
+	key := string(r.Key)
+	end := string(r.RangeEnd)
+
+	// Single key delete.
+	if end == "" {
+		rev, prev, ok, err := k.store.Delete(ctx, key, 0)
+		if err != nil {
+			return nil, toGRPCErr(err)
+		}
+		resp := &etcdserverpb.DeleteRangeResponse{
+			Header:  header(rev),
+			Deleted: boolToInt(ok),
+		}
+		if r.PrevKv && prev != nil {
+			resp.PrevKvs = []*mvccpb.KeyValue{toProtoKV(prev)}
+		}
+		return resp, nil
+	}
+
+	// Range / prefix delete — iterate and delete each key.
+	prefix := rangeToPrefix(key, end)
+	_, _, kvs, err := k.store.List(ctx, prefix, key, 0, 0)
+	if err != nil {
+		return nil, toGRPCErr(err)
+	}
+
+	var deleted int64
+	var prevKvs []*mvccpb.KeyValue
+	var lastRev int64
+
+	for _, kv := range kvs {
+		rev, prev, ok, err := k.store.Delete(ctx, kv.Key, 0)
+		if err != nil {
+			continue
+		}
+		if ok {
+			deleted++
+			lastRev = rev
+			if r.PrevKv && prev != nil {
+				prevKvs = append(prevKvs, toProtoKV(prev))
+			}
+		}
+	}
+
+	if lastRev == 0 {
+		lastRev, _ = k.store.CurrentRevision(ctx)
+	}
+
+	return &etcdserverpb.DeleteRangeResponse{
+		Header:  header(lastRev),
+		Deleted: deleted,
+		PrevKvs: prevKvs,
+	}, nil
+}
+
 // Txn processes an etcd transaction — the primary operation used by Kubernetes.
 func (k *KVServer) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error) {
 	// Evaluate Compare conditions.
