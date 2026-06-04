@@ -2,7 +2,7 @@
 
 A Kubernetes-native **etcd v3 API server** backed by **Google Cloud Spanner**.
 
-Implements the full etcd v3 gRPC protocol so that any etcd client or Kubernetes API server can use it as a drop-in replacement for etcd — with Spanner handling storage, replication, and horizontal scalability.
+Implements the complete etcd v3 KV/Watch/Lease API required by Kubernetes, so that any Kubernetes API server or etcd-compatible client can use it as a drop-in — with Spanner handling storage, replication, and horizontal scalability.
 
 ## Why
 
@@ -366,6 +366,32 @@ Logs are emitted as JSON with Google Cloud Logging field names:
 ```
 
 `severity` maps to GCP severity levels (DEBUG / INFO / WARNING / ERROR / CRITICAL), enabling filtering and alerting in Cloud Console and Cloud Monitoring without a custom log parser.
+
+## Known limitations and design trade-offs
+
+### Write serialization (kv_rev)
+
+Every write (`Create`, `Update`, `Delete`) increments the global revision counter via:
+
+```sql
+UPDATE kv_rev SET rev = rev + 1 WHERE id = 1 THEN RETURN rev
+```
+
+This is a **global serialization point** — all writes queue on this single row. This is intentional and semantically equivalent to how etcd itself serializes revisions through Raft. On production Spanner the practical limit is **~200–500 writes/sec per replica** before contention becomes visible.
+
+Reads (`Get`, `List`, `Watch`) are fully parallel — Spanner `Single()` reads scale linearly with replicas and Spanner processing units.
+
+**If you need higher write throughput**, the path is:
+- Shard `kv_rev` by key namespace (multiple independent revision sequences)
+- Use Spanner's `PENDING_COMMIT_TIMESTAMP()` as a logical clock instead of an integer counter
+
+### Watch fan-out
+
+With 10,000 concurrent watchers and 1,000 writes/sec, each write triggers fan-out to matching subscribers in all replicas. The current implementation dispatches synchronously in `dispatchEvents`. Under extreme fan-out this becomes a goroutine scheduling bottleneck. Mitigation: increase replica count — each replica handles a subset of Watch connections independently.
+
+### Not implemented
+
+Auth (UserAdd/RoleAdd/Authenticate), Defrag, Snapshot — these are not needed for standard Kubernetes API server operation but may be required for some etcd-compatible tools.
 
 ## Why not kine?
 
