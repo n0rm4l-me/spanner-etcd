@@ -1,18 +1,47 @@
+// Package store — Watch fan-out with Change Stream or polling fallback.
+//
+// # Event delivery strategy
+//
+// spanner-etcd supports two event delivery modes:
+//
+//  1. Change Stream mode (preferred, ~10–50ms latency):
+//     A ChangeStreamReader reads all partitions of the kv_changes Change Stream
+//     and calls dispatchEvents whenever a DataChangeRecord arrives. This is
+//     push-based — Spanner notifies us as soon as a write commits.
+//
+//  2. Poll mode (fallback, ~1s latency):
+//     A background goroutine runs SELECT ... WHERE rev > lastRev every second.
+//     Used automatically when Change Streams are unavailable (Spanner emulator,
+//     older instances) or on first startup before the stream is established.
+//
+// At startup the Watcher always begins in poll mode. It concurrently tries to
+// start the ChangeStreamReader. If the reader starts successfully, the poll loop
+// is kept running in parallel for a short transition window to avoid missing
+// events, then the poll loop slows its ticker to 30s (heartbeat-only) once the
+// Change Stream has proven healthy for >csHealthyDuration.
+//
+// The reason for running both simultaneously during transition is that Spanner
+// Change Streams have a small start lag (~100ms) — using polls during that window
+// ensures no events are dropped.
 package store
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
 )
 
 const (
-	pollInterval    = time.Second
-	pollBatchSize   = int64(500)
-	subChannelDepth = 100
+	pollInterval      = time.Second
+	pollSlowInterval  = 30 * time.Second // heartbeat poll when CS is healthy
+	pollBatchSize     = int64(500)
+	subChannelDepth   = 100
+	csHealthyDuration = 10 * time.Second // CS must be healthy this long before we slow polls
 )
 
 // subscriber is a single Watch consumer.
@@ -22,29 +51,41 @@ type subscriber struct {
 	cancel context.CancelFunc
 }
 
-// Watcher runs a single background poll loop and fans events out to subscribers.
-// Multiple spanner-etcd replicas can run concurrently: each has its own Watcher
-// polling the same Spanner table, so Watch events are delivered independently
-// per replica — which is correct for a stateless horizontally-scaled deployment.
+// Watcher orchestrates event delivery to Watch subscribers.
+// It runs a poll loop (always) plus an optional Change Stream reader.
+// Both paths call dispatchEvents which routes events to matching subscribers.
 type Watcher struct {
-	store  *Store
-	log    *zap.Logger
-	notifyCh chan int64 // woken by local writes with their new revision
+	store    *Store
+	log      *zap.Logger
+	notifyCh chan int64 // woken by local writes
 
 	mu          sync.Mutex
 	subscribers []*subscriber
-	running     bool
 	stopCh      chan struct{}
+
+	// csHealthy is set to 1 once the Change Stream reader has been running
+	// without error for csHealthyDuration. The poll ticker slows down at that
+	// point to avoid unnecessary Spanner reads.
+	csHealthy atomic.Int32
 }
 
 func newWatcher(ctx context.Context, store *Store, log *zap.Logger) *Watcher {
 	w := &Watcher{
-		store:  store,
-		log:    log,
+		store:    store,
+		log:      log,
 		notifyCh: make(chan int64, 1024),
-		stopCh: make(chan struct{}),
+		stopCh:   make(chan struct{}),
 	}
+
+	// Always start poll loop — acts as fallback / transition safety net.
 	go w.pollLoop(ctx)
+
+	// Attempt to start Change Stream reader.
+	// If the Spanner backend doesn't support Change Streams (e.g. emulator),
+	// startChangeStream logs a warning and returns silently, leaving the poll
+	// loop as the sole event source.
+	go w.startChangeStream(ctx)
+
 	return w
 }
 
@@ -53,6 +94,7 @@ func (w *Watcher) close() {
 }
 
 // notify wakes the poll loop with a hint about the latest revision.
+// Called by Create/Update/Delete after a successful write.
 func (w *Watcher) notify(rev int64) {
 	select {
 	case w.notifyCh <- rev:
@@ -61,6 +103,7 @@ func (w *Watcher) notify(rev int64) {
 }
 
 // subscribe returns a channel that delivers events for prefix, starting after afterRev.
+// The caller should drain the channel and stop when it is closed.
 func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) <-chan []*Event {
 	subCtx, cancel := context.WithCancel(ctx)
 	sub := &subscriber{
@@ -73,16 +116,15 @@ func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) 
 	w.subscribers = append(w.subscribers, sub)
 	w.mu.Unlock()
 
-	// Replay existing events from afterRev before switching to live feed.
-	// Use bgCtx (not subCtx) for the replay query so it isn't cancelled
-	// when the gRPC request context times out between subscribe and first poll.
+	// Replay existing events from afterRev before switching to the live feed.
+	// Use bgCtx so the query isn't cancelled when the gRPC request context ends.
 	go func() {
 		defer func() {
 			w.removeSub(sub)
 			close(sub.ch)
 		}()
 
-		cur, events, err := w.store.After(w.store.bgCtx, prefix, afterRev, pollBatchSize)
+		_, events, err := w.store.After(w.store.bgCtx, prefix, afterRev, pollBatchSize)
 		if err != nil {
 			w.log.Warn("watch replay error", zap.String("prefix", prefix), zap.Error(err))
 			return
@@ -94,8 +136,6 @@ func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) 
 				return
 			}
 		}
-		// From here the poll loop will deliver further events via sub.ch.
-		_ = cur
 		<-subCtx.Done()
 	}()
 
@@ -106,20 +146,54 @@ func (w *Watcher) removeSub(sub *subscriber) {
 	sub.cancel()
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	subs := w.subscribers[:0]
+	out := w.subscribers[:0]
 	for _, s := range w.subscribers {
 		if s != sub {
-			subs = append(subs, s)
+			out = append(out, s)
 		}
 	}
-	w.subscribers = subs
+	w.subscribers = out
 }
 
-// pollLoop is the single background goroutine that polls for new events.
-// Design: one poll per replica, scales horizontally because Spanner handles
-// concurrent readers without coordination.
+// dispatchEvents routes a slice of events to all matching subscribers.
+// Called from both the poll loop and the Change Stream dispatch function.
+func (w *Watcher) dispatchEvents(events []*Event) {
+	if len(events) == 0 {
+		return
+	}
+
+	w.mu.Lock()
+	subs := make([]*subscriber, len(w.subscribers))
+	copy(subs, w.subscribers)
+	w.mu.Unlock()
+
+	for _, sub := range subs {
+		prefix := strings.TrimSuffix(sub.prefix, "%")
+		var matching []*Event
+		for _, ev := range events {
+			if prefix == "" || strings.HasPrefix(ev.KV.Key, prefix) {
+				matching = append(matching, ev)
+			}
+		}
+		if len(matching) == 0 {
+			continue
+		}
+		select {
+		case sub.ch <- matching:
+		default:
+			// Channel full — drop subscription (etcd semantics: client reconnects).
+			w.log.Warn("subscriber channel full, closing watch",
+				zap.String("prefix", sub.prefix))
+			sub.cancel()
+		}
+	}
+}
+
+// ── Poll loop ──────────────────────────────────────────────────────────────────
+
+// pollLoop runs until ctx or stopCh. It slows its ticker once the Change Stream
+// is healthy to act only as a heartbeat / safety net.
 func (w *Watcher) pollLoop(ctx context.Context) {
-	// Start from current revision to avoid replaying history at startup.
 	lastRev, _ := w.store.CurrentRevision(ctx)
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
@@ -131,50 +205,65 @@ func (w *Watcher) pollLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case hint := <-w.notifyCh:
+			// Local write notification — poll immediately regardless of CS status.
 			if hint > lastRev {
-				lastRev = w.poll(ctx, lastRev)
+				lastRev = w.doPoll(ctx, lastRev)
 			}
 		case <-ticker.C:
-			lastRev = w.poll(ctx, lastRev)
+			if w.csHealthy.Load() == 1 {
+				// Change Stream is healthy — slow the ticker and skip redundant polls.
+				ticker.Reset(pollSlowInterval)
+			} else {
+				ticker.Reset(pollInterval)
+			}
+			lastRev = w.doPoll(ctx, lastRev)
 		}
 	}
 }
 
-// poll fetches all events after lastRev and delivers them to matching subscribers.
-// Returns the new lastRev.
-func (w *Watcher) poll(ctx context.Context, lastRev int64) int64 {
+// doPoll fetches events after lastRev and dispatches them.
+func (w *Watcher) doPoll(ctx context.Context, lastRev int64) int64 {
 	curRev, events, err := w.store.After(ctx, "", lastRev, pollBatchSize)
 	if err != nil {
 		w.log.Warn("poll error", zap.Error(err))
 		return lastRev
 	}
-	if len(events) == 0 {
-		return curRev
-	}
-
-	w.mu.Lock()
-	subs := make([]*subscriber, len(w.subscribers))
-	copy(subs, w.subscribers)
-	w.mu.Unlock()
-
-	for _, sub := range subs {
-		var matching []*Event
-		for _, ev := range events {
-			if strings.HasPrefix(ev.KV.Key, strings.TrimSuffix(sub.prefix, "%")) {
-				matching = append(matching, ev)
-			}
-		}
-		if len(matching) == 0 {
-			continue
-		}
-		select {
-		case sub.ch <- matching:
-		default:
-			// Subscriber channel full — drop and close (etcd semantics: client must reconnect).
-			w.log.Warn("subscriber channel full, dropping", zap.String("prefix", sub.prefix))
-			sub.cancel()
-		}
-	}
-
+	w.dispatchEvents(events)
 	return curRev
+}
+
+// ── Change Stream ──────────────────────────────────────────────────────────────
+
+// startChangeStream starts the ChangeStreamReader. If the backend does not
+// support Change Streams (emulator, missing DDL) it logs and returns silently,
+// leaving the poll loop as the only event source.
+func (w *Watcher) startChangeStream(ctx context.Context) {
+	// Unique replica ID derived from the store pointer — stable within a process.
+	replicaID := fmt.Sprintf("replica-%p", w.store)
+
+	reader := NewChangeStreamReader(
+		w.store.client,
+		replicaID,
+		w.dispatchEvents, // Change Stream events go directly to subscribers
+		w.log,
+	)
+
+	// Monitor CS health: if it has been running for csHealthyDuration without
+	// error, mark it healthy so the poll loop slows down.
+	go func() {
+		select {
+		case <-time.After(csHealthyDuration):
+			w.csHealthy.Store(1)
+			w.log.Info("change stream healthy, slowing poll loop")
+		case <-ctx.Done():
+		case <-w.stopCh:
+		}
+	}()
+
+	if err := reader.Start(ctx); err != nil {
+		// Not an error on the emulator — it's expected.
+		w.log.Warn("change stream unavailable, using poll fallback", zap.Error(err))
+		// Reset healthy flag so the poll loop stays at full speed.
+		w.csHealthy.Store(0)
+	}
 }

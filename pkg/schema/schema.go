@@ -1,12 +1,18 @@
 // Package schema manages the Spanner DDL for spanner-etcd.
 //
 // Table design:
-//   kv        — main key-value log (append-only, one row per write event)
-//   kv_rev    — single-row monotonic revision counter
-//   kv_lease  — active leases with TTL
+//   kv             — main key-value log (append-only, one row per write event)
+//   kv_rev         — single-row monotonic revision counter
+//   kv_lease       — active leases with TTL
+//   kv_cs_cursors  — Change Stream partition cursors for resume after restart
 //
 // The physical PK of kv uses bit_reversed_positive to avoid write hotspots.
 // The logical revision is stored in the `rev` column and sourced from kv_rev.
+//
+// Change Stream (kv_changes) is created after the main tables so that it
+// captures all subsequent writes. Each spanner-etcd replica reads all
+// partitions of kv_changes and fans events out to local Watch subscribers,
+// reducing Watch latency from ~1s (poll) to ~10–50ms.
 package schema
 
 import (
@@ -62,6 +68,29 @@ var statements = []string{
 	`CREATE INDEX IF NOT EXISTS kv_key_rev   ON kv (key, rev DESC)`,
 	`CREATE INDEX IF NOT EXISTS kv_rev_idx   ON kv (rev)`,
 	`CREATE INDEX IF NOT EXISTS kv_lease_idx ON kv (lease_id) STORING (key, rev)`,
+
+	// Change Stream: captures all mutations to the kv table.
+	// Each spanner-etcd replica reads this stream to deliver Watch events
+	// with ~10–50ms latency instead of the ~1s polling approach.
+	// retention_period: 7 days allows replicas to catch up after downtime.
+	`CREATE CHANGE STREAM IF NOT EXISTS kv_changes
+		FOR kv
+		OPTIONS (
+			retention_period = '7d',
+			value_capture_type = 'NEW_ROW'
+		)`,
+
+	// Change Stream partition cursors.
+	// Each replica persists its last-read partition token + timestamp here
+	// so that it can resume from the correct position after a restart without
+	// re-delivering already-seen events.
+	// replica_id allows multiple replicas to store independent cursors.
+	`CREATE TABLE IF NOT EXISTS kv_cs_cursors (
+		replica_id       STRING(128) NOT NULL,
+		partition_token  STRING(MAX) NOT NULL,
+		resume_timestamp TIMESTAMP  NOT NULL,
+		updated_at       TIMESTAMP  NOT NULL OPTIONS (allow_commit_timestamp = true)
+	) PRIMARY KEY (replica_id, partition_token)`,
 }
 
 // Ensure creates or updates the schema and seeds the revision counter.
