@@ -307,22 +307,50 @@ Slow RPCs (>500ms) are logged at `info` level with method name and elapsed time.
 - [x] Prometheus metrics (`/metrics` on `:2381`)
 - [x] Helm chart with WIF, PDB, HPA, ServiceMonitor
 - [x] Deployed and tested on GKE with real Spanner — 33/33 etcd operations pass
-- [ ] Unit tests with Spanner emulator
+- [x] Integration tests against Spanner emulator — 38 tests, full stack coverage
 - [ ] etcd auth passthrough
 - [ ] Multi-region Spanner configuration examples
 - [ ] Spanner Change Streams for emulator (currently uses poll fallback)
 
+## Testing
+
+Tests run against the Spanner emulator and cover the full stack: store operations, Watch delivery, Lease TTL, and the gRPC server layer (38 tests total).
+
+```bash
+# Start Spanner emulator
+docker run -d -p 9010:9010 -p 9020:9020 \
+  gcr.io/cloud-spanner-emulator/emulator
+
+# Run all tests
+SPANNER_EMULATOR_HOST=localhost:9010 go test ./...
+
+# Run with verbose output
+SPANNER_EMULATOR_HOST=localhost:9010 go test ./... -v -timeout=120s
+
+# Run a specific package
+SPANNER_EMULATOR_HOST=localhost:9010 go test ./pkg/store/... -v
+SPANNER_EMULATOR_HOST=localhost:9010 go test ./pkg/server/... -v
+```
+
+Tests skip gracefully when the emulator is not running. Each test creates its own isolated Spanner database and cleans up after itself.
+
+| Package | Tests | Coverage |
+|---------|-------|---------|
+| `pkg/store` | 23 | Create, Get (incl. historical), Update, Delete, List, Count, After, Compact, revision monotonicity, OldValue |
+| `pkg/store` (Watch) | 5 | Live events, DELETE type, replay from rev=N, prefix filter, OldValue/PrevKv |
+| `pkg/store` (Lease) | 4 | Grant/Revoke, natural TTL expiry, Keepalive |
+| `pkg/server` (gRPC) | 9 | Put/Get, Update, Delete, DeleteRange, prefix scan, historical Get, Txn CAS, Compact, Watch |
+
 ## Development
 
 ```bash
-# Run tests
-go test ./...
+# Build
+go mod vendor
+go build -o spanner-etcd ./cmd/server/
 
 # Run with race detector
-go run -race ./cmd/server/ --spanner-database=...
-
-# Local emulator
-SPANNER_EMULATOR_HOST=localhost:9010 go run ./cmd/server/ \
+SPANNER_EMULATOR_HOST=localhost:9010 \
+go run -race ./cmd/server/ \
   --spanner-database=projects/test/instances/test/databases/test \
   --log-level=debug
 ```
