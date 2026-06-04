@@ -30,6 +30,7 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -282,8 +283,27 @@ func printSample(kvs []*mvccpb.KeyValue, n int, log *zap.Logger) {
 
 func buildLogger(level string) (*zap.Logger, error) {
 	cfg := zap.NewProductionConfig()
-	cfg.EncoderConfig.TimeKey = "ts"
+	cfg.EncoderConfig.TimeKey = "time"
+	cfg.EncoderConfig.EncodeTime = zapcore.RFC3339NanoTimeEncoder
+	cfg.EncoderConfig.MessageKey = "message"
+	cfg.EncoderConfig.LevelKey = "severity"
+	cfg.EncoderConfig.EncodeLevel = gcpLevelEncoder
 	return cfg.Build()
+}
+
+func gcpLevelEncoder(l zapcore.Level, enc zapcore.PrimitiveArrayEncoder) {
+	switch l {
+	case zapcore.DebugLevel:
+		enc.AppendString("DEBUG")
+	case zapcore.InfoLevel:
+		enc.AppendString("INFO")
+	case zapcore.WarnLevel:
+		enc.AppendString("WARNING")
+	case zapcore.ErrorLevel:
+		enc.AppendString("ERROR")
+	default:
+		enc.AppendString("CRITICAL")
+	}
 }
 
 // ── flag parsing ──────────────────────────────────────────────────────────────

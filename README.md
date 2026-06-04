@@ -355,6 +355,18 @@ grpc_health_probe -addr=localhost:2379 -tls \
 
 Slow RPCs (>500ms) are logged at `info` level with method name and elapsed time. Set `--log-level=debug` to log all RPCs.
 
+### Structured logging (Google Cloud Logging)
+
+Logs are emitted as JSON with Google Cloud Logging field names:
+
+```json
+{"severity":"INFO","time":"2026-06-04T10:00:00Z","caller":"server/main.go:54","message":"spanner-etcd listening","addr":"0.0.0.0:2379"}
+{"severity":"WARNING","time":"...","message":"compact rows delete failed","count":0}
+{"severity":"ERROR","time":"...","message":"partition read error, retrying"}
+```
+
+`severity` maps to GCP severity levels (DEBUG / INFO / WARNING / ERROR / CRITICAL), enabling filtering and alerting in Cloud Console and Cloud Monitoring without a custom log parser.
+
 ## Why not kine?
 
 [kine](https://github.com/k3s-io/kine) is a popular etcd shim that translates the etcd API to SQL. It works well with PostgreSQL and MySQL, but is a poor fit for Spanner: kine's `generic.Dialect` assumes `MAX(id)` equals the global revision, which breaks with Spanner's `bit_reversed_positive` sequences; it relies on `LIKE ... ESCAPE` which Spanner doesn't support; and its query aliases (`AS current`, `AS compact`) collide with Spanner reserved words. The result is that almost every query needs to be overridden, at which point you're better off implementing the etcd `server.Backend` interface directly — which is what this project does.

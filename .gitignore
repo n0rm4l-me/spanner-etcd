@@ -1,6 +1,8 @@
-# Binary (root-level only, not helm chart subdirectory)
+# Binaries (root-level only)
 /spanner-etcd
+/spanner-etcd-migrate
 /cmd/server/spanner-etcd
+/cmd/migrate/spanner-etcd-migrate
 
 # TLS certificates (never commit private keys)
 certs/

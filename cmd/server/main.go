@@ -194,7 +194,15 @@ func splitCSV(s string) []string {
 	return strings.Split(s, ",")
 }
 
-// buildLogger creates a production JSON logger (Kubernetes-native).
+// buildLogger creates a production JSON logger compatible with Google Cloud Logging.
+//
+// GCP structured logging expects:
+//   - "severity"  for log level  (not "level")
+//   - "message"   for the text   (not "msg")
+//   - "time"      for timestamp  (ISO8601)
+//
+// This makes logs automatically parsed by Cloud Logging / GKE without
+// a custom parser, and enables severity-based filtering in Cloud Console.
 func buildLogger(level string) (*zap.Logger, error) {
 	var l zapcore.Level
 	if err := l.UnmarshalText([]byte(level)); err != nil {
@@ -202,10 +210,37 @@ func buildLogger(level string) (*zap.Logger, error) {
 	}
 	cfg := zap.NewProductionConfig()
 	cfg.Level = zap.NewAtomicLevelAt(l)
-	cfg.EncoderConfig.TimeKey = "ts"
-	cfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
-	cfg.EncoderConfig.MessageKey = "msg"
-	cfg.EncoderConfig.LevelKey = "level"
+
+	// Google Cloud Logging field names.
+	cfg.EncoderConfig.TimeKey = "time"
+	cfg.EncoderConfig.EncodeTime = zapcore.RFC3339NanoTimeEncoder
+	cfg.EncoderConfig.MessageKey = "message"
+	cfg.EncoderConfig.LevelKey = "severity"
 	cfg.EncoderConfig.CallerKey = "caller"
+
+	// Map zap levels to GCP severity strings.
+	// GCP accepts: DEBUG, INFO, NOTICE, WARNING, ERROR, CRITICAL, ALERT, EMERGENCY
+	cfg.EncoderConfig.EncodeLevel = gcpLevelEncoder
+
 	return cfg.Build(zap.AddCallerSkip(0))
+}
+
+// gcpLevelEncoder maps zap levels to Google Cloud Logging severity strings.
+func gcpLevelEncoder(l zapcore.Level, enc zapcore.PrimitiveArrayEncoder) {
+	switch l {
+	case zapcore.DebugLevel:
+		enc.AppendString("DEBUG")
+	case zapcore.InfoLevel:
+		enc.AppendString("INFO")
+	case zapcore.WarnLevel:
+		enc.AppendString("WARNING")
+	case zapcore.ErrorLevel:
+		enc.AppendString("ERROR")
+	case zapcore.DPanicLevel, zapcore.PanicLevel:
+		enc.AppendString("CRITICAL")
+	case zapcore.FatalLevel:
+		enc.AppendString("CRITICAL")
+	default:
+		enc.AppendString("DEFAULT")
+	}
 }
