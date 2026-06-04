@@ -70,21 +70,18 @@ func run(ctx context.Context, cfg appConfig, log *zap.Logger) error {
 	// ── Spanner client ────────────────────────────────────────────────────────
 	spannerClient, err := spanner.NewClientWithConfig(ctx, cfg.spannerDatabase,
 		spanner.ClientConfig{
-			// NumChannels: multiple gRPC channels for parallel RPCs.
-			// Each channel can handle ~100 concurrent streams.
 			NumChannels: cfg.spannerChannels,
 			SessionPoolConfig: spanner.SessionPoolConfig{
-				// MinOpened: keep sessions warm so the first requests don't pay
-				// the session creation cost (~100ms).
-				MinOpened: cfg.spannerMinSessions,
-				MaxOpened: cfg.spannerMaxSessions,
-				// WriteSessions: 50% write-capable sessions since Kubernetes
-				// is write-heavy during bootstrap and reconciliation loops.
-				WriteSessions: 0.5,
-				// HealthCheckWorkers: background goroutines that keep sessions alive.
-				// Default 10 is fine for up to 100 sessions.
+				MinOpened:          cfg.spannerMinSessions,
+				MaxOpened:          cfg.spannerMaxSessions,
+				WriteSessions:      0.5,
 				HealthCheckWorkers: 10,
 			},
+			// DisableNativeMetrics suppresses the "monitoring.timeSeries.create
+			// denied" noise from Spanner's built-in client-side metrics.
+			// Enable with --spanner-native-metrics if roles/monitoring.metricWriter
+			// is granted (useful for Spanner client dashboards in Cloud Monitoring).
+			DisableNativeMetrics: !cfg.spannerNativeMetrics,
 		},
 	)
 	if err != nil {
@@ -122,17 +119,18 @@ func run(ctx context.Context, cfg appConfig, log *zap.Logger) error {
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 type appConfig struct {
-	listenAddr         string
-	metricsAddr        string
-	spannerDatabase    string
-	spannerChannels    int
-	spannerMinSessions uint64
-	spannerMaxSessions uint64
-	tlsCert            string
-	tlsKey             string
-	tlsCA              string
-	peerURLs           []string
-	logLevel           string
+	listenAddr           string
+	metricsAddr          string
+	spannerDatabase      string
+	spannerChannels      int
+	spannerMinSessions   uint64
+	spannerMaxSessions   uint64
+	spannerNativeMetrics bool // enable Spanner built-in client-side metrics
+	tlsCert              string
+	tlsKey               string
+	tlsCA                string
+	peerURLs             []string
+	logLevel             string
 }
 
 func parseFlags() appConfig {
@@ -157,6 +155,8 @@ func parseFlags() appConfig {
 			cfg.listenAddr = strings.TrimPrefix(arg, "--listen-address=")
 		case strings.HasPrefix(arg, "--metrics-addr="):
 			cfg.metricsAddr = strings.TrimPrefix(arg, "--metrics-addr=")
+		case arg == "--spanner-native-metrics":
+			cfg.spannerNativeMetrics = true
 		case strings.HasPrefix(arg, "--spanner-database="):
 			cfg.spannerDatabase = strings.TrimPrefix(arg, "--spanner-database=")
 		case strings.HasPrefix(arg, "--tls-cert="):

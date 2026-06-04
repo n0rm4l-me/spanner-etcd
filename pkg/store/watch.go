@@ -127,7 +127,14 @@ func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) 
 			close(sub.ch)
 		}()
 
-		_, events, err := w.store.After(w.store.bgCtx, prefix, afterRev, pollBatchSize)
+		// afterRev=0 means "live watch from now" — no replay needed.
+		// afterRev>0 means "replay from that revision" — include startRev itself
+		// by querying After(afterRev-1) since After returns rev > N.
+		if afterRev == 0 {
+			<-subCtx.Done()
+			return
+		}
+		_, events, err := w.store.After(w.store.bgCtx, prefix, afterRev-1, pollBatchSize)
 		if err != nil {
 			w.log.Warn("watch replay error", zap.String("prefix", prefix), zap.Error(err))
 			return

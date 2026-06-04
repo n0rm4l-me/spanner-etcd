@@ -11,7 +11,8 @@ certs/
 *.p12
 *.srl
 
-# Go build cache
+# Go vendor directory — not committed; Docker builds use -mod=vendor
+# with a pre-created vendor dir from CI, or use GOPROXY
 /vendor/
 
 # IDE

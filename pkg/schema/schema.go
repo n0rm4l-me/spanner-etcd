@@ -23,6 +23,8 @@ import (
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
 	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -94,6 +96,10 @@ var statements = []string{
 }
 
 // Ensure creates or updates the schema and seeds the revision counter.
+// If the caller does not have spanner.databases.updateDdl permission
+// (e.g. runtime SA with databaseUser only), the DDL step is skipped with a
+// warning. In that case the schema must be managed externally (e.g. via
+// gcloud spanner databases ddl update or Terraform).
 func Ensure(ctx context.Context, adminClient *database.DatabaseAdminClient, dbPath string, log *zap.Logger) error {
 	log.Info("ensuring schema", zap.String("database", dbPath))
 
@@ -102,9 +108,19 @@ func Ensure(ctx context.Context, adminClient *database.DatabaseAdminClient, dbPa
 		Statements: statements,
 	})
 	if err != nil {
+		if isPermissionDenied(err) {
+			log.Warn("no DDL permission — assuming schema is already up to date (managed externally)",
+				zap.String("database", dbPath))
+			return nil
+		}
 		return fmt.Errorf("update DDL: %w", err)
 	}
 	if err := op.Wait(ctx); err != nil {
+		if isPermissionDenied(err) {
+			log.Warn("no DDL permission — assuming schema is already up to date (managed externally)",
+				zap.String("database", dbPath))
+			return nil
+		}
 		return fmt.Errorf("wait DDL: %w", err)
 	}
 
@@ -112,19 +128,24 @@ func Ensure(ctx context.Context, adminClient *database.DatabaseAdminClient, dbPa
 	return nil
 }
 
+func isPermissionDenied(err error) bool {
+	if s, ok := status.FromError(err); ok {
+		return s.Code() == codes.PermissionDenied
+	}
+	return false
+}
+
 // SeedRevCounter inserts the revision counter row if it doesn't exist.
 func SeedRevCounter(ctx context.Context, client *spanner.Client) error {
 	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		row, err := txn.ReadRow(ctx, "kv_rev", spanner.Key{RevCounterRow}, []string{"rev"})
+		_, err := txn.ReadRow(ctx, "kv_rev", spanner.Key{RevCounterRow}, []string{"rev"})
 		if err == nil {
-			var rev int64
-			_ = row.Column(0, &rev)
 			return nil // already seeded
 		}
-		if spanner.ErrCode(err).String() != "NotFound" {
-			// spanner.ErrCode returns a codes.Code; check string for portability
-			_ = err // non-fatal on unexpected errors
+		if spanner.ErrCode(err) != codes.NotFound {
+			return err
 		}
+		// Row not found — insert it.
 		return txn.BufferWrite([]*spanner.Mutation{
 			spanner.Insert("kv_rev", []string{"id", "rev"}, []interface{}{RevCounterRow, int64(0)}),
 		})

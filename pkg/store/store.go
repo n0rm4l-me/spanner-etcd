@@ -545,19 +545,55 @@ func (s *Store) compactRevision(ctx context.Context) (int64, error) {
 }
 
 // compactRows physically deletes rows that are superseded or deleted and older than targetRev.
+// Spanner PartitionedUpdate does not support subqueries, so we use a
+// ReadWriteTransaction with a simple DELETE that Spanner can execute directly.
+// Rows are deleted in batches to avoid exceeding transaction mutation limits.
 func (s *Store) compactRows(ctx context.Context, targetRev int64) {
+	// Find IDs to delete.
 	stmt := spanner.Statement{
-		SQL: `DELETE FROM kv WHERE id IN (
-		        SELECT id FROM kv
-		        WHERE rev <= @target
-		          AND (deleted = true OR prev_revision != 0)
-		      )`,
+		SQL: `SELECT id FROM kv
+		      WHERE rev <= @target
+		        AND (deleted = true OR prev_revision != 0)
+		      LIMIT 5000`,
 		Params: map[string]interface{}{"target": targetRev},
 	}
-	_, err := s.client.PartitionedUpdate(ctx, stmt)
-	if err != nil {
-		s.log.Warn("compact rows failed", zap.Error(err))
+
+	iter := s.client.Single().Query(ctx, stmt)
+	defer iter.Stop()
+
+	var ids []spanner.Key
+	for {
+		row, err := iter.Next()
+		if errors.Is(err, iterator.Done) {
+			break
+		}
+		if err != nil {
+			s.log.Warn("compact rows scan failed", zap.Error(err))
+			return
+		}
+		var id int64
+		if err := row.Column(0, &id); err != nil {
+			continue
+		}
+		ids = append(ids, spanner.Key{id})
 	}
+
+	if len(ids) == 0 {
+		return
+	}
+
+	// Delete in one transaction (up to 5000 mutations is well within Spanner limits).
+	var mutations []*spanner.Mutation
+	for _, id := range ids {
+		mutations = append(mutations, spanner.Delete("kv", id))
+	}
+
+	_, err := s.client.Apply(ctx, mutations)
+	if err != nil {
+		s.log.Warn("compact rows delete failed", zap.Int("count", len(ids)), zap.Error(err))
+		return
+	}
+	s.log.Info("compacted old revisions", zap.Int("deleted", len(ids)), zap.Int64("target_rev", targetRev))
 }
 
 // scanKV reads one row from a Spanner iterator into a KV struct.
