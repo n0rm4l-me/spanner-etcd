@@ -61,7 +61,7 @@ Multiple `spanner-etcd` replicas can run concurrently — all state lives in Spa
 |---------|--------|--------|-------|
 | **KV** | Range (Get/List) | ✅ | Single key, prefix, range, historical (rev=N), count-only |
 | **KV** | Put | ✅ | Create + unconditional update |
-| **KV** | DeleteRange | ✅ | Via Txn (Kubernetes-style) |
+| **KV** | DeleteRange | ✅ | Direct single key + prefix, and via Txn (Kubernetes-style) |
 | **KV** | Txn | ✅ | Compare-and-swap, all operators: MOD, VERSION, CREATE, VALUE |
 | **KV** | Compact | ✅ | Async GC of old revisions |
 | **Watch** | Watch | ✅ | Live streaming, prefix filter, revision replay, PrevKv, progress notify |
@@ -147,7 +147,7 @@ Must be executed via `client.Single().Query()` — Spanner rejects CS queries on
 | Get (single key) | ~5ms | ~20ms |
 | Put (create) | ~10ms | ~100ms |
 | List (prefix, 100 keys) | ~10ms | ~30ms |
-| Watch event delivery (Change Streams) | **~10–50ms** | N/A (fallback to poll) |
+| Watch event delivery (Change Streams) | **~10–50ms** | ~1s (emulator: poll fallback) |
 | Watch event delivery (poll fallback) | ~1s | ~1s |
 
 Write latency is bounded by one Spanner RW transaction: `UPDATE kv_rev THEN RETURN` + `INSERT INTO kv`. Both are buffered and committed atomically.
@@ -163,14 +163,9 @@ Watch latency with Change Streams is ~10–50ms because Spanner pushes DataChang
 - A Spanner instance and database
 
 ```bash
-go install github.com/paas/spanner-etcd/cmd/server@latest
-```
-
-Or build from source:
-
-```bash
-git clone https://github.com/paas/spanner-etcd
+git clone https://github.com/n0rm4l-me/spanner-etcd
 cd spanner-etcd
+go mod vendor
 go build -o spanner-etcd ./cmd/server/
 ```
 
@@ -180,11 +175,27 @@ go build -o spanner-etcd ./cmd/server/
 |------|-----|---------|-------------|
 | `--spanner-database` | `SPANNER_DATABASE` | — | **Required.** Full Spanner DB path: `projects/P/instances/I/databases/D` |
 | `--listen-address` | `LISTEN_ADDR` | `0.0.0.0:2379` | gRPC listen address |
+| `--metrics-addr` | `METRICS_ADDR` | `0.0.0.0:2381` | HTTP address for `/metrics` and `/healthz` |
 | `--tls-cert` | `TLS_CERT` | — | Server TLS certificate file |
 | `--tls-key` | `TLS_KEY` | — | Server TLS private key file |
 | `--tls-ca` | `TLS_CA` | — | CA certificate for mTLS client verification |
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, `error` |
 | `--peer-urls` | `PEER_URLS` | — | Peer URLs advertised in MemberList (comma-separated) |
+| `--spanner-native-metrics` | — | `false` | Enable Spanner built-in client metrics (requires `roles/monitoring.metricWriter`) |
+
+## Schema Management
+
+`spanner-etcd` applies DDL on startup via `UpdateDatabaseDdl`. If the runtime service account has only `roles/spanner.databaseUser` (no DDL rights), the server logs a warning and continues — assuming the schema was created externally. This is the recommended production setup:
+
+```bash
+# Run once by an admin with roles/spanner.databaseAdmin or roles/spanner.admin:
+gcloud spanner databases ddl update MY_DATABASE \
+  --instance=MY_INSTANCE \
+  --project=MY_PROJECT \
+  --ddl-file=./ddl/schema.sql
+```
+
+The runtime SA needs only `roles/spanner.databaseUser` on the database plus `roles/iam.workloadIdentityUser` for WIF.
 
 ## Quick Start
 
@@ -286,8 +297,8 @@ Slow RPCs (>500ms) are logged at `info` level with method name and elapsed time.
 | Watch latency | <10ms | ~10–50ms (Change Streams) |
 | Watch latency (emulator) | <10ms | ~1s (poll, CS not supported) |
 | Lease keepalive | Streaming | Streaming ✅ |
-| DeleteRange (bare gRPC) | ✅ | Via Txn only |
-| Defrag / Snapshot | ✅ | Not implemented |
+| DeleteRange (bare gRPC) | ✅ | ✅ Single key + prefix |
+| Defrag / Snapshot | ✅ | Not implemented (not needed — Spanner manages storage) |
 | Auth (RBAC) | ✅ | Not implemented |
 
 ### Roadmap
