@@ -8,9 +8,11 @@ COPY go.mod go.sum ./
 COPY vendor/ vendor/
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -mod=vendor -ldflags="-s -w" -o /spanner-etcd ./cmd/server/
+    go build -mod=vendor -ldflags="-s -w" -o /spanner-etcd ./cmd/server/ && \
+    go build -mod=vendor -ldflags="-s -w" -o /spanner-etcd-migrate ./cmd/migrate/
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /spanner-etcd /spanner-etcd
+COPY --from=builder /spanner-etcd-migrate /spanner-etcd-migrate
 EXPOSE 2379 2381
 ENTRYPOINT ["/spanner-etcd"]
