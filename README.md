@@ -281,22 +281,22 @@ Spanner supports multi-region instance configurations out of the box — no chan
 
 ### Instance configs
 
-| Config | Regions | RPO | Write latency | Use case |
-|--------|---------|-----|---------------|---------|
-| `regional-asia-northeast1` | Tokyo only | 0 (single region) | ~5ms | Dev / single-zone HA |
-| `asia1` | Tokyo + Osaka | 0 (synchronous) | ~10ms | Asia multi-region |
-| `nam4` | N. Virginia + S. Carolina | 0 (synchronous) | ~10ms | US multi-region |
-| `eur3` | Belgium + Netherlands | 0 (synchronous) | ~10ms | EU multi-region |
+| Config | Coverage | RPO | Write latency | Use case |
+|--------|----------|-----|---------------|---------|
+| `regional-us-central1` | Single region | 0 | ~5ms | Dev / single-zone HA |
+| `nam4` | US East + West | 0 (synchronous) | ~10ms | US multi-region |
+| `eur3` | EU West + North | 0 (synchronous) | ~10ms | EU multi-region |
+| `asia1` | Asia East + West | 0 (synchronous) | ~10ms | Asia multi-region |
 | `nam-eur-asia1` | US + EU + Asia | 0 (synchronous) | ~30ms | Global |
 
-Multi-region configs replicate writes synchronously across all regions before acknowledging. `RPO=0` means **zero data loss** even if an entire region fails — stronger than etcd's single-region Raft.
+Multi-region configs replicate writes synchronously across regions before acknowledging. `RPO=0` means **zero data loss** even if an entire region fails — stronger than etcd's single-region Raft.
 
 ### Creating a multi-region instance
 
 ```bash
-# Asia multi-region (Tokyo + Osaka)
+# US multi-region (East + West)
 gcloud spanner instances create k8s-etcd \
-  --config=asia1 \
+  --config=nam4 \
   --description="spanner-etcd multi-region" \
   --processing-units=1000 \
   --project=MY_PROJECT
@@ -316,7 +316,7 @@ spanner-etcd \
 ### Horizontal scaling with multi-region
 
 ```
-Region: asia-northeast1 (Tokyo)          Region: asia-northeast2 (Osaka)
+us-east1                                  us-west1
 ┌──────────────────────────┐             ┌──────────────────────────┐
 │  spanner-etcd replica 1  │             │  spanner-etcd replica 2  │
 │  spanner-etcd replica 2  │             │  spanner-etcd replica 3  │
@@ -325,11 +325,11 @@ Region: asia-northeast1 (Tokyo)          Region: asia-northeast2 (Osaka)
              └──────────────┬──────────────────────────┘
                             │
                    Google Cloud Spanner
-                   (asia1 multi-region)
+                   (nam4 multi-region)
                    synchronous replication
 ```
 
-Clients in Tokyo connect to Tokyo replicas (~1ms), clients in Osaka connect to Osaka replicas (~1ms). All replicas read from and write to the same Spanner database. Watch events via Change Streams are delivered independently per replica with ~10–50ms latency.
+Clients in the east connect to east replicas (~1ms), clients in the west connect to west replicas (~1ms). All replicas share the same Spanner database. Watch events via Change Streams are delivered per replica with ~10–50ms latency.
 
 ### Processing units
 
