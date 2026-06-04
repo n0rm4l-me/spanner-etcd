@@ -9,7 +9,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/paas/spanner-etcd/pkg/store"
+	"github.com/n0rm4l-me/spanner-etcd/pkg/store"
 )
 
 // LeaseServer implements etcdserverpb.LeaseServer.

@@ -8,7 +8,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 
-	"github.com/paas/spanner-etcd/pkg/metrics"
+	"github.com/n0rm4l-me/spanner-etcd/pkg/metrics"
 )
 
 // contextWithCancel is a helper to create a cancellable context from an interface.

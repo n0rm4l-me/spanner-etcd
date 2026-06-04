@@ -1,4 +1,4 @@
-module github.com/paas/spanner-etcd
+module github.com/n0rm4l-me/spanner-etcd
 
 go 1.26.4
 
@@ -25,6 +25,8 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20260202195803-dba9d589def2 // indirect
+	github.com/coreos/go-semver v0.3.1 // indirect
+	github.com/coreos/go-systemd/v22 v22.5.0 // indirect
 	github.com/envoyproxy/go-control-plane/envoy v1.37.0 // indirect
 	github.com/envoyproxy/protoc-gen-validate v1.3.3 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
@@ -44,6 +46,8 @@ require (
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/spiffe/go-spiffe/v2 v2.6.0 // indirect
+	go.etcd.io/etcd/client/pkg/v3 v3.6.11 // indirect
+	go.etcd.io/etcd/client/v3 v3.6.11 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/detectors/gcp v1.42.0 // indirect
@@ -54,7 +58,7 @@ require (
 	go.opentelemetry.io/otel/sdk v1.43.0 // indirect
 	go.opentelemetry.io/otel/sdk/metric v1.43.0 // indirect
 	go.opentelemetry.io/otel/trace v1.43.0 // indirect
-	go.uber.org/multierr v1.10.0 // indirect
+	go.uber.org/multierr v1.11.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	golang.org/x/crypto v0.49.0 // indirect
 	golang.org/x/net v0.52.0 // indirect

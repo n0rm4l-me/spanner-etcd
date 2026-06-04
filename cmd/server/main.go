@@ -25,9 +25,9 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/paas/spanner-etcd/pkg/schema"
-	"github.com/paas/spanner-etcd/pkg/server"
-	"github.com/paas/spanner-etcd/pkg/store"
+	"github.com/n0rm4l-me/spanner-etcd/pkg/schema"
+	"github.com/n0rm4l-me/spanner-etcd/pkg/server"
+	"github.com/n0rm4l-me/spanner-etcd/pkg/store"
 )
 
 func main() {

@@ -6,7 +6,7 @@ import (
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.uber.org/zap"
 
-	"github.com/paas/spanner-etcd/pkg/store"
+	"github.com/n0rm4l-me/spanner-etcd/pkg/store"
 )
 
 // MaintenanceServer implements etcdserverpb.MaintenanceServer.

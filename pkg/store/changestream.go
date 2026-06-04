@@ -36,7 +36,7 @@ import (
 	"google.golang.org/api/iterator"
 	"google.golang.org/protobuf/types/known/structpb"
 
-	"github.com/paas/spanner-etcd/pkg/metrics"
+	"github.com/n0rm4l-me/spanner-etcd/pkg/metrics"
 )
 
 const (

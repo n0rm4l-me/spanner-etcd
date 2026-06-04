@@ -9,7 +9,7 @@ import (
 	"cloud.google.com/go/spanner"
 	"go.uber.org/zap"
 
-	"github.com/paas/spanner-etcd/pkg/metrics"
+	"github.com/n0rm4l-me/spanner-etcd/pkg/metrics"
 )
 
 // Lease represents an active lease.

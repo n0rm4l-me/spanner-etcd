@@ -21,7 +21,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"github.com/paas/spanner-etcd/pkg/store"
+	"github.com/n0rm4l-me/spanner-etcd/pkg/store"
 )
 
 const (
@@ -45,10 +45,20 @@ type Config struct {
 
 // Server wraps the gRPC server and all etcd service implementations.
 type Server struct {
-	grpc   *grpc.Server
-	store  *store.Store
-	config Config
-	log    *zap.Logger
+	grpc     *grpc.Server
+	store    *store.Store
+	config   Config
+	log      *zap.Logger
+	listener net.Listener // set during Serve, used by Addr()
+}
+
+// Addr returns the address the server is listening on.
+// Only valid after Serve has been called.
+func (s *Server) Addr() string {
+	if s.listener != nil {
+		return s.listener.Addr().String()
+	}
+	return s.config.ListenAddr
 }
 
 // New creates a Server. Call Serve to start accepting connections.
@@ -138,7 +148,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", s.config.ListenAddr, err)
 	}
-	s.log.Info("spanner-etcd listening", zap.String("addr", s.config.ListenAddr))
+	s.listener = lis
+	s.log.Info("spanner-etcd listening", zap.String("addr", lis.Addr().String()))
 
 	// Start metrics server if configured.
 	if s.config.MetricsAddr != "" {

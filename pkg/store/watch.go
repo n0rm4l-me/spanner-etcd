@@ -35,7 +35,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/paas/spanner-etcd/pkg/metrics"
+	"github.com/n0rm4l-me/spanner-etcd/pkg/metrics"
 )
 
 const (

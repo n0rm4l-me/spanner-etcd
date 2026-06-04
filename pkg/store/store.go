@@ -14,8 +14,8 @@ import (
 	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
 
-	"github.com/paas/spanner-etcd/pkg/metrics"
-	"github.com/paas/spanner-etcd/pkg/schema"
+	"github.com/n0rm4l-me/spanner-etcd/pkg/metrics"
+	"github.com/n0rm4l-me/spanner-etcd/pkg/schema"
 )
 
 // ErrKeyNotFound is returned by Get when the key does not exist.
