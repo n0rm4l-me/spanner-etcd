@@ -8,6 +8,8 @@ import (
 
 	"cloud.google.com/go/spanner"
 	"go.uber.org/zap"
+
+	"github.com/paas/spanner-etcd/pkg/metrics"
 )
 
 // Lease represents an active lease.
@@ -74,6 +76,7 @@ func (lm *LeaseManager) Grant(ctx context.Context, ttl int64) (*Lease, error) {
 	lm.mu.Lock()
 	lm.leases[id] = lease
 	lm.mu.Unlock()
+	metrics.ActiveLeases.Inc()
 
 	// Schedule expiry using the server-lifetime context, not the request context.
 	// The request context is cancelled as soon as LeaseGrant returns to the client.
@@ -84,8 +87,12 @@ func (lm *LeaseManager) Grant(ctx context.Context, ttl int64) (*Lease, error) {
 // Revoke removes a lease and deletes all keys associated with it.
 func (lm *LeaseManager) Revoke(ctx context.Context, id int64) error {
 	lm.mu.Lock()
+	_, existed := lm.leases[id]
 	delete(lm.leases, id)
 	lm.mu.Unlock()
+	if existed {
+		metrics.ActiveLeases.Dec()
+	}
 
 	// Use bgCtx so expiry works even when called from a short-lived request ctx.
 	return lm.expireLeaseKeys(lm.bgCtx, id)
@@ -139,6 +146,7 @@ func (lm *LeaseManager) scheduleExpiry(ctx context.Context, lease *Lease) {
 	}
 
 	lm.log.Info("lease expired", zap.Int64("lease_id", lease.ID))
+	metrics.LeaseExpirations.Inc()
 	if err := lm.Revoke(ctx, lease.ID); err != nil {
 		lm.log.Warn("lease expiry error", zap.Int64("lease_id", lease.ID), zap.Error(err))
 	}

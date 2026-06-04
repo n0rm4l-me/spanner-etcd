@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
@@ -17,6 +18,8 @@ import (
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/paas/spanner-etcd/pkg/store"
 )
@@ -29,14 +32,15 @@ const (
 
 // Config holds server configuration.
 type Config struct {
-	ListenAddr string
-	TLSCert    string // server certificate file
-	TLSKey     string // server private key file
-	TLSCAFile  string // CA cert for verifying client certs (enables mTLS when set)
-	PeerURLs   []string
-	Version    string
-	MemberID   uint64
-	ClusterID  uint64
+	ListenAddr  string
+	TLSCert     string // server certificate file
+	TLSKey      string // server private key file
+	TLSCAFile   string // CA cert for verifying client certs (enables mTLS when set)
+	MetricsAddr string // HTTP address for /metrics; empty = disabled
+	PeerURLs    []string
+	Version     string
+	MemberID    uint64
+	ClusterID   uint64
 }
 
 // Server wraps the gRPC server and all etcd service implementations.
@@ -127,19 +131,22 @@ func buildServerCreds(certFile, keyFile, caFile string) (credentials.TransportCr
 	return credentials.NewTLS(cfg), nil
 }
 
-// Serve starts the gRPC listener. Blocks until ctx is cancelled.
+// Serve starts the gRPC listener and, if configured, the metrics HTTP server.
+// Blocks until ctx is cancelled.
 func (s *Server) Serve(ctx context.Context) error {
 	lis, err := net.Listen("tcp", s.config.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", s.config.ListenAddr, err)
 	}
-
 	s.log.Info("spanner-etcd listening", zap.String("addr", s.config.ListenAddr))
 
+	// Start metrics server if configured.
+	if s.config.MetricsAddr != "" {
+		go s.serveMetrics(ctx)
+	}
+
 	errCh := make(chan error, 1)
-	go func() {
-		errCh <- s.grpc.Serve(lis)
-	}()
+	go func() { errCh <- s.grpc.Serve(lis) }()
 
 	select {
 	case <-ctx.Done():
@@ -147,5 +154,27 @@ func (s *Server) Serve(ctx context.Context) error {
 		return nil
 	case err := <-errCh:
 		return err
+	}
+}
+
+// serveMetrics runs a minimal HTTP server exposing /metrics and /healthz.
+func (s *Server) serveMetrics(ctx context.Context) {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok")) //nolint:errcheck
+	})
+	srv := &http.Server{Addr: s.config.MetricsAddr, Handler: mux}
+
+	s.log.Info("metrics server listening", zap.String("addr", s.config.MetricsAddr))
+
+	go func() {
+		<-ctx.Done()
+		srv.Close() //nolint:errcheck
+	}()
+
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		s.log.Warn("metrics server error", zap.Error(err))
 	}
 }

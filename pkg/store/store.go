@@ -14,6 +14,7 @@ import (
 	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
 
+	"github.com/paas/spanner-etcd/pkg/metrics"
 	"github.com/paas/spanner-etcd/pkg/schema"
 )
 
@@ -241,7 +242,6 @@ func (s *Store) Count(ctx context.Context, prefix, startKey string, revision int
 func (s *Store) Create(ctx context.Context, key string, value []byte, leaseID int64) (int64, error) {
 	var newRev int64
 	_, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		// Check key does not exist (not deleted).
 		exists, err := s.keyExistsTxn(ctx, txn, key)
 		if err != nil {
 			return err
@@ -249,13 +249,10 @@ func (s *Store) Create(ctx context.Context, key string, value []byte, leaseID in
 		if exists {
 			return ErrKeyExists
 		}
-
 		newRev, err = s.bumpRevTxn(ctx, txn)
 		if err != nil {
 			return err
 		}
-
-		// Omit "id" — the DEFAULT expression (GET_NEXT_SEQUENCE_VALUE) fills it.
 		return txn.BufferWrite([]*spanner.Mutation{
 			spanner.Insert("kv",
 				[]string{"rev", "key", "value", "old_value", "lease_id", "deleted", "created", "create_revision", "prev_revision"},
@@ -263,9 +260,16 @@ func (s *Store) Create(ctx context.Context, key string, value []byte, leaseID in
 			),
 		})
 	})
+	status := "ok"
+	if err != nil {
+		status = "error"
+	}
+	metrics.KVOperationsTotal.WithLabelValues("create", status).Inc()
+	metrics.SpannerTransactions.WithLabelValues(status).Inc()
 	if err != nil {
 		return 0, err
 	}
+	metrics.CurrentRevision.Set(float64(newRev))
 	s.watcher.notify(newRev)
 	return newRev, nil
 }
@@ -300,6 +304,12 @@ func (s *Store) Update(ctx context.Context, key string, value []byte, revision, 
 			),
 		})
 	})
+	status := "ok"
+	if err != nil {
+		status = "error"
+	}
+	metrics.KVOperationsTotal.WithLabelValues("update", status).Inc()
+	metrics.SpannerTransactions.WithLabelValues(status).Inc()
 	if errors.Is(err, ErrRevisionMismatch) || errors.Is(err, ErrKeyNotFound) {
 		curRev, _ := s.CurrentRevision(ctx)
 		return curRev, prev, false, nil
@@ -307,6 +317,7 @@ func (s *Store) Update(ctx context.Context, key string, value []byte, revision, 
 	if err != nil {
 		return 0, nil, false, err
 	}
+	metrics.CurrentRevision.Set(float64(newRev))
 	s.watcher.notify(newRev)
 	return newRev, prev, true, nil
 }
@@ -341,6 +352,12 @@ func (s *Store) Delete(ctx context.Context, key string, revision int64) (int64, 
 			),
 		})
 	})
+	status := "ok"
+	if err != nil {
+		status = "error"
+	}
+	metrics.KVOperationsTotal.WithLabelValues("delete", status).Inc()
+	metrics.SpannerTransactions.WithLabelValues(status).Inc()
 	if errors.Is(err, ErrRevisionMismatch) || errors.Is(err, ErrKeyNotFound) {
 		curRev, _ := s.CurrentRevision(ctx)
 		return curRev, prev, false, nil
@@ -348,6 +365,7 @@ func (s *Store) Delete(ctx context.Context, key string, revision int64) (int64, 
 	if err != nil {
 		return 0, nil, false, err
 	}
+	metrics.CurrentRevision.Set(float64(newRev))
 	s.watcher.notify(newRev)
 	return newRev, prev, true, nil
 }

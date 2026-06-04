@@ -105,11 +105,12 @@ func run(ctx context.Context, cfg appConfig, log *zap.Logger) error {
 
 	// ── gRPC server ───────────────────────────────────────────────────────────
 	srv, err := server.New(ctx, kvStore, server.Config{
-		ListenAddr: cfg.listenAddr,
-		TLSCert:    cfg.tlsCert,
-		TLSKey:     cfg.tlsKey,
-		TLSCAFile:  cfg.tlsCA,
-		PeerURLs:   cfg.peerURLs,
+		ListenAddr:  cfg.listenAddr,
+		MetricsAddr: cfg.metricsAddr,
+		TLSCert:     cfg.tlsCert,
+		TLSKey:      cfg.tlsKey,
+		TLSCAFile:   cfg.tlsCA,
+		PeerURLs:    cfg.peerURLs,
 	}, log)
 	if err != nil {
 		return fmt.Errorf("create server: %w", err)
@@ -122,13 +123,14 @@ func run(ctx context.Context, cfg appConfig, log *zap.Logger) error {
 
 type appConfig struct {
 	listenAddr         string
+	metricsAddr        string
 	spannerDatabase    string
 	spannerChannels    int
 	spannerMinSessions uint64
 	spannerMaxSessions uint64
 	tlsCert            string
 	tlsKey             string
-	tlsCA              string // CA cert for mTLS client verification
+	tlsCA              string
 	peerURLs           []string
 	logLevel           string
 }
@@ -136,6 +138,7 @@ type appConfig struct {
 func parseFlags() appConfig {
 	cfg := appConfig{
 		listenAddr:         envOr("LISTEN_ADDR", "0.0.0.0:2379"),
+		metricsAddr:        envOr("METRICS_ADDR", "0.0.0.0:2381"),
 		spannerDatabase:    envOr("SPANNER_DATABASE", ""),
 		spannerChannels:    4,
 		spannerMinSessions: 10,
@@ -152,6 +155,8 @@ func parseFlags() appConfig {
 		switch {
 		case strings.HasPrefix(arg, "--listen-address="):
 			cfg.listenAddr = strings.TrimPrefix(arg, "--listen-address=")
+		case strings.HasPrefix(arg, "--metrics-addr="):
+			cfg.metricsAddr = strings.TrimPrefix(arg, "--metrics-addr=")
 		case strings.HasPrefix(arg, "--spanner-database="):
 			cfg.spannerDatabase = strings.TrimPrefix(arg, "--spanner-database=")
 		case strings.HasPrefix(arg, "--tls-cert="):

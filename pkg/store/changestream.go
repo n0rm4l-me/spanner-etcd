@@ -42,6 +42,8 @@ import (
 	"cloud.google.com/go/spanner"
 	"go.uber.org/zap"
 	"google.golang.org/api/iterator"
+
+	"github.com/paas/spanner-etcd/pkg/metrics"
 )
 
 const (
@@ -224,12 +226,14 @@ func (r *ChangeStreamReader) Start(ctx context.Context) error {
 			r.mu.Unlock()
 
 			wg.Add(1)
+			metrics.CSActivePartitions.Inc()
 			go func(ps *partitionState) {
 				defer wg.Done()
 				defer func() {
 					r.mu.Lock()
 					delete(r.active, ps.token)
 					r.mu.Unlock()
+					metrics.CSActivePartitions.Dec()
 				}()
 				r.readPartition(ctx, ps)
 			}(p)
@@ -270,6 +274,7 @@ func (r *ChangeStreamReader) readPartition(ctx context.Context, p *partitionStat
 			return
 		}
 		// Transient error — backoff and retry.
+		metrics.CSPartitionRestarts.Inc()
 		log.Warn("partition read error, retrying", zap.Error(err))
 		select {
 		case <-time.After(2 * time.Second):

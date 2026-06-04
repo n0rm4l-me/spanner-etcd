@@ -34,6 +34,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/paas/spanner-etcd/pkg/metrics"
 )
 
 const (
@@ -115,6 +117,7 @@ func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) 
 	w.mu.Lock()
 	w.subscribers = append(w.subscribers, sub)
 	w.mu.Unlock()
+	metrics.ActiveWatches.Inc()
 
 	// Replay existing events from afterRev before switching to the live feed.
 	// Use bgCtx so the query isn't cancelled when the gRPC request context ends.
@@ -153,6 +156,13 @@ func (w *Watcher) removeSub(sub *subscriber) {
 		}
 	}
 	w.subscribers = out
+	metrics.ActiveWatches.Dec()
+}
+
+// dispatchFromCS is the DispatchFunc passed to the Change Stream reader.
+func (w *Watcher) dispatchFromCS(events []*Event) {
+	metrics.WatchEventsTotal.WithLabelValues("change_stream").Add(float64(len(events)))
+	w.dispatchEvents(events)
 }
 
 // dispatchEvents routes a slice of events to all matching subscribers.
@@ -184,6 +194,7 @@ func (w *Watcher) dispatchEvents(events []*Event) {
 			// Channel full — drop subscription (etcd semantics: client reconnects).
 			w.log.Warn("subscriber channel full, closing watch",
 				zap.String("prefix", sub.prefix))
+			metrics.WatchSubscriberDropsTotal.Inc()
 			sub.cancel()
 		}
 	}
@@ -228,7 +239,10 @@ func (w *Watcher) doPoll(ctx context.Context, lastRev int64) int64 {
 		w.log.Warn("poll error", zap.Error(err))
 		return lastRev
 	}
-	w.dispatchEvents(events)
+	if len(events) > 0 {
+		metrics.WatchEventsTotal.WithLabelValues("poll").Add(float64(len(events)))
+		w.dispatchEvents(events)
+	}
 	return curRev
 }
 
@@ -244,7 +258,7 @@ func (w *Watcher) startChangeStream(ctx context.Context) {
 	reader := NewChangeStreamReader(
 		w.store.client,
 		replicaID,
-		w.dispatchEvents, // Change Stream events go directly to subscribers
+		w.dispatchFromCS, // metrics-instrumented dispatch
 		w.log,
 	)
 
@@ -254,6 +268,7 @@ func (w *Watcher) startChangeStream(ctx context.Context) {
 		select {
 		case <-time.After(csHealthyDuration):
 			w.csHealthy.Store(1)
+			metrics.CSMode.Set(1)
 			w.log.Info("change stream healthy, slowing poll loop")
 		case <-ctx.Done():
 		case <-w.stopCh:
@@ -261,9 +276,8 @@ func (w *Watcher) startChangeStream(ctx context.Context) {
 	}()
 
 	if err := reader.Start(ctx); err != nil {
-		// Not an error on the emulator — it's expected.
 		w.log.Warn("change stream unavailable, using poll fallback", zap.Error(err))
-		// Reset healthy flag so the poll loop stays at full speed.
 		w.csHealthy.Store(0)
+		metrics.CSMode.Set(0)
 	}
 }
