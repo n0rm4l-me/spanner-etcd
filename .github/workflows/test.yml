@@ -38,5 +38,47 @@ jobs:
         run: |
           echo "## Test Results" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          grep -E "^(=== RUN|--- PASS|--- FAIL|FAIL|ok )" /tmp/test-output.txt >> $GITHUB_STEP_SUMMARY || true
+          grep -E "^(--- PASS|--- FAIL|FAIL|ok )" /tmp/test-output.txt >> $GITHUB_STEP_SUMMARY || true
           echo '```' >> $GITHUB_STEP_SUMMARY
+
+  bench:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    services:
+      spanner-emulator:
+        image: gcr.io/cloud-spanner-emulator/emulator
+        ports:
+          - 9010:9010
+          - 9020:9020
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: bench
+        run: |
+          go test ./bench/... -bench=. -benchtime=5s -benchmem -timeout=300s \
+            2>&1 | tee /tmp/bench-output.txt
+        env:
+          SPANNER_EMULATOR_HOST: localhost:9010
+
+      - name: summary
+        if: always()
+        run: |
+          echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          grep -E "^(Benchmark|PASS|FAIL|ok )" /tmp/bench-output.txt >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: /tmp/bench-output.txt
+          retention-days: 30
