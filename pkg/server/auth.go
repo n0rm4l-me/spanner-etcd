@@ -17,14 +17,11 @@ import (
 )
 
 const (
-	// tokenTTL is set to 24 hours. etcd simple tokens don't expire in many
-	// production deployments, and most clients (jetcd, etcd-java) do not
-	// refresh tokens automatically — they authenticate once at startup and
-	// reuse the token for the lifetime of the connection. A 24h TTL covers
-	// any reasonable session without requiring clients to re-authenticate.
-	tokenTTL      = 24 * time.Hour
-	tokenHeader   = "token"
-	authHeaderKey = "authorization"
+	// DefaultTokenTTL matches the etcd default simple token TTL (5 minutes).
+	// Override via Config.AuthTokenTTL.
+	DefaultTokenTTL = 5 * time.Minute
+	tokenHeader     = "token"
+	authHeaderKey   = "authorization"
 )
 
 // AuthServer implements etcdserverpb.AuthServer.
@@ -37,6 +34,7 @@ type AuthServer struct {
 	users   map[string]string    // username → password
 	tokens  map[string]tokenInfo // token → info
 	enabled bool
+	ttl     time.Duration
 	log     *zap.Logger
 }
 
@@ -45,11 +43,15 @@ type tokenInfo struct {
 	expiresAt time.Time
 }
 
-func newAuthServer(users map[string]string, log *zap.Logger) *AuthServer {
+func newAuthServer(users map[string]string, ttl time.Duration, log *zap.Logger) *AuthServer {
+	if ttl <= 0 {
+		ttl = DefaultTokenTTL
+	}
 	return &AuthServer{
 		users:   users,
 		tokens:  make(map[string]tokenInfo),
 		enabled: len(users) > 0,
+		ttl:     ttl,
 		log:     log,
 	}
 }
@@ -72,7 +74,7 @@ func (a *AuthServer) Authenticate(ctx context.Context, r *etcdserverpb.Authentic
 	tok := generateToken()
 	a.tokens[tok] = tokenInfo{
 		username:  r.Name,
-		expiresAt: time.Now().Add(tokenTTL),
+		expiresAt: time.Now().Add(a.ttl),
 	}
 
 	a.log.Info("authenticated", zap.String("user", r.Name))

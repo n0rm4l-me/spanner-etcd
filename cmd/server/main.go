@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"cloud.google.com/go/spanner"
 	spanneradmin "cloud.google.com/go/spanner/admin/database/apiv1"
@@ -102,13 +103,14 @@ func run(ctx context.Context, cfg appConfig, log *zap.Logger) error {
 
 	// ── gRPC server ───────────────────────────────────────────────────────────
 	srv, err := server.New(ctx, kvStore, server.Config{
-		ListenAddr:  cfg.listenAddr,
-		MetricsAddr: cfg.metricsAddr,
-		TLSCert:     cfg.tlsCert,
-		TLSKey:      cfg.tlsKey,
-		TLSCAFile:   cfg.tlsCA,
-		AuthUsers:   cfg.authUsers,
-		PeerURLs:    cfg.peerURLs,
+		ListenAddr:   cfg.listenAddr,
+		MetricsAddr:  cfg.metricsAddr,
+		TLSCert:      cfg.tlsCert,
+		TLSKey:       cfg.tlsKey,
+		TLSCAFile:    cfg.tlsCA,
+		AuthUsers:    cfg.authUsers,
+		AuthTokenTTL: cfg.authTokenTTL,
+		PeerURLs:     cfg.peerURLs,
 	}, log)
 	if err != nil {
 		return fmt.Errorf("create server: %w", err)
@@ -130,7 +132,8 @@ type appConfig struct {
 	tlsCert              string
 	tlsKey               string
 	tlsCA                string
-	authUsers            string // "user1:pass1,user2:pass2" — from env ETCD_AUTH_USERS
+	authUsers            string        // "user1:pass1,user2:pass2" — from env ETCD_AUTH_USERS
+	authTokenTTL         time.Duration // 0 = DefaultTokenTTL (5m)
 	peerURLs             []string
 	logLevel             string
 }
@@ -170,6 +173,11 @@ func parseFlags() appConfig {
 			cfg.tlsCA = strings.TrimPrefix(arg, "--tls-ca=")
 		case strings.HasPrefix(arg, "--auth-users="):
 			cfg.authUsers = strings.TrimPrefix(arg, "--auth-users=")
+		case strings.HasPrefix(arg, "--auth-token-ttl="):
+			d, err := time.ParseDuration(strings.TrimPrefix(arg, "--auth-token-ttl="))
+			if err == nil {
+				cfg.authTokenTTL = d
+			}
 		case strings.HasPrefix(arg, "--log-level="):
 			cfg.logLevel = strings.TrimPrefix(arg, "--log-level=")
 		case strings.HasPrefix(arg, "--peer-urls="):

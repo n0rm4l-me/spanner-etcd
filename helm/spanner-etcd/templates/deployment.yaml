@@ -35,16 +35,6 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args:
-            - --spanner-database={{ required "spannerDatabase is required" .Values.spannerDatabase }}
-            - --listen-address={{ .Values.listenAddr }}
-            - --metrics-addr={{ .Values.metricsAddr }}
-            - --log-level={{ .Values.logLevel }}
-            {{- if .Values.tls.existingSecret }}
-            - --tls-cert=/tls/tls.crt
-            - --tls-key=/tls/tls.key
-            - --tls-ca=/tls/ca.crt
-            {{- end }}
           env:
             {{- if or .Values.auth.users .Values.auth.existingSecret }}
             - name: ETCD_AUTH_USERS
@@ -52,6 +42,19 @@ spec:
                 secretKeyRef:
                   name: {{ if .Values.auth.existingSecret }}{{ .Values.auth.existingSecret }}{{ else }}{{ include "spanner-etcd.fullname" . }}-auth{{ end }}
                   key: {{ .Values.auth.existingSecretKey }}
+            {{- end }}
+          args:
+            - --spanner-database={{ required "spannerDatabase is required" .Values.spannerDatabase }}
+            - --listen-address={{ .Values.listenAddr }}
+            - --metrics-addr={{ .Values.metricsAddr }}
+            - --log-level={{ .Values.logLevel }}
+            {{- if .Values.auth.tokenTTL }}
+            - --auth-token-ttl={{ .Values.auth.tokenTTL }}
+            {{- end }}
+            {{- if .Values.tls.existingSecret }}
+            - --tls-cert=/tls/tls.crt
+            - --tls-key=/tls/tls.key
+            - --tls-ca=/tls/ca.crt
             {{- end }}
           ports:
             - name: etcd

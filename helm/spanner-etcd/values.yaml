@@ -66,6 +66,10 @@ auth:
   # The Secret must have a key named "users" with the same format.
   existingSecret: ""
   existingSecretKey: "users"
+  # Token TTL. Default matches etcd simple-token default (5m).
+  # Increase if your client does not refresh tokens automatically.
+  # Example: "24h", "1h", "30m"
+  tokenTTL: "5m"
 
 service:
   type: ClusterIP

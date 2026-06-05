@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"time"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.uber.org/zap"
@@ -37,7 +38,8 @@ type Config struct {
 	TLSKey      string // server private key file
 	TLSCAFile   string // CA cert for verifying client certs (enables mTLS when set)
 	MetricsAddr string // HTTP address for /metrics; empty = disabled
-	AuthUsers   string // "user1:pass1,user2:pass2" — empty = auth disabled
+	AuthUsers    string        // "user1:pass1,user2:pass2" — empty = auth disabled
+	AuthTokenTTL time.Duration // token lifetime; 0 = DefaultTokenTTL (5 min)
 	PeerURLs    []string
 	Version     string
 	MemberID    uint64
@@ -75,7 +77,7 @@ func New(ctx context.Context, s *store.Store, cfg Config, log *zap.Logger) (*Ser
 	}
 
 	// Auth — parse users and build interceptors.
-	auth := newAuthServer(parseUsers(cfg.AuthUsers), log)
+	auth := newAuthServer(parseUsers(cfg.AuthUsers), cfg.AuthTokenTTL, log)
 	if auth.enabled {
 		log.Info("auth enabled", zap.Int("users", len(auth.users)))
 	}
