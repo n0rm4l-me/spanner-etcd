@@ -249,7 +249,34 @@ etcdctl --endpoints=https://localhost:2379 \
   endpoint health
 ```
 
-### 3. As Kubernetes etcd backend (k3s)
+### 3. As Kubernetes etcd backend (kubeadm)
+
+Tested with **real Kubernetes v1.31 (kubeadm)** — full control plane including
+kube-apiserver, kube-controller-manager, kube-scheduler, CoreDNS, Flannel CNI.
+
+```bash
+# kubeadm-config.yaml
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: v1.31.14
+etcd:
+  external:
+    endpoints:
+      - http://127.0.0.1:2379   # spanner-etcd running as systemd service
+networking:
+  podSubnet: 10.244.0.0/16
+
+# Init
+kubeadm init \
+  --config=kubeadm-config.yaml \
+  --ignore-preflight-errors=ExternalEtcdVersion
+```
+
+> **Note**: spanner-etcd must be started before `kubeadm init`. The initial
+> revision is seeded to 1 (not 0) — Kubernetes API server rejects revision=0
+> as `illegal resource version from storage: 0`.
+
+### 4. As Kubernetes etcd backend (k3s)
 
 ```bash
 # k3s with spanner-etcd as external datastore
@@ -414,6 +441,7 @@ Auth (UserAdd/RoleAdd/Authenticate), Defrag, Snapshot — these are not needed f
 - [x] Prometheus metrics (`/metrics` on `:2381`)
 - [x] Helm chart with WIF, PDB, HPA, ServiceMonitor
 - [x] Deployed and tested on GKE with real Spanner — 33/33 etcd operations pass
+- [x] **Kubernetes v1.31 (kubeadm) running with spanner-etcd as etcd backend** — full control plane, pods, CoreDNS, CNI
 - [x] Integration tests against Spanner emulator — 38 tests, full stack coverage
 - [ ] etcd auth passthrough
 - [x] Multi-region Spanner configuration and scaling guidance

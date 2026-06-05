@@ -145,9 +145,11 @@ func SeedRevCounter(ctx context.Context, client *spanner.Client) error {
 		if spanner.ErrCode(err) != codes.NotFound {
 			return err
 		}
-		// Row not found — insert it.
+		// Row not found — insert with rev=1.
+		// Kubernetes API server rejects revision=0 as invalid ("illegal resource
+		// version from storage: 0"), so we seed with 1 to satisfy its invariant.
 		return txn.BufferWrite([]*spanner.Mutation{
-			spanner.Insert("kv_rev", []string{"id", "rev"}, []interface{}{RevCounterRow, int64(0)}),
+			spanner.Insert("kv_rev", []string{"id", "rev"}, []interface{}{RevCounterRow, int64(1)}),
 		})
 	})
 	return err
