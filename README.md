@@ -150,15 +150,33 @@ Must be executed via `client.Single().Query()` — Spanner rejects CS queries on
 
 ## Performance
 
-| Operation | Latency (Spanner prod) | Latency (emulator) |
-|-----------|----------------------|-------------------|
-| Get (single key) | ~5ms | ~20ms |
-| Put (create) | ~10ms | ~100ms |
-| List (prefix, 100 keys) | ~10ms | ~30ms |
-| Watch event delivery (Change Streams) | **~10–50ms** | ~1s (emulator: poll fallback) |
-| Watch event delivery (poll fallback) | ~1s | ~1s |
+Benchmarked on GCP `e2-standard-4` (4 vCPU, 16GB, `asia-northeast1`) with production Spanner — not the emulator.
 
-Write latency is bounded by one Spanner RW transaction: `UPDATE kv_rev THEN RETURN` + `INSERT INTO kv`. Both are buffered and committed atomically.
+### Direct gRPC benchmark (1000 PU)
+
+| Operation | Clients | ops/sec | Avg latency |
+|-----------|---------|---------|-------------|
+| PUT 256B | 1 | 24 | 41.9ms |
+| PUT 256B | 8 | 58 | 17.4ms |
+| PUT 256B | 32 | **44** | 22.8ms |
+| GET | 1 | 86 | 11.6ms |
+| GET | 8 | 757 | 1.3ms |
+| GET | 32 | **1,360** | 0.7ms |
+| GET | 64 | **1,506** | 0.7ms |
+
+Reads scale linearly with concurrency — fully parallel Spanner `Single()` reads.  
+Writes are serialized through `kv_rev` (equivalent to etcd's Raft log). At 1000 PU, concurrent writes at ×32 achieve 44 ops/sec vs 19 ops/sec at 100 PU (+131%).
+
+### Kubernetes workload — kubeadm v1.31 (100 pods)
+
+| Metric | 100 PU | 1000 PU |
+|--------|--------|---------|
+| 50 Deployments created (parallel) | 6.1s | **3.75s** (−39%) |
+| 100 pods Ready | 53s | **44s** (−17%) |
+| KV/Range avg latency | 28.8ms | **22.6ms** |
+| KV/Txn avg latency | 275ms | 281ms |
+
+Write latency is bounded by one Spanner RW transaction: `UPDATE kv_rev THEN RETURN` + `INSERT INTO kv`.
 
 Watch latency with Change Streams is ~10–50ms because Spanner pushes DataChangeRecords as soon as a write commits. The poll fallback (1s) is used automatically on the Spanner emulator or when Change Streams are not available.
 
