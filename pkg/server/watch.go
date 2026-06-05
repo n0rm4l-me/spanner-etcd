@@ -13,7 +13,11 @@ import (
 	"github.com/n0rm4l-me/spanner-etcd/pkg/store"
 )
 
-const progressNotifyInterval = 5 * time.Second
+// progressNotifyInterval matches the etcd default (10 minutes).
+// This is a keepalive heartbeat only — real events are delivered immediately.
+// Clients that expect frequent progress notifications (e.g. for leader election)
+// can lower this via the --watch-progress-notify-interval flag on the API server.
+const progressNotifyInterval = 10 * time.Minute
 
 // WatchServer implements etcdserverpb.WatchServer.
 type WatchServer struct {
