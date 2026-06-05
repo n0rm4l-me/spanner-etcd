@@ -118,6 +118,11 @@ func ensureInstance(t *testing.T, ctx context.Context) {
 	op.Wait(ctx) //nolint
 }
 
+func newTestLogger(t *testing.T) *zap.Logger {
+	t.Helper()
+	return zap.NewNop()
+}
+
 func emulatorRunning() bool {
 	resp, err := http.Get(fmt.Sprintf("http://%s", strings.Replace(emulatorHost, "9010", "9020", 1)))
 	if err != nil {

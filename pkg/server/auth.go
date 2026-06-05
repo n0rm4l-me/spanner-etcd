@@ -139,6 +139,11 @@ func (a *AuthServer) validate(ctx context.Context) bool {
 	return true
 }
 
+// invalidAuthTokenErr returns the exact error string etcd uses so that
+// clients (jetcd, etcd-java) recognise it as ErrInvalidAuthToken and
+// automatically re-authenticate instead of treating it as a fatal error.
+var invalidAuthTokenErr = status.Error(codes.Unauthenticated, "etcdserver: invalid auth token")
+
 // authUnaryInterceptor validates auth token for unary RPCs.
 // Methods in noAuthMethods are always allowed (e.g. Authenticate itself).
 func authUnaryInterceptor(auth *AuthServer) grpc.UnaryServerInterceptor {
@@ -146,7 +151,7 @@ func authUnaryInterceptor(auth *AuthServer) grpc.UnaryServerInterceptor {
 		if isPublicMethod(info.FullMethod) || auth.validate(ctx) {
 			return handler(ctx, req)
 		}
-		return nil, status.Error(codes.Unauthenticated, "invalid or expired token")
+		return nil, invalidAuthTokenErr
 	}
 }
 
@@ -156,7 +161,7 @@ func authStreamInterceptor(auth *AuthServer) grpc.StreamServerInterceptor {
 		if isPublicMethod(info.FullMethod) || auth.validate(ss.Context()) {
 			return handler(srv, ss)
 		}
-		return status.Error(codes.Unauthenticated, "invalid or expired token")
+		return invalidAuthTokenErr
 	}
 }
 
