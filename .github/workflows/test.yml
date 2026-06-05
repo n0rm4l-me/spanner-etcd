@@ -25,7 +25,18 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: vet
+        run: go vet ./...
+
       - name: test
-        run: go test ./... -timeout=120s -count=1
+        run: go test ./... -timeout=120s -count=1 -v 2>&1 | tee /tmp/test-output.txt
         env:
           SPANNER_EMULATOR_HOST: localhost:9010
+
+      - name: summary
+        if: always()
+        run: |
+          echo "## Test Results" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          grep -E "^(=== RUN|--- PASS|--- FAIL|FAIL|ok )" /tmp/test-output.txt >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY

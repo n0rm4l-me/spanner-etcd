@@ -1,5 +1,7 @@
 # spanner-etcd
 
+[![test](https://github.com/n0rm4l-me/spanner-etcd/actions/workflows/test.yml/badge.svg)](https://github.com/n0rm4l-me/spanner-etcd/actions/workflows/test.yml)
+
 A **drop-in etcd replacement** backed by **Google Cloud Spanner** — tested with real Kubernetes v1.31 (kubeadm) and production application workloads.
 
 Implements the complete etcd v3 KV/Watch/Lease/Auth API. Swap out etcd for spanner-etcd and get unlimited horizontal scale, native multi-region replication, and 99.999% SLA — with zero etcd cluster management.
