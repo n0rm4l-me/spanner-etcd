@@ -264,6 +264,25 @@ helm install spanner-etcd ./helm/spanner-etcd \
   --set auth.tokenTTL="24h"
 ```
 
+### 6. Migrate data from existing etcd
+
+```bash
+# One-time migration via Helm post-install Job:
+helm upgrade spanner-etcd ./helm/spanner-etcd \
+  --set spannerDatabase=... \
+  --set migrate.enabled=true \
+  --set migrate.src=http://etcd.my-namespace:2379 \
+  --set migrate.srcUser=root \
+  --set migrate.srcPasswordSecret=etcd-secret \
+  --set migrate.verify=true
+
+# Or run the migrate binary directly inside the cluster:
+kubectl run migrate --image=...spanner-etcd:VERSION \
+  --command -- /spanner-etcd-migrate \
+    --src=http://etcd:2379 --src-user=root \
+    --dst=http://spanner-etcd:2379 --verify
+```
+
 ## Schema Management
 
 `spanner-etcd` applies DDL on startup. If the runtime SA lacks DDL permissions, a warning is logged and the server continues (schema managed externally).
@@ -415,15 +434,31 @@ Tested with **22 production Java/Kotlin microservices** (Vert.x + jetcd) on GKE:
 ## Development
 
 ```bash
-go mod vendor
-go build -o spanner-etcd ./cmd/server/
+# Build local binary
+make build
 
-# With race detector
+# Vendor dependencies (required before Docker build)
+make vendor
+
+# Build Docker image (linux/amd64)
+make docker VERSION=0.4.0
+
+# Build + push
+make release VERSION=0.4.0
+
+# Run tests
+make test
+
+# Run with race detector
 SPANNER_EMULATOR_HOST=localhost:9010 \
 go run -race ./cmd/server/ \
   --spanner-database=projects/test/instances/test/databases/test \
   --log-level=debug
 ```
+
+> **Note on vendor**: `vendor/` is not committed. Run `make vendor` before `make docker`.
+> In corporate networks with custom CA certificates, `go mod download` inside Docker
+> fails — vendoring locally avoids this.
 
 ## License
 
