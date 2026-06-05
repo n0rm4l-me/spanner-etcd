@@ -428,7 +428,6 @@ Tested with **22 production Java/Kotlin microservices** (Vert.x + jetcd) on GKE:
 - [x] Production validation: 22 microservices, 45 Watch streams
 - [x] 38 integration tests (emulator)
 - [ ] Auth RBAC (UserAdd/RoleGrantPermission)
-- [ ] Shared auth tokens across replicas (Spanner-backed)
 - [ ] Change Streams support on Spanner emulator
 
 ## Development
