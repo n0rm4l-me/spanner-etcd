@@ -113,6 +113,12 @@ affinity:
 nodeSelector: {}
 tolerations: []
 
+# PodMonitoring for GKE Managed Prometheus (Google Cloud Managed Service for Prometheus).
+# Requires the monitoring.googleapis.com/v1 CRD (available in GKE by default).
+podMonitoring:
+  enabled: true
+  interval: 30s
+
 # ServiceMonitor for Prometheus Operator.
 serviceMonitor:
   enabled: false

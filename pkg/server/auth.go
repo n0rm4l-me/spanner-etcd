@@ -17,7 +17,10 @@ import (
 )
 
 const (
-	tokenTTL      = 5 * time.Minute
+	// tokenTTL matches the etcd default simple token TTL (1 hour).
+	// jetcd and other clients do not refresh tokens automatically, so we use
+	// a long TTL to avoid unexpected UNAUTHENTICATED errors mid-session.
+	tokenTTL      = 1 * time.Hour
 	tokenHeader   = "token"
 	authHeaderKey = "authorization"
 )
