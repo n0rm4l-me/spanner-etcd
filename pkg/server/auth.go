@@ -17,10 +17,12 @@ import (
 )
 
 const (
-	// tokenTTL matches the etcd default simple token TTL (1 hour).
-	// jetcd and other clients do not refresh tokens automatically, so we use
-	// a long TTL to avoid unexpected UNAUTHENTICATED errors mid-session.
-	tokenTTL      = 1 * time.Hour
+	// tokenTTL is set to 24 hours. etcd simple tokens don't expire in many
+	// production deployments, and most clients (jetcd, etcd-java) do not
+	// refresh tokens automatically — they authenticate once at startup and
+	// reuse the token for the lifetime of the connection. A 24h TTL covers
+	// any reasonable session without requiring clients to re-authenticate.
+	tokenTTL      = 24 * time.Hour
 	tokenHeader   = "token"
 	authHeaderKey = "authorization"
 )
