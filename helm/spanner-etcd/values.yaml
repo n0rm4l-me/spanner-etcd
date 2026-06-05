@@ -90,6 +90,15 @@ autoscaling:
   maxReplicas: 10
   targetCPUUtilizationPercentage: 70
 
+# Graceful shutdown configuration.
+# preStopSleepSeconds: time to wait before SIGTERM so Kubernetes can remove
+#   the pod from Service endpoints. Google recommends 15s for GKE.
+# seconds: total termination grace period = preStopSleep + app shutdown time.
+#   Must be > preStopSleepSeconds. Google recommends 60s for gRPC services.
+terminationGracePeriod:
+  preStopSleepSeconds: 15
+  seconds: 60
+
 podAnnotations: {}
 
 podSecurityContext:

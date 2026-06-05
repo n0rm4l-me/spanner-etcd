@@ -22,6 +22,7 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriod.seconds }}
       serviceAccountName: {{ include "spanner-etcd.fullname" . }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
@@ -63,6 +64,14 @@ spec:
             - name: metrics
               containerPort: 2381
               protocol: TCP
+          lifecycle:
+            preStop:
+              exec:
+                # Sleep gives Kubernetes time to remove the pod from Service endpoints
+                # before SIGTERM is sent. Without this, new requests arrive on the
+                # terminating pod during the ~1-5s endpoint propagation window.
+                # Google recommends 15s; we use the configurable value.
+                command: ["sleep", "{{ .Values.terminationGracePeriod.preStopSleepSeconds }}"]
           livenessProbe:
             httpGet:
               path: /healthz

@@ -171,7 +171,22 @@ func (s *Server) Serve(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
-		s.grpc.GracefulStop()
+		s.log.Info("shutting down — draining connections")
+		// GracefulStop waits for active RPCs to finish.
+		// We give it 10 seconds; Watch streams will be terminated by context
+		// cancellation, so in-flight KV/Lease RPCs are the only ones that need time.
+		graceDone := make(chan struct{})
+		go func() {
+			s.grpc.GracefulStop()
+			close(graceDone)
+		}()
+		select {
+		case <-graceDone:
+			s.log.Info("graceful shutdown complete")
+		case <-time.After(10 * time.Second):
+			s.log.Warn("graceful shutdown timed out — forcing stop")
+			s.grpc.Stop()
+		}
 		return nil
 	case err := <-errCh:
 		return err
