@@ -396,7 +396,7 @@ The emulator does not support the `READ_kv_changes` TVF. spanner-etcd falls back
 
 ## Testing
 
-38 integration tests against the Spanner emulator.
+48 integration tests against the Spanner emulator.
 
 ```bash
 SPANNER_EMULATOR_HOST=localhost:9010 go test ./...
@@ -404,8 +404,8 @@ SPANNER_EMULATOR_HOST=localhost:9010 go test ./...
 
 | Package | Tests | What's covered |
 |---------|-------|----------------|
-| `pkg/store` | 23 | Create/Get/Update/Delete/List/Count/After/Compact/Watch/Lease |
-| `pkg/server` | 9 + 3 auth | Full gRPC stack + auth token expiry / re-auth |
+| `pkg/store` | 25 | Create/Get/Update/Delete/List/Count/After/Compact/Watch/Lease/Lease+Watch |
+| `pkg/server` | 13 + 3 auth | Full gRPC stack, Txn multi-op, Watch cancel/fanout/concurrent, graceful shutdown, auth token expiry / re-auth |
 
 ## Production validation
 
