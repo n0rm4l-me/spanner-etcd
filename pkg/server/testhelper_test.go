@@ -83,6 +83,7 @@ func newTestStore(t *testing.T) *store.Store {
 	t.Cleanup(func() {
 		s.Close()
 		spannerClient.Close()
+		adminClient.DropDatabase(context.Background(), &databasepb.DropDatabaseRequest{Database: dbPath}) //nolint:errcheck
 	})
 	return s
 }

@@ -89,8 +89,7 @@ func newTestStore(t *testing.T) *store.Store {
 	t.Cleanup(func() {
 		s.Close()
 		spannerClient.Close()
-		// Best-effort drop of test database.
-		adminClient.DropDatabase(ctx, nil) //nolint
+		adminClient.DropDatabase(context.Background(), &databasepb.DropDatabaseRequest{Database: dbPath}) //nolint:errcheck
 	})
 
 	return s
