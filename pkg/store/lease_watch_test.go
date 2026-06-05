@@ -21,27 +21,42 @@ func TestLeaseWatch_RevokeGeneratesDeleteEvent(t *testing.T) {
 		t.Fatalf("grant: %v", err)
 	}
 
-	s.Create(ctx, "/svc/ep1", []byte("10.0.0.1:8080"), lease.ID)
-	s.Create(ctx, "/svc/ep2", []byte("10.0.0.2:8080"), lease.ID)
-	time.Sleep(200 * time.Millisecond)
-
+	// Subscribe before creating keys so Watch sees both CREATE and DELETE events.
+	// If we subscribe after Create, curRev may already include the CREATE events
+	// and the poll cycle races with Revoke — making the test flaky.
 	curRev, _ := s.CurrentRevision(ctx)
 	ch := s.Watch(ctx, "/svc/", curRev)
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
+
+	s.Create(ctx, "/svc/ep1", []byte("10.0.0.1:8080"), lease.ID)
+	s.Create(ctx, "/svc/ep2", []byte("10.0.0.2:8080"), lease.ID)
 
 	if err := s.Leases().Revoke(ctx, lease.ID); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
 
-	got := collectEvents(t, ch, 2, 10*time.Second)
+	// Drain until 2 DELETEs arrive or timeout — the two Deletes may land in
+	// separate poll cycles (each is an independent Spanner transaction).
 	var deleteCount int
-	for _, ev := range got {
-		if ev.Type == store.EventDelete {
-			deleteCount++
+	deadline := time.After(10 * time.Second)
+	for deleteCount < 2 {
+		select {
+		case events, ok := <-ch:
+			if !ok {
+				goto done
+			}
+			for _, ev := range events {
+				if ev.Type == store.EventDelete {
+					deleteCount++
+				}
+			}
+		case <-deadline:
+			goto done
 		}
 	}
+done:
 	if deleteCount < 2 {
-		t.Fatalf("want 2 DELETE events after lease revoke, got %d (events=%+v)", deleteCount, got)
+		t.Fatalf("want 2 DELETE events after lease revoke, got %d", deleteCount)
 	}
 }
 
