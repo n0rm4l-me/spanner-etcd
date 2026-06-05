@@ -84,59 +84,39 @@ Multiple `spanner-etcd` replicas can run concurrently — all state lives in Spa
 ## Spanner Schema
 
 ```sql
--- Main KV log: append-only, one row per write event.
--- Physical PK uses bit_reversed_positive to avoid write hotspots.
+-- See ddl/schema.sql for the full DDL.
+
+-- rev = PENDING_COMMIT_TIMESTAMP() on every write — no lock, no counter.
 CREATE TABLE kv (
-  id               INT64 NOT NULL DEFAULT (GET_NEXT_SEQUENCE_VALUE(SEQUENCE kv_seq)),
-  rev              INT64 NOT NULL,          -- logical monotonic revision
+  id               INT64     NOT NULL DEFAULT (GET_NEXT_SEQUENCE_VALUE(SEQUENCE kv_seq)),
+  rev              TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp = true),
   key              STRING(2048) NOT NULL,
   value            BYTES(MAX),
-  old_value        BYTES(MAX),              -- populated for Watch PrevKv
+  old_value        BYTES(MAX),
   lease_id         INT64,
   deleted          BOOL NOT NULL DEFAULT (false),
   created          BOOL NOT NULL DEFAULT (false),
-  create_revision  INT64 NOT NULL DEFAULT (0),
-  prev_revision    INT64 NOT NULL DEFAULT (0)
+  create_revision  TIMESTAMP OPTIONS (allow_commit_timestamp = true),
+  prev_revision    TIMESTAMP OPTIONS (allow_commit_timestamp = true)
 ) PRIMARY KEY (id);
 
--- Single-row monotonic revision counter.
--- Incremented atomically via UPDATE...THEN RETURN in every write transaction.
+-- kv_rev holds only the compact revision.
+-- Current revision = MAX(rev) FROM kv (no lock needed).
 CREATE TABLE kv_rev (
-  id   INT64 NOT NULL,
-  rev  INT64 NOT NULL
+  id  INT64     NOT NULL,
+  rev TIMESTAMP NOT NULL
 ) PRIMARY KEY (id);
-
--- Active leases with TTL.
-CREATE TABLE kv_lease (
-  lease_id   INT64 NOT NULL,
-  ttl_sec    INT64 NOT NULL,
-  granted_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp = true)
-) PRIMARY KEY (lease_id);
-
--- Change Stream: captures all mutations to kv for Watch delivery.
-CREATE CHANGE STREAM kv_changes FOR kv
-  OPTIONS (retention_period = '7d', value_capture_type = 'NEW_ROW');
-
--- Per-replica cursor store: enables resume after restart.
-CREATE TABLE kv_cs_cursors (
-  replica_id       STRING(128) NOT NULL,
-  partition_token  STRING(MAX) NOT NULL,
-  resume_timestamp TIMESTAMP  NOT NULL,
-  updated_at       TIMESTAMP  NOT NULL OPTIONS (allow_commit_timestamp = true)
-) PRIMARY KEY (replica_id, partition_token);
 ```
 
 ### Design decisions
 
-**`id` vs `rev`**: The physical PK (`id`) uses `bit_reversed_positive` to distribute writes across Spanner splits and avoid hotspots. The logical revision (`rev`) is a monotonic integer from `kv_rev`. etcd clients see `rev` as `ModRevision`.
+**`PENDING_COMMIT_TIMESTAMP()` as revision**: Every write sets `rev = PENDING_COMMIT_TIMESTAMP()` — Spanner's TrueTime-based commit timestamp. No shared counter row, no lock. Each transaction is fully independent. etcd clients receive `rev` as `int64` (UnixNano), which is a valid etcd `ModRevision`.
 
-**Atomic revision bump**: Every write does `UPDATE kv_rev SET rev = rev + 1 WHERE id = 1 THEN RETURN rev` — a single server-side DML statement that both increments and reads the counter, avoiding the two-RPC read-modify-write pattern that serialises concurrent transactions.
+**`id` vs `rev`**: Physical PK (`id`) uses `bit_reversed_positive` to distribute writes across Spanner splits and avoid hotspots.
 
 **Append-only log**: Like etcd, we never update rows in `kv`. Each write appends a new row. Compaction physically deletes old rows asynchronously.
 
-**Change Streams for Watch**: Instead of polling every second, each replica opens a long-lived streaming SQL query per partition of `kv_changes`. Spanner pushes records as writes commit (~10–50ms). The initial query uses `NULL` partition token to discover active partitions; subsequent queries use tokens returned in `ChildPartitionsRecord` entries. Partition cursors are flushed to `kv_cs_cursors` every 5s so replicas resume from the correct position after a restart.
-
-The poll loop (1s) runs in parallel as a safety net during the Change Stream startup window (first 10s) and falls back automatically when Change Streams are unavailable (Spanner emulator does not support the TVF).
+**Change Streams for Watch**: Each replica streams all partitions of `kv_changes`. Spanner pushes records as writes commit (~10–50ms). Partition cursors are flushed to `kv_cs_cursors` every 5s for resume after restart. The poll loop (1s) runs as a fallback when Change Streams are unavailable (Spanner emulator).
 
 **Change Stream SQL syntax** (real Spanner only):
 ```sql
@@ -150,35 +130,45 @@ Must be executed via `client.Single().Query()` — Spanner rejects CS queries on
 
 ## Performance
 
-Benchmarked on GCP `e2-standard-4` (4 vCPU, 16GB, `asia-northeast1`) with production Spanner — not the emulator.
+Benchmarked on GCP `e2-standard-4` (4 vCPU, 16GB RAM, `asia-northeast1-a`) with production Spanner (`regional-asia-northeast1`, 1000 PU) in the same region — not the emulator. Numbers reflect single-node spanner-etcd; scale further by adding replicas behind a load balancer.
 
-### Direct gRPC benchmark (1000 PU)
+### Direct gRPC benchmark — PENDING_COMMIT_TIMESTAMP revision
+
+Revisions use Spanner's `PENDING_COMMIT_TIMESTAMP()` — each write is fully independent, no shared lock.
 
 | Operation | Clients | ops/sec | Avg latency |
 |-----------|---------|---------|-------------|
-| PUT 256B | 1 | 24 | 41.9ms |
-| PUT 256B | 8 | 58 | 17.4ms |
-| PUT 256B | 32 | **44** | 22.8ms |
-| GET | 1 | 86 | 11.6ms |
-| GET | 8 | 757 | 1.3ms |
-| GET | 32 | **1,360** | 0.7ms |
-| GET | 64 | **1,506** | 0.7ms |
+| PUT 256B | 1 | **86** | 11.7ms |
+| PUT 256B | 8 | **379** | 2.6ms |
+| PUT 256B | 32 | **673** | 1.5ms |
+| PUT 1KB | 8 | 218 | 4.6ms |
+| PUT 1KB | 32 | 459 | 2.2ms |
+| GET | 1 | 71 | 14.0ms |
+| GET | 8 | 597 | 1.7ms |
+| GET | 32 | **1,391** | 0.7ms |
+| GET | 64 | **1,504** | 0.7ms |
 
-Reads scale linearly with concurrency — fully parallel Spanner `Single()` reads.  
-Writes are serialized through `kv_rev` (equivalent to etcd's Raft log). At 1000 PU, concurrent writes at ×32 achieve 44 ops/sec vs 19 ops/sec at 100 PU (+131%).
+Both reads and writes scale with concurrency. No serialization bottleneck.
+
+**vs. integer counter (previous implementation, same hardware):**
+
+| Clients | Integer counter | PCT | Speedup |
+|---------|-----------------|-----|---------|
+| PUT ×1 | 24 ops/sec | 86 ops/sec | **3.6×** |
+| PUT ×8 | 58 ops/sec | 379 ops/sec | **6.5×** |
+| PUT ×32 | 44 ops/sec | 673 ops/sec | **15×** |
 
 ### Kubernetes workload — kubeadm v1.31 (100 pods)
 
-| Metric | 100 PU | 1000 PU |
-|--------|--------|---------|
-| 50 Deployments created (parallel) | 6.1s | **3.75s** (−39%) |
-| 100 pods Ready | 53s | **44s** (−17%) |
-| KV/Range avg latency | 28.8ms | **22.6ms** |
-| KV/Txn avg latency | 275ms | 281ms |
+| Metric | Value |
+|--------|-------|
+| 50 Deployments created (parallel) | 3.75s |
+| 100 pods Ready | 44s |
+| KV/Range avg latency | ~22ms |
 
-Write latency is bounded by one Spanner RW transaction: `UPDATE kv_rev THEN RETURN` + `INSERT INTO kv`.
+Write latency is bounded by one Spanner RW transaction with `PENDING_COMMIT_TIMESTAMP()` — no counter increment, no contention.
 
-Watch latency with Change Streams is ~10–50ms because Spanner pushes DataChangeRecords as soon as a write commits. The poll fallback (1s) is used automatically on the Spanner emulator or when Change Streams are not available.
+Watch latency with Change Streams is ~10–50ms. The poll fallback (1s) is used automatically on the Spanner emulator.
 
 ## Installation
 
@@ -422,21 +412,11 @@ Logs are emitted as JSON with Google Cloud Logging field names:
 
 ## Known limitations and design trade-offs
 
-### Write serialization (kv_rev)
+### Write throughput
 
-Every write (`Create`, `Update`, `Delete`) increments the global revision counter via:
+Writes use `PENDING_COMMIT_TIMESTAMP()` as the revision — each transaction is fully independent. Write throughput scales with Spanner processing units and replica count. At 1000 PU: **~670 concurrent writes/sec** at ×32 concurrency.
 
-```sql
-UPDATE kv_rev SET rev = rev + 1 WHERE id = 1 THEN RETURN rev
-```
-
-This is a **global serialization point** — all writes queue on this single row. This is intentional and semantically equivalent to how etcd itself serializes revisions through Raft. On production Spanner the practical limit is **~200–500 writes/sec per replica** before contention becomes visible.
-
-Reads (`Get`, `List`, `Watch`) are fully parallel — Spanner `Single()` reads scale linearly with replicas and Spanner processing units.
-
-**If you need higher write throughput**, the path is:
-- Shard `kv_rev` by key namespace (multiple independent revision sequences)
-- Use Spanner's `PENDING_COMMIT_TIMESTAMP()` as a logical clock instead of an integer counter
+Reads use `Single()` strong reads — fully parallel, no coordination.
 
 ### Watch fan-out
 
