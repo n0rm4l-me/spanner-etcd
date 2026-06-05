@@ -1,8 +1,16 @@
 # spanner-etcd
 
-A Kubernetes-native **etcd v3 API server** backed by **Google Cloud Spanner**.
+A **drop-in etcd replacement** backed by **Google Cloud Spanner** — tested with real Kubernetes v1.31 (kubeadm).
 
-Implements the complete etcd v3 KV/Watch/Lease API required by Kubernetes, so that any Kubernetes API server or etcd-compatible client can use it as a drop-in — with Spanner handling storage, replication, and horizontal scalability.
+Implements the complete etcd v3 KV/Watch/Lease API required by Kubernetes. Swap out etcd for spanner-etcd and get unlimited horizontal scale, native multi-region replication, and 99.999% SLA — with zero etcd cluster management.
+
+```
+# Before
+--etcd-servers=https://etcd-0:2379,https://etcd-1:2379,https://etcd-2:2379
+
+# After
+--etcd-servers=http://spanner-etcd:2379
+```
 
 ## Why
 
