@@ -47,12 +47,34 @@ func newAuthServer(users map[string]string, ttl time.Duration, log *zap.Logger) 
 	if ttl <= 0 {
 		ttl = DefaultTokenTTL
 	}
-	return &AuthServer{
+	s := &AuthServer{
 		users:   users,
 		tokens:  make(map[string]tokenInfo),
 		enabled: len(users) > 0,
 		ttl:     ttl,
 		log:     log,
+	}
+	// Background GC: remove expired tokens every TTL period.
+	// Without this, tokens accumulate on every client reconnect/redeploy.
+	go s.gcLoop()
+	return s
+}
+
+func (a *AuthServer) gcLoop() {
+	for range time.Tick(a.ttl) {
+		now := time.Now()
+		a.mu.Lock()
+		before := len(a.tokens)
+		for tok, info := range a.tokens {
+			if now.After(info.expiresAt) {
+				delete(a.tokens, tok)
+			}
+		}
+		after := len(a.tokens)
+		a.mu.Unlock()
+		if before != after {
+			a.log.Debug("auth token GC", zap.Int("removed", before-after), zap.Int("remaining", after))
+		}
 	}
 }
 
