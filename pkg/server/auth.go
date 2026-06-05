@@ -10,6 +10,7 @@ import (
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.uber.org/zap"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -99,7 +100,15 @@ func (a *AuthServer) Authenticate(ctx context.Context, r *etcdserverpb.Authentic
 		expiresAt: time.Now().Add(a.ttl),
 	}
 
-	a.log.Info("authenticated", zap.String("user", r.Name))
+	// Extract client IP from gRPC peer info for audit logging.
+	clientAddr := "unknown"
+	if p, ok := peer.FromContext(ctx); ok {
+		clientAddr = p.Addr.String()
+	}
+	a.log.Info("authenticated",
+		zap.String("user", r.Name),
+		zap.String("client", clientAddr),
+	)
 	return &etcdserverpb.AuthenticateResponse{
 		Header: &etcdserverpb.ResponseHeader{},
 		Token:  tok,
