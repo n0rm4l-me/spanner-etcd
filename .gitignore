@@ -1,6 +1,7 @@
 # Binaries (root-level only)
 /spanner-etcd
 /spanner-etcd-migrate
+/migrate
 /cmd/server/spanner-etcd
 /cmd/migrate/spanner-etcd-migrate
 
