@@ -1,0 +1,44 @@
+{{- if .Values.migrate.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "spanner-etcd.fullname" . }}-migrate
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spanner-etcd.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      serviceAccountName: {{ include "spanner-etcd.fullname" . }}
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          command: ["/spanner-etcd-migrate"]
+          args:
+            - --src={{ required "migrate.src is required when migrate.enabled=true" .Values.migrate.src }}
+            - --dst=http://{{ include "spanner-etcd.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:2379
+            {{- if .Values.migrate.srcUser }}
+            - --src-user={{ .Values.migrate.srcUser }}
+            {{- end }}
+            {{- if .Values.migrate.verify }}
+            - --verify
+            {{- end }}
+          env:
+            {{- if .Values.migrate.srcPasswordSecret }}
+            - name: SRC_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.migrate.srcPasswordSecret }}
+                  key: {{ .Values.migrate.srcPasswordKey | default "password" }}
+            {{- end }}
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+{{- end }}

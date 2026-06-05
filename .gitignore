@@ -14,8 +14,8 @@ certs/
 *.p12
 *.srl
 
-# Go vendor directory — not committed; Docker builds use -mod=vendor
-# with a pre-created vendor dir from CI, or use GOPROXY
+# Go vendor — generated, not committed.
+# Run `make vendor` before `make docker` to populate.
 /vendor/
 
 # IDE

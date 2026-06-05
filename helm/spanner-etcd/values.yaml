@@ -15,6 +15,16 @@ fullnameOverride: ""
 # Format: projects/PROJECT/instances/INSTANCE/databases/DATABASE
 spannerDatabase: ""
 
+# One-time data migration from an existing etcd instance.
+# Runs as a Helm post-install/post-upgrade Job.
+migrate:
+  enabled: false
+  src: ""              # Source etcd endpoint, e.g. http://etcd:2379
+  srcUser: ""          # Source etcd username (optional)
+  srcPasswordSecret: "" # Secret name containing source etcd password
+  srcPasswordKey: "password"
+  verify: true         # Verify all keys after migration
+
 # ServiceAccount configuration.
 # spanner-etcd authenticates to Spanner via Workload Identity Federation.
 # Two WIF modes are supported:
