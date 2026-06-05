@@ -107,6 +107,7 @@ func run(ctx context.Context, cfg appConfig, log *zap.Logger) error {
 		TLSCert:     cfg.tlsCert,
 		TLSKey:      cfg.tlsKey,
 		TLSCAFile:   cfg.tlsCA,
+		AuthUsers:   cfg.authUsers,
 		PeerURLs:    cfg.peerURLs,
 	}, log)
 	if err != nil {
@@ -125,10 +126,11 @@ type appConfig struct {
 	spannerChannels      int
 	spannerMinSessions   uint64
 	spannerMaxSessions   uint64
-	spannerNativeMetrics bool // enable Spanner built-in client-side metrics
+	spannerNativeMetrics bool
 	tlsCert              string
 	tlsKey               string
 	tlsCA                string
+	authUsers            string // "user1:pass1,user2:pass2" — from env ETCD_AUTH_USERS
 	peerURLs             []string
 	logLevel             string
 }
@@ -137,6 +139,7 @@ func parseFlags() appConfig {
 	cfg := appConfig{
 		listenAddr:         envOr("LISTEN_ADDR", "0.0.0.0:2379"),
 		metricsAddr:        envOr("METRICS_ADDR", "0.0.0.0:2381"),
+		authUsers:          envOr("ETCD_AUTH_USERS", ""),
 		spannerDatabase:    envOr("SPANNER_DATABASE", ""),
 		spannerChannels:    4,
 		spannerMinSessions: 10,
@@ -165,6 +168,8 @@ func parseFlags() appConfig {
 			cfg.tlsKey = strings.TrimPrefix(arg, "--tls-key=")
 		case strings.HasPrefix(arg, "--tls-ca="):
 			cfg.tlsCA = strings.TrimPrefix(arg, "--tls-ca=")
+		case strings.HasPrefix(arg, "--auth-users="):
+			cfg.authUsers = strings.TrimPrefix(arg, "--auth-users=")
 		case strings.HasPrefix(arg, "--log-level="):
 			cfg.logLevel = strings.TrimPrefix(arg, "--log-level=")
 		case strings.HasPrefix(arg, "--peer-urls="):

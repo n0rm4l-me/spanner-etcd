@@ -101,7 +101,7 @@ func (s *Store) Leases() *LeaseManager {
 // With PCT, current revision = MAX(rev) FROM kv — no lock, no contention.
 func (s *Store) CurrentRevision(ctx context.Context) (int64, error) {
 	row, err := s.client.Single().Query(ctx, spanner.Statement{
-		SQL: `SELECT COALESCE(MAX(rev), TIMESTAMP '1970-01-01 00:00:00 UTC') FROM kv`,
+		SQL: `SELECT MAX(rev) FROM kv`,
 	}).Next()
 	if errors.Is(err, iterator.Done) {
 		return 1, nil
@@ -109,11 +109,14 @@ func (s *Store) CurrentRevision(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("current revision: %w", err)
 	}
-	var ts time.Time
+	var ts spanner.NullTime
 	if err := row.Column(0, &ts); err != nil {
 		return 0, err
 	}
-	rev := tsToRev(ts)
+	if !ts.Valid {
+		return 1, nil // empty table
+	}
+	rev := tsToRev(ts.Time)
 	if rev <= 1 {
 		return 1, nil
 	}

@@ -55,6 +55,18 @@ metricsAddr: "0.0.0.0:2381"
 # Log level: debug | info | warn | error
 logLevel: info
 
+# Authentication — simple username/password, no RBAC.
+# Format: "user1:pass1,user2:pass2"
+# Can be passed directly or from an existing Secret.
+auth:
+  # Inline credentials (stored as a Secret by the chart).
+  # Example: "root:mypassword"
+  users: ""
+  # Use an existing Secret instead of inline users.
+  # The Secret must have a key named "users" with the same format.
+  existingSecret: ""
+  existingSecretKey: "users"
+
 service:
   type: ClusterIP
   port: 2379

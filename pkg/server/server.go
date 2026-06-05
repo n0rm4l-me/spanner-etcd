@@ -37,6 +37,7 @@ type Config struct {
 	TLSKey      string // server private key file
 	TLSCAFile   string // CA cert for verifying client certs (enables mTLS when set)
 	MetricsAddr string // HTTP address for /metrics; empty = disabled
+	AuthUsers   string // "user1:pass1,user2:pass2" — empty = auth disabled
 	PeerURLs    []string
 	Version     string
 	MemberID    uint64
@@ -73,6 +74,12 @@ func New(ctx context.Context, s *store.Store, cfg Config, log *zap.Logger) (*Ser
 		cfg.ClusterID = defaultClusterID
 	}
 
+	// Auth — parse users and build interceptors.
+	auth := newAuthServer(parseUsers(cfg.AuthUsers), log)
+	if auth.enabled {
+		log.Info("auth enabled", zap.Int("users", len(auth.users)))
+	}
+
 	var opts []grpc.ServerOption
 
 	// TLS / mTLS.
@@ -91,8 +98,8 @@ func New(ctx context.Context, s *store.Store, cfg Config, log *zap.Logger) (*Ser
 		}),
 		grpc.MaxRecvMsgSize(8*1024*1024),
 		grpc.MaxSendMsgSize(8*1024*1024),
-		grpc.ChainUnaryInterceptor(loggingUnary(log)),
-		grpc.ChainStreamInterceptor(loggingStream(log)),
+		grpc.ChainUnaryInterceptor(loggingUnary(log), authUnaryInterceptor(auth)),
+		grpc.ChainStreamInterceptor(loggingStream(log), authStreamInterceptor(auth)),
 	)
 
 	grpcServer := grpc.NewServer(opts...)
@@ -103,6 +110,7 @@ func New(ctx context.Context, s *store.Store, cfg Config, log *zap.Logger) (*Ser
 	etcdserverpb.RegisterLeaseServer(grpcServer, newLeaseServer(s.Leases(), log))
 	etcdserverpb.RegisterClusterServer(grpcServer, newClusterServer(cfg.MemberID, cfg.ClusterID, cfg.PeerURLs, log))
 	etcdserverpb.RegisterMaintenanceServer(grpcServer, newMaintenanceServer(s, cfg.MemberID, cfg.ClusterID, cfg.Version, log))
+	etcdserverpb.RegisterAuthServer(grpcServer, auth)
 
 	// Standard gRPC health check — used by Kubernetes liveness probes.
 	healthSrv := health.NewServer()

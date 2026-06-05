@@ -45,6 +45,14 @@ spec:
             - --tls-key=/tls/tls.key
             - --tls-ca=/tls/ca.crt
             {{- end }}
+          env:
+            {{- if or .Values.auth.users .Values.auth.existingSecret }}
+            - name: ETCD_AUTH_USERS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ if .Values.auth.existingSecret }}{{ .Values.auth.existingSecret }}{{ else }}{{ include "spanner-etcd.fullname" . }}-auth{{ end }}
+                  key: {{ .Values.auth.existingSecretKey }}
+            {{- end }}
           ports:
             - name: etcd
               containerPort: 2379
