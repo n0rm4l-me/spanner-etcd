@@ -72,6 +72,8 @@ Multiple `spanner-etcd` replicas can run concurrently — all state lives in Spa
 | **KV** | DeleteRange | ✅ | Direct single key + prefix, and via Txn (Kubernetes-style) |
 | **KV** | Txn | ✅ | Compare-and-swap, all operators: MOD, VERSION, CREATE, VALUE |
 | **KV** | Compact | ✅ | Async GC of old revisions |
+| **Auth** | Authenticate | ✅ | Username/password → token; clients auto-re-authenticate on expiry |
+| **Auth** | AuthEnable/Disable/Status | ✅ | Stubs (auth controlled via `--auth-users` flag) |
 | **Watch** | Watch | ✅ | Live streaming, prefix filter, revision replay, PrevKv, progress notify |
 | **Lease** | LeaseGrant | ✅ | TTL leases |
 | **Lease** | LeaseRevoke | ✅ | Immediate key deletion |
@@ -198,6 +200,8 @@ go build -o spanner-etcd ./cmd/server/
 | `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, `error` |
 | `--peer-urls` | `PEER_URLS` | — | Peer URLs advertised in MemberList (comma-separated) |
 | `--spanner-native-metrics` | — | `false` | Enable Spanner built-in client metrics (requires `roles/monitoring.metricWriter`) |
+| `--auth-users` | `ETCD_AUTH_USERS` | — | `user1:pass1,user2:pass2` — empty = auth disabled |
+| `--auth-token-ttl` | — | `5m` | Token lifetime. Clients auto-re-authenticate on expiry. |
 
 ## Schema Management
 
