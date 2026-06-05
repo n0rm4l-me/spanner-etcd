@@ -557,15 +557,34 @@ func extractKV(newV, oldV map[string]interface{}, commitTS time.Time) *KV {
 	if kv.Key == "" {
 		return nil
 	}
-	kv.Rev = i64Field(src, "rev")
+	// rev, create_revision, prev_revision are TIMESTAMP — Change Streams
+	// serialize them as RFC3339Nano strings. Convert to int64 (UnixNano).
+	kv.Rev = tsField(src, "rev")
 	kv.Value = bytesField(src, "value")
 	kv.Deleted = boolField(src, "deleted")
 	kv.Created = boolField(src, "created")
-	kv.CreateRevision = i64Field(src, "create_revision")
-	kv.PrevRevision = i64Field(src, "prev_revision")
+	kv.CreateRevision = tsField(src, "create_revision")
+	kv.PrevRevision = tsField(src, "prev_revision")
 	kv.LeaseID = i64Field(src, "lease_id")
 	kv.OldValue = bytesField(oldV, "value")
 	return kv
+}
+
+// tsField parses a TIMESTAMP value from a Change Stream JSON mod.
+// Spanner serializes TIMESTAMP as an RFC3339Nano string in change records.
+func tsField(m map[string]interface{}, k string) int64 {
+	if m == nil {
+		return 0
+	}
+	if v, ok := m[k]; ok {
+		if s, ok := v.(string); ok && s != "" {
+			t, err := time.Parse(time.RFC3339Nano, s)
+			if err == nil {
+				return tsToRev(t)
+			}
+		}
+	}
+	return 0
 }
 
 func strField(m map[string]interface{}, k string) string {

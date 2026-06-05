@@ -1,23 +1,32 @@
 // Package schema manages the Spanner DDL for spanner-etcd.
 //
-// Table design:
-//   kv             — main key-value log (append-only, one row per write event)
-//   kv_rev         — single-row monotonic revision counter
-//   kv_lease       — active leases with TTL
-//   kv_cs_cursors  — Change Stream partition cursors for resume after restart
+// # Table design
 //
-// The physical PK of kv uses bit_reversed_positive to avoid write hotspots.
-// The logical revision is stored in the `rev` column and sourced from kv_rev.
+//	kv            — main KV log (append-only, one row per write event)
+//	kv_rev        — stores only the compact revision (not the current revision)
+//	kv_lease      — active leases with TTL
+//	kv_cs_cursors — Change Stream partition cursors for resume after restart
 //
-// Change Stream (kv_changes) is created after the main tables so that it
-// captures all subsequent writes. Each spanner-etcd replica reads all
-// partitions of kv_changes and fans events out to local Watch subscribers,
-// reducing Watch latency from ~1s (poll) to ~10–50ms.
+// # Revision strategy: PENDING_COMMIT_TIMESTAMP
+//
+// The `rev` column uses PENDING_COMMIT_TIMESTAMP() — Spanner's TrueTime-based
+// commit timestamp. Every write sets rev = PENDING_COMMIT_TIMESTAMP() and the
+// resulting timestamp is globally unique and monotonically increasing across all
+// transactions.
+//
+// Benefits vs the previous kv_rev integer counter:
+//   - No serialization point: every transaction writes independently, no lock on kv_rev
+//   - Write throughput scales with Spanner processing units
+//   - Revision is a nanosecond-precision timestamp (int64 UnixNano) — valid etcd int64
+//
+// The `rev` column is stored as TIMESTAMP internally but exposed as int64 (UnixNano)
+// to etcd clients. Spanner guarantees commit timestamps are strictly monotonic.
 package schema
 
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"cloud.google.com/go/spanner"
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
@@ -28,53 +37,52 @@ import (
 )
 
 const (
-	RevCounterRow = int64(1)
+	CompactRevRow = int64(1) // kv_rev row that stores the last compact revision
 )
 
-// DDL statements — all idempotent (IF NOT EXISTS).
+// RevCounterRow kept for backward compatibility during migration.
+// With PCT this row is no longer used for current revision.
+const RevCounterRow = CompactRevRow
+
+// DDL statements — all idempotent (IF NOT EXISTS / OR REPLACE).
 var statements = []string{
-	// Sequence must be created before the table that references it.
 	`CREATE SEQUENCE IF NOT EXISTS kv_seq OPTIONS (
 		sequence_kind = 'bit_reversed_positive'
 	)`,
 
-	// Main KV log table. Physical PK is bit_reversed to avoid hotspots.
-	// rev = logical monotonic revision from kv_rev.
+	// rev, create_revision, prev_revision are commit timestamps.
+	// All TIMESTAMP columns that receive PENDING_COMMIT_TIMESTAMP() must have
+	// OPTIONS (allow_commit_timestamp = true).
 	`CREATE TABLE IF NOT EXISTS kv (
-		id               INT64 NOT NULL DEFAULT (GET_NEXT_SEQUENCE_VALUE(SEQUENCE kv_seq)),
-		rev              INT64 NOT NULL,
+		id               INT64     NOT NULL DEFAULT (GET_NEXT_SEQUENCE_VALUE(SEQUENCE kv_seq)),
+		rev              TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp = true),
 		key              STRING(2048) NOT NULL,
 		value            BYTES(MAX),
 		old_value        BYTES(MAX),
 		lease_id         INT64,
 		deleted          BOOL NOT NULL DEFAULT (false),
 		created          BOOL NOT NULL DEFAULT (false),
-		create_revision  INT64 NOT NULL DEFAULT (0),
-		prev_revision    INT64 NOT NULL DEFAULT (0)
+		create_revision  TIMESTAMP OPTIONS (allow_commit_timestamp = true),
+		prev_revision    TIMESTAMP OPTIONS (allow_commit_timestamp = true)
 	) PRIMARY KEY (id)`,
 
-	// Monotonic revision counter — single row, bumped in every RW txn.
+	// kv_rev stores only the compact revision timestamp.
+	// Current revision = MAX(rev) FROM kv (no lock needed).
 	`CREATE TABLE IF NOT EXISTS kv_rev (
-		id   INT64 NOT NULL,
-		rev  INT64 NOT NULL
+		id  INT64     NOT NULL,
+		rev TIMESTAMP NOT NULL
 	) PRIMARY KEY (id)`,
 
-	// Active leases. TTL goroutine watches this table.
 	`CREATE TABLE IF NOT EXISTS kv_lease (
 		lease_id   INT64 NOT NULL,
 		ttl_sec    INT64 NOT NULL,
 		granted_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp = true)
 	) PRIMARY KEY (lease_id)`,
 
-	// Indexes for common access patterns.
 	`CREATE INDEX IF NOT EXISTS kv_key_rev   ON kv (key, rev DESC)`,
 	`CREATE INDEX IF NOT EXISTS kv_rev_idx   ON kv (rev)`,
 	`CREATE INDEX IF NOT EXISTS kv_lease_idx ON kv (lease_id) STORING (key, rev)`,
 
-	// Change Stream: captures all mutations to the kv table.
-	// Each spanner-etcd replica reads this stream to deliver Watch events
-	// with ~10–50ms latency instead of the ~1s polling approach.
-	// retention_period: 7 days allows replicas to catch up after downtime.
 	`CREATE CHANGE STREAM IF NOT EXISTS kv_changes
 		FOR kv
 		OPTIONS (
@@ -82,24 +90,15 @@ var statements = []string{
 			value_capture_type = 'NEW_ROW'
 		)`,
 
-	// Change Stream partition cursors.
-	// Each replica persists its last-read partition token + timestamp here
-	// so that it can resume from the correct position after a restart without
-	// re-delivering already-seen events.
-	// replica_id allows multiple replicas to store independent cursors.
 	`CREATE TABLE IF NOT EXISTS kv_cs_cursors (
 		replica_id       STRING(128) NOT NULL,
 		partition_token  STRING(MAX) NOT NULL,
-		resume_timestamp TIMESTAMP  NOT NULL,
-		updated_at       TIMESTAMP  NOT NULL OPTIONS (allow_commit_timestamp = true)
+		resume_timestamp TIMESTAMP   NOT NULL,
+		updated_at       TIMESTAMP   NOT NULL OPTIONS (allow_commit_timestamp = true)
 	) PRIMARY KEY (replica_id, partition_token)`,
 }
 
-// Ensure creates or updates the schema and seeds the revision counter.
-// If the caller does not have spanner.databases.updateDdl permission
-// (e.g. runtime SA with databaseUser only), the DDL step is skipped with a
-// warning. In that case the schema must be managed externally (e.g. via
-// gcloud spanner databases ddl update or Terraform).
+// Ensure creates or updates the schema.
 func Ensure(ctx context.Context, adminClient *database.DatabaseAdminClient, dbPath string, log *zap.Logger) error {
 	log.Info("ensuring schema", zap.String("database", dbPath))
 
@@ -109,7 +108,7 @@ func Ensure(ctx context.Context, adminClient *database.DatabaseAdminClient, dbPa
 	})
 	if err != nil {
 		if isPermissionDenied(err) {
-			log.Warn("no DDL permission — assuming schema is already up to date (managed externally)",
+			log.Warn("no DDL permission — assuming schema is managed externally",
 				zap.String("database", dbPath))
 			return nil
 		}
@@ -117,7 +116,7 @@ func Ensure(ctx context.Context, adminClient *database.DatabaseAdminClient, dbPa
 	}
 	if err := op.Wait(ctx); err != nil {
 		if isPermissionDenied(err) {
-			log.Warn("no DDL permission — assuming schema is already up to date (managed externally)",
+			log.Warn("no DDL permission — assuming schema is managed externally",
 				zap.String("database", dbPath))
 			return nil
 		}
@@ -135,22 +134,29 @@ func isPermissionDenied(err error) bool {
 	return false
 }
 
-// SeedRevCounter inserts the revision counter row if it doesn't exist.
-func SeedRevCounter(ctx context.Context, client *spanner.Client) error {
+// SeedCompactRev inserts the compact revision row with the epoch timestamp
+// if it doesn't already exist. With PCT, the current revision is derived from
+// MAX(kv.rev) and needs no explicit seeding — the first write sets it.
+func SeedCompactRev(ctx context.Context, client *spanner.Client) error {
 	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		_, err := txn.ReadRow(ctx, "kv_rev", spanner.Key{RevCounterRow}, []string{"rev"})
+		_, err := txn.ReadRow(ctx, "kv_rev", spanner.Key{CompactRevRow}, []string{"rev"})
 		if err == nil {
-			return nil // already seeded
+			return nil
 		}
 		if spanner.ErrCode(err) != codes.NotFound {
 			return err
 		}
-		// Row not found — insert with rev=1.
-		// Kubernetes API server rejects revision=0 as invalid ("illegal resource
-		// version from storage: 0"), so we seed with 1 to satisfy its invariant.
+		// Seed with Unix epoch so compact_rev < any real write.
+		epoch := time.Unix(0, 1) // 1 nanosecond past epoch
 		return txn.BufferWrite([]*spanner.Mutation{
-			spanner.Insert("kv_rev", []string{"id", "rev"}, []interface{}{RevCounterRow, int64(1)}),
+			spanner.Insert("kv_rev", []string{"id", "rev"}, []interface{}{CompactRevRow, epoch}),
 		})
 	})
 	return err
+}
+
+// SeedRevCounter is kept for backward compatibility.
+// With PCT it delegates to SeedCompactRev.
+func SeedRevCounter(ctx context.Context, client *spanner.Client) error {
+	return SeedCompactRev(ctx, client)
 }

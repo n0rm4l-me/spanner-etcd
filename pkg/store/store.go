@@ -1,6 +1,14 @@
 // Package store implements the core Spanner-backed key-value store.
-// All operations are linearizable: reads use strong reads, writes use
-// read-write transactions that atomically bump the global revision counter.
+//
+// # Revision strategy: PENDING_COMMIT_TIMESTAMP
+//
+// Every write uses Spanner's PENDING_COMMIT_TIMESTAMP() as the revision.
+// This eliminates the kv_rev serialization bottleneck: each write transaction
+// is fully independent — no lock on a shared counter row.
+//
+// Revisions are stored as TIMESTAMP in Spanner and exposed as int64 (UnixNano)
+// to etcd clients. Spanner guarantees TrueTime-based commit timestamps are
+// globally unique and monotonically increasing across all transactions.
 package store
 
 import (
@@ -38,7 +46,7 @@ type KV struct {
 	LeaseID        int64
 	Deleted        bool
 	Created        bool
-	Rev            int64 // ModRevision
+	Rev            int64 // ModRevision (UnixNano of commit timestamp)
 	CreateRevision int64
 	PrevRevision   int64
 }
@@ -61,7 +69,7 @@ const (
 type Store struct {
 	client    *spanner.Client
 	log       *zap.Logger
-	bgCtx     context.Context // server-lifetime context for background operations
+	bgCtx     context.Context
 	watcher   *Watcher
 	leasesMgr *LeaseManager
 }
@@ -84,21 +92,30 @@ func (s *Store) Close() {
 	s.leasesMgr.close()
 }
 
-// Leases returns the lease manager for use by the gRPC lease server.
+// Leases returns the lease manager.
 func (s *Store) Leases() *LeaseManager {
 	return s.leasesMgr
 }
 
-// CurrentRevision returns the latest global revision.
+// CurrentRevision returns the latest global revision as int64 (UnixNano).
+// With PCT, current revision = MAX(rev) FROM kv — no lock, no contention.
 func (s *Store) CurrentRevision(ctx context.Context) (int64, error) {
-	row, err := s.client.Single().ReadRow(ctx, "kv_rev",
-		spanner.Key{schema.RevCounterRow}, []string{"rev"})
-	if err != nil {
-		return 0, fmt.Errorf("read kv_rev: %w", err)
+	row, err := s.client.Single().Query(ctx, spanner.Statement{
+		SQL: `SELECT COALESCE(MAX(rev), TIMESTAMP '1970-01-01 00:00:00 UTC') FROM kv`,
+	}).Next()
+	if errors.Is(err, iterator.Done) {
+		return 1, nil
 	}
-	var rev int64
-	if err := row.Column(0, &rev); err != nil {
+	if err != nil {
+		return 0, fmt.Errorf("current revision: %w", err)
+	}
+	var ts time.Time
+	if err := row.Column(0, &ts); err != nil {
 		return 0, err
+	}
+	rev := tsToRev(ts)
+	if rev <= 1 {
+		return 1, nil
 	}
 	return rev, nil
 }
@@ -111,17 +128,18 @@ func (s *Store) Get(ctx context.Context, key string, revision int64) (currentRev
 		return 0, nil, err
 	}
 
+	capTS := revToTS(revCap(revision, currentRev))
 	stmt := spanner.Statement{
 		SQL: `SELECT rev, key, value, old_value, lease_id, deleted, created, create_revision, prev_revision
 		      FROM kv
 		      WHERE key = @key
 		        AND rev = (
 		          SELECT MAX(rev) FROM kv
-		          WHERE key = @key AND rev <= @rev_cap
+		          WHERE key = @key AND rev <= @cap
 		        )`,
 		Params: map[string]interface{}{
-			"key":     key,
-			"rev_cap": revCap(revision, currentRev),
+			"key": key,
+			"cap": capTS,
 		},
 	}
 
@@ -147,13 +165,12 @@ func (s *Store) Get(ctx context.Context, key string, revision int64) (currentRev
 }
 
 // List returns all keys matching the prefix, as of a given revision.
-// revision=0 means current. Returns (currentRev, compactRev, kvs, err).
 func (s *Store) List(ctx context.Context, prefix, startKey string, limit, revision int64) (int64, int64, []*KV, error) {
 	currentRev, err := s.CurrentRevision(ctx)
 	if err != nil {
 		return 0, 0, nil, err
 	}
-	cap := revCap(revision, currentRev)
+	capTS := revToTS(revCap(revision, currentRev))
 
 	stmt := spanner.Statement{
 		SQL: `SELECT kv.rev, kv.key, kv.value, kv.old_value, kv.lease_id,
@@ -171,7 +188,7 @@ func (s *Store) List(ctx context.Context, prefix, startKey string, limit, revisi
 		Params: map[string]interface{}{
 			"prefix":    likePrefix(prefix),
 			"start_key": startKey,
-			"cap":       cap,
+			"cap":       capTS,
 		},
 	}
 
@@ -207,7 +224,7 @@ func (s *Store) Count(ctx context.Context, prefix, startKey string, revision int
 	if err != nil {
 		return 0, 0, err
 	}
-	cap := revCap(revision, currentRev)
+	capTS := revToTS(revCap(revision, currentRev))
 
 	stmt := spanner.Statement{
 		SQL: `SELECT COUNT(*) FROM (
@@ -222,7 +239,7 @@ func (s *Store) Count(ctx context.Context, prefix, startKey string, revision int
 		Params: map[string]interface{}{
 			"prefix":    likePrefix(prefix),
 			"start_key": startKey,
-			"cap":       cap,
+			"cap":       capTS,
 		},
 	}
 
@@ -238,78 +255,91 @@ func (s *Store) Count(ctx context.Context, prefix, startKey string, revision int
 }
 
 // Create inserts key only if it does not currently exist.
-// Returns (newRevision, error). Returns ErrKeyExists if key already present.
+// Uses PENDING_COMMIT_TIMESTAMP() — no kv_rev lock.
 func (s *Store) Create(ctx context.Context, key string, value []byte, leaseID int64) (int64, error) {
-	var newRev int64
-	_, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		exists, err := s.keyExistsTxn(ctx, txn, key)
-		if err != nil {
-			return err
-		}
-		if exists {
-			return ErrKeyExists
-		}
-		newRev, err = s.bumpRevTxn(ctx, txn)
-		if err != nil {
-			return err
-		}
-		return txn.BufferWrite([]*spanner.Mutation{
-			spanner.Insert("kv",
-				[]string{"rev", "key", "value", "old_value", "lease_id", "deleted", "created", "create_revision", "prev_revision"},
-				[]interface{}{newRev, key, value, []byte(nil), leaseID, false, true, newRev, int64(0)},
-			),
-		})
-	})
+	var commitTS time.Time
+
+	resp, err := s.client.ReadWriteTransactionWithOptions(ctx,
+		func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			exists, err := s.keyExistsTxn(ctx, txn, key)
+			if err != nil {
+				return err
+			}
+			if exists {
+				return ErrKeyExists
+			}
+			return txn.BufferWrite([]*spanner.Mutation{
+				spanner.Insert("kv",
+					[]string{"rev", "key", "value", "old_value", "lease_id",
+						"deleted", "created", "create_revision", "prev_revision"},
+					[]interface{}{
+						spanner.CommitTimestamp, // rev = PENDING_COMMIT_TIMESTAMP()
+						key, value, []byte(nil), leaseID,
+						false, true,
+						spanner.CommitTimestamp, // create_revision = same commit
+						(*time.Time)(nil),       // prev_revision = NULL
+					},
+				),
+			})
+		}, spanner.TransactionOptions{CommitOptions: spanner.CommitOptions{ReturnCommitStats: false}})
+
 	status := "ok"
 	if err != nil {
 		status = "error"
 	}
 	metrics.KVOperationsTotal.WithLabelValues("create", status).Inc()
 	metrics.SpannerTransactions.WithLabelValues(status).Inc()
+
 	if err != nil {
 		return 0, err
 	}
-	metrics.CurrentRevision.Set(float64(newRev))
-	s.watcher.notify(newRev)
-	return newRev, nil
+	commitTS = resp.CommitTs
+	rev := tsToRev(commitTS)
+	metrics.CurrentRevision.Set(float64(rev))
+	s.watcher.notify(rev)
+	return rev, nil
 }
 
-// Update replaces key at the given revision (CAS). Returns ErrRevisionMismatch if revision doesn't match.
+// Update replaces key at the given revision (CAS).
 func (s *Store) Update(ctx context.Context, key string, value []byte, revision, leaseID int64) (int64, *KV, bool, error) {
-	var newRev int64
+	var commitTS time.Time
 	var prev *KV
 
-	_, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		var err error
-		prev, err = s.getLatestTxn(ctx, txn, key)
-		if err != nil {
-			return err
-		}
-		if prev == nil {
-			return ErrKeyNotFound
-		}
-		if prev.Rev != revision {
-			return ErrRevisionMismatch
-		}
+	resp, err := s.client.ReadWriteTransactionWithOptions(ctx,
+		func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			var err error
+			prev, err = s.getLatestTxn(ctx, txn, key)
+			if err != nil {
+				return err
+			}
+			if prev == nil {
+				return ErrKeyNotFound
+			}
+			if prev.Rev != revision {
+				return ErrRevisionMismatch
+			}
+			return txn.BufferWrite([]*spanner.Mutation{
+				spanner.Insert("kv",
+					[]string{"rev", "key", "value", "old_value", "lease_id",
+						"deleted", "created", "create_revision", "prev_revision"},
+					[]interface{}{
+						spanner.CommitTimestamp,
+						key, value, prev.Value, leaseID,
+						false, false,
+						revToTS(prev.CreateRevision),
+						revToTS(prev.Rev),
+					},
+				),
+			})
+		}, spanner.TransactionOptions{})
 
-		newRev, err = s.bumpRevTxn(ctx, txn)
-		if err != nil {
-			return err
-		}
-
-		return txn.BufferWrite([]*spanner.Mutation{
-			spanner.Insert("kv",
-				[]string{"rev", "key", "value", "old_value", "lease_id", "deleted", "created", "create_revision", "prev_revision"},
-				[]interface{}{newRev, key, value, prev.Value, leaseID, false, false, prev.CreateRevision, prev.Rev},
-			),
-		})
-	})
 	status := "ok"
 	if err != nil {
 		status = "error"
 	}
 	metrics.KVOperationsTotal.WithLabelValues("update", status).Inc()
 	metrics.SpannerTransactions.WithLabelValues(status).Inc()
+
 	if errors.Is(err, ErrRevisionMismatch) || errors.Is(err, ErrKeyNotFound) {
 		curRev, _ := s.CurrentRevision(ctx)
 		return curRev, prev, false, nil
@@ -317,47 +347,53 @@ func (s *Store) Update(ctx context.Context, key string, value []byte, revision, 
 	if err != nil {
 		return 0, nil, false, err
 	}
-	metrics.CurrentRevision.Set(float64(newRev))
-	s.watcher.notify(newRev)
-	return newRev, prev, true, nil
+	commitTS = resp.CommitTs
+	rev := tsToRev(commitTS)
+	metrics.CurrentRevision.Set(float64(rev))
+	s.watcher.notify(rev)
+	return rev, prev, true, nil
 }
 
-// Delete removes key at the given revision (CAS). revision=0 means unconditional.
+// Delete removes key at the given revision (CAS). revision=0 = unconditional.
 func (s *Store) Delete(ctx context.Context, key string, revision int64) (int64, *KV, bool, error) {
-	var newRev int64
+	var commitTS time.Time
 	var prev *KV
 
-	_, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		var err error
-		prev, err = s.getLatestTxn(ctx, txn, key)
-		if err != nil {
-			return err
-		}
-		if prev == nil {
-			return ErrKeyNotFound
-		}
-		if revision != 0 && prev.Rev != revision {
-			return ErrRevisionMismatch
-		}
+	resp, err := s.client.ReadWriteTransactionWithOptions(ctx,
+		func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			var err error
+			prev, err = s.getLatestTxn(ctx, txn, key)
+			if err != nil {
+				return err
+			}
+			if prev == nil {
+				return ErrKeyNotFound
+			}
+			if revision != 0 && prev.Rev != revision {
+				return ErrRevisionMismatch
+			}
+			return txn.BufferWrite([]*spanner.Mutation{
+				spanner.Insert("kv",
+					[]string{"rev", "key", "value", "old_value", "lease_id",
+						"deleted", "created", "create_revision", "prev_revision"},
+					[]interface{}{
+						spanner.CommitTimestamp,
+						key, []byte(nil), prev.Value, int64(0),
+						true, false,
+						revToTS(prev.CreateRevision),
+						revToTS(prev.Rev),
+					},
+				),
+			})
+		}, spanner.TransactionOptions{})
 
-		newRev, err = s.bumpRevTxn(ctx, txn)
-		if err != nil {
-			return err
-		}
-
-		return txn.BufferWrite([]*spanner.Mutation{
-			spanner.Insert("kv",
-				[]string{"rev", "key", "value", "old_value", "lease_id", "deleted", "created", "create_revision", "prev_revision"},
-				[]interface{}{newRev, key, []byte(nil), prev.Value, int64(0), true, false, prev.CreateRevision, prev.Rev},
-			),
-		})
-	})
 	status := "ok"
 	if err != nil {
 		status = "error"
 	}
 	metrics.KVOperationsTotal.WithLabelValues("delete", status).Inc()
 	metrics.SpannerTransactions.WithLabelValues(status).Inc()
+
 	if errors.Is(err, ErrRevisionMismatch) || errors.Is(err, ErrKeyNotFound) {
 		curRev, _ := s.CurrentRevision(ctx)
 		return curRev, prev, false, nil
@@ -365,19 +401,21 @@ func (s *Store) Delete(ctx context.Context, key string, revision int64) (int64, 
 	if err != nil {
 		return 0, nil, false, err
 	}
-	metrics.CurrentRevision.Set(float64(newRev))
-	s.watcher.notify(newRev)
-	return newRev, prev, true, nil
+	commitTS = resp.CommitTs
+	rev := tsToRev(commitTS)
+	metrics.CurrentRevision.Set(float64(rev))
+	s.watcher.notify(rev)
+	return rev, prev, true, nil
 }
 
-// After returns all events with rev > afterRev matching prefix, up to limit.
-// This is the core of the Watch poll loop.
+// After returns all events with rev > afterRev matching prefix.
 func (s *Store) After(ctx context.Context, prefix string, afterRev, limit int64) (int64, []*Event, error) {
 	currentRev, err := s.CurrentRevision(ctx)
 	if err != nil {
 		return 0, nil, err
 	}
 
+	afterTS := revToTS(afterRev)
 	stmt := spanner.Statement{
 		SQL: `SELECT rev, key, value, old_value, lease_id, deleted, created, create_revision, prev_revision
 		      FROM kv
@@ -386,7 +424,7 @@ func (s *Store) After(ctx context.Context, prefix string, afterRev, limit int64)
 		      ORDER BY rev ASC` + limitClause(limit),
 		Params: map[string]interface{}{
 			"prefix":    likePrefix(prefix),
-			"after_rev": afterRev,
+			"after_rev": afterTS,
 		},
 	}
 
@@ -415,15 +453,14 @@ func (s *Store) After(ctx context.Context, prefix string, afterRev, limit int64)
 	return currentRev, events, nil
 }
 
-// Compact marks all old revisions up to targetRev as eligible for GC.
-// In this implementation, compact deletes superseded and deleted rows.
+// Compact records the compaction revision.
 func (s *Store) Compact(ctx context.Context, targetRev int64) (int64, error) {
+	targetTS := revToTS(targetRev)
 	_, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		// Record compact revision in a known key so Watch can detect ErrCompacted.
 		return txn.BufferWrite([]*spanner.Mutation{
 			spanner.InsertOrUpdateMap("kv_rev", map[string]interface{}{
-				"id":  schema.RevCounterRow + 1, // row 2 = compact rev
-				"rev": targetRev,
+				"id":  schema.CompactRevRow,
+				"rev": targetTS,
 			}),
 		})
 	})
@@ -431,7 +468,6 @@ func (s *Store) Compact(ctx context.Context, targetRev int64) (int64, error) {
 		return 0, err
 	}
 
-	// Async deletion of old rows.
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
@@ -441,7 +477,7 @@ func (s *Store) Compact(ctx context.Context, targetRev int64) (int64, error) {
 	return targetRev, nil
 }
 
-// CompactRevision returns the last compacted revision (0 if never compacted).
+// CompactRevision returns the last compacted revision (1 if never compacted).
 func (s *Store) CompactRevision(ctx context.Context) (int64, error) {
 	return s.compactRevision(ctx)
 }
@@ -453,31 +489,21 @@ func (s *Store) Watch(ctx context.Context, prefix string, afterRev int64) <-chan
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
-// bumpRevTxn atomically increments kv_rev.rev and returns the new value.
-//
-// Performance note: we use a single DML UPDATE...THEN RETURN statement which
-// both increments and reads the counter server-side, avoiding the two-RPC
-// read-modify-write pattern. The Spanner Go client executes this via Query()
-// (not Update()) because THEN RETURN produces a result set.
-func (s *Store) bumpRevTxn(ctx context.Context, txn *spanner.ReadWriteTransaction) (int64, error) {
-	iter := txn.Query(ctx, spanner.Statement{
-		SQL: `UPDATE kv_rev SET rev = rev + 1 WHERE id = @id THEN RETURN rev`,
-		Params: map[string]interface{}{"id": schema.RevCounterRow},
-	})
-	defer iter.Stop()
+// tsToRev converts a Spanner TIMESTAMP to int64 revision (UnixNano).
+func tsToRev(ts time.Time) int64 {
+	n := ts.UnixNano()
+	if n <= 0 {
+		return 1
+	}
+	return n
+}
 
-	row, err := iter.Next()
-	if errors.Is(err, iterator.Done) {
-		return 0, fmt.Errorf("kv_rev row not found")
+// revToTS converts an int64 revision (UnixNano) to time.Time.
+func revToTS(rev int64) time.Time {
+	if rev <= 1 {
+		return time.Unix(0, 1)
 	}
-	if err != nil {
-		return 0, fmt.Errorf("bump kv_rev: %w", err)
-	}
-	var newRev int64
-	if err := row.Columns(&newRev); err != nil {
-		return 0, err
-	}
-	return newRev, nil
+	return time.Unix(0, rev)
 }
 
 // keyExistsTxn checks whether key has a non-deleted current row.
@@ -502,12 +528,11 @@ func (s *Store) keyExistsTxn(ctx context.Context, txn *spanner.ReadWriteTransact
 	return !deleted, nil
 }
 
-// getLatestTxn returns the most recent KV row for key within a txn.
-// Uses the kv_key_rev index (key, rev DESC) for an efficient latest-row lookup.
+// getLatestTxn returns the most recent non-deleted KV row for key within a txn.
 func (s *Store) getLatestTxn(ctx context.Context, txn *spanner.ReadWriteTransaction, key string) (*KV, error) {
 	stmt := spanner.Statement{
 		SQL: `SELECT rev, key, value, old_value, lease_id, deleted, created, create_revision, prev_revision
-		      FROM kv@{FORCE_INDEX=kv_key_rev} WHERE key = @key ORDER BY rev DESC LIMIT 1`,
+		      FROM kv WHERE key = @key ORDER BY rev DESC LIMIT 1`,
 		Params: map[string]interface{}{"key": key},
 	}
 	iter := txn.Query(ctx, stmt)
@@ -529,33 +554,30 @@ func (s *Store) getLatestTxn(ctx context.Context, txn *spanner.ReadWriteTransact
 	return kv, nil
 }
 
-// compactRevision reads kv_rev row 2 (compact revision). Returns 0 if absent.
+// compactRevision reads the stored compact revision (1 if absent).
 func (s *Store) compactRevision(ctx context.Context) (int64, error) {
 	row, err := s.client.Single().ReadRow(ctx, "kv_rev",
-		spanner.Key{schema.RevCounterRow + 1}, []string{"rev"})
+		spanner.Key{schema.CompactRevRow}, []string{"rev"})
 	if err != nil {
 		if spanner.ErrCode(err) == codes.NotFound {
-			return 0, nil
+			return 1, nil
 		}
 		return 0, err
 	}
-	var rev int64
-	_ = row.Column(0, &rev)
-	return rev, nil
+	var ts time.Time
+	_ = row.Column(0, &ts)
+	return tsToRev(ts), nil
 }
 
-// compactRows physically deletes rows that are superseded or deleted and older than targetRev.
-// Spanner PartitionedUpdate does not support subqueries, so we use a
-// ReadWriteTransaction with a simple DELETE that Spanner can execute directly.
-// Rows are deleted in batches to avoid exceeding transaction mutation limits.
+// compactRows physically deletes old revisions asynchronously.
 func (s *Store) compactRows(ctx context.Context, targetRev int64) {
-	// Find IDs to delete.
+	targetTS := revToTS(targetRev)
 	stmt := spanner.Statement{
 		SQL: `SELECT id FROM kv
 		      WHERE rev <= @target
-		        AND (deleted = true OR prev_revision != 0)
+		        AND (deleted = true OR prev_revision IS NOT NULL)
 		      LIMIT 5000`,
-		Params: map[string]interface{}{"target": targetRev},
+		Params: map[string]interface{}{"target": targetTS},
 	}
 
 	iter := s.client.Single().Query(ctx, stmt)
@@ -582,7 +604,6 @@ func (s *Store) compactRows(ctx context.Context, targetRev int64) {
 		return
 	}
 
-	// Delete in one transaction (up to 5000 mutations is well within Spanner limits).
 	var mutations []*spanner.Mutation
 	for _, id := range ids {
 		mutations = append(mutations, spanner.Delete("kv", id))
@@ -596,28 +617,36 @@ func (s *Store) compactRows(ctx context.Context, targetRev int64) {
 	s.log.Info("compacted old revisions", zap.Int("deleted", len(ids)), zap.Int64("target_rev", targetRev))
 }
 
-// scanKV reads one row from a Spanner iterator into a KV struct.
+// scanKV reads a Spanner row into a KV struct.
+// rev, create_revision, prev_revision are TIMESTAMP → int64 (UnixNano).
 func scanKV(row *spanner.Row) (*KV, error) {
 	var kv KV
+	var revTS time.Time
+	var createRevTS spanner.NullTime
+	var prevRevTS spanner.NullTime
 	var value, oldValue []byte
+
 	if err := row.Columns(
-		&kv.Rev, &kv.Key, &value, &oldValue,
+		&revTS, &kv.Key, &value, &oldValue,
 		&kv.LeaseID, &kv.Deleted, &kv.Created,
-		&kv.CreateRevision, &kv.PrevRevision,
+		&createRevTS, &prevRevTS,
 	); err != nil {
 		return nil, fmt.Errorf("scan kv row: %w", err)
 	}
+	kv.Rev = tsToRev(revTS)
 	kv.Value = value
 	kv.OldValue = oldValue
+	if createRevTS.Valid {
+		kv.CreateRevision = tsToRev(createRevTS.Time)
+	}
+	if prevRevTS.Valid {
+		kv.PrevRevision = tsToRev(prevRevTS.Time)
+	}
 	return &kv, nil
 }
 
-// likePrefix converts an exact prefix to a SQL LIKE pattern.
-func likePrefix(prefix string) string {
-	return prefix + "%"
-}
+func likePrefix(prefix string) string { return prefix + "%" }
 
-// limitClause returns a LIMIT clause or empty string.
 func limitClause(limit int64) string {
 	if limit <= 0 {
 		return ""
@@ -625,7 +654,7 @@ func limitClause(limit int64) string {
 	return fmt.Sprintf(" LIMIT %d", limit)
 }
 
-// revCap returns the effective revision cap: revision if set, else currentRev.
+// revCap returns revision if set, otherwise currentRev.
 func revCap(revision, currentRev int64) int64 {
 	if revision > 0 {
 		return revision

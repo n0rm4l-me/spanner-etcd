@@ -173,10 +173,11 @@ func (lm *LeaseManager) expireLeaseKeys(ctx context.Context, leaseID int64) erro
 			break
 		}
 		var key string
-		var rev int64
-		if err := row.Columns(&key, &rev); err != nil {
+		var revTS time.Time
+		if err := row.Columns(&key, &revTS); err != nil {
 			continue
 		}
+		rev := tsToRev(revTS)
 		if _, _, _, err := lm.store.Delete(ctx, key, rev); err != nil {
 			lm.log.Warn("failed to delete lease key", zap.String("key", key), zap.Error(err))
 		}
