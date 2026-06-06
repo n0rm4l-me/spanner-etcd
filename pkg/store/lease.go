@@ -250,9 +250,13 @@ func (lm *LeaseManager) expireLeaseKeys(ctx context.Context, leaseID int64) erro
 	}
 
 	// All keys processed successfully — remove the lease record.
-	lm.store.client.Apply(ctx, []*spanner.Mutation{ //nolint:errcheck
+	if _, err := lm.store.client.Apply(ctx, []*spanner.Mutation{
 		spanner.Delete("kv_lease", spanner.Key{leaseID}),
-	})
+	}); err != nil {
+		lm.log.Warn("expireLeaseKeys: failed to delete lease record",
+			zap.Int64("lease_id", leaseID), zap.Error(err))
+		return err
+	}
 	return nil
 }
 

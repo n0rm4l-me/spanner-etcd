@@ -47,8 +47,10 @@ func (w *WatchServer) Watch(stream etcdserverpb.Watch_WatchServer) error {
 	// guarantees no IDs are dropped even when stream.Recv() is blocking.
 	cancelledCh := make(chan int64)
 
-	// sendErrCh receives the first stream.Send error so the main loop can exit.
+	// sendErrCh receives the first stream.Send error so the main loop can exit
+	// and propagate non-cancel failures to the caller.
 	sendErrCh := make(chan error, 1)
+	var sendErr error
 
 	// Send loop — runs in its own goroutine.
 	go func() {
@@ -112,7 +114,8 @@ loop:
 		select {
 		case <-ctx.Done():
 			break loop
-		case <-sendErrCh:
+		case err := <-sendErrCh:
+			sendErr = err
 			break loop
 		case id := <-cancelledCh:
 			if cancel, ok := watches[id]; ok {
@@ -173,6 +176,9 @@ loop:
 	for _, cancel := range watches {
 		cancel()
 	}
+	if sendErr != nil && status.Code(sendErr) != codes.Canceled {
+		return sendErr
+	}
 	return nil
 }
 
@@ -215,11 +221,15 @@ func (w *WatchServer) watchLoop(
 			// torn down by the store layer (channel overflow, compaction, or
 			// other internal error). Notify the client and clean up the watches map.
 			if len(events) == 0 {
+				// Include CompactRevision so etcd clients know the minimum safe
+				// revision they can resume from after this cancellation.
+				compactRev, _ := w.store.CompactRevision(stdCtx)
 				select {
 				case respCh <- &etcdserverpb.WatchResponse{
-					Header:   header(0),
-					WatchId:  watchID,
-					Canceled: true,
+					Header:          header(0),
+					WatchId:         watchID,
+					Canceled:        true,
+					CompactRevision: compactRev,
 				}:
 				case <-stdCtx.Done():
 				}
