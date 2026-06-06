@@ -119,9 +119,8 @@ func TestAfter_ErrCompacted(t *testing.T) {
 }
 
 // waitCompacted polls until Get at the given revision returns ErrCompacted.
-// Compact() records the compact revision synchronously but the kv_rev write
-// may take a short time to be visible to subsequent Single() reads. Polling
-// with a short sleep avoids a flaky test on slow CI machines.
+// The test waits for kv_rev to become visible to Single() reads — not for
+// physical row deletion (which is async and tested separately).
 func waitCompacted(t *testing.T, s *store.Store, ctx context.Context, key string, rev int64) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
