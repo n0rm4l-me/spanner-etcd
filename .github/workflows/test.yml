@@ -18,9 +18,9 @@ jobs:
           - 9020:9020
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5.4.0
         with:
           go-version-file: go.mod
           cache: true
@@ -53,9 +53,9 @@ jobs:
           - 9020:9020
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5.4.0
         with:
           go-version-file: go.mod
           cache: true
