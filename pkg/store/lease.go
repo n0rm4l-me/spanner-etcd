@@ -187,9 +187,9 @@ func (lm *LeaseManager) scheduleExpiry(ctx context.Context, lease *Lease) {
 }
 
 // expireLeaseKeys deletes all keys whose latest revision still belongs to leaseID.
-// Uses unconditional delete (rev=0) conditioned on lease_id still matching — avoids
-// a TOCTOU race where a stale rev read causes CAS failure if a concurrent writer
-// updated the key between the read and the delete.
+// Each deletion is performed by DeleteIfLease — a Spanner RW transaction that
+// re-reads the key and only writes a tombstone when lease_id still matches.
+// This closes the TOCTOU window between the initial scan and the delete.
 func (lm *LeaseManager) expireLeaseKeys(ctx context.Context, leaseID int64) error {
 	// Find all keys whose current row still belongs to this lease.
 	stmt := spanner.Statement{
