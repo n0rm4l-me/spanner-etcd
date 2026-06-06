@@ -17,7 +17,7 @@ func TestAutoCompactLoop(t *testing.T) {
 
 	s := newTestStoreWithConfig(t, ctx, store.StoreConfig{
 		AutoCompactInterval: 2 * time.Second,
-		AutoCompactAge:      1 * time.Millisecond, // compact nearly everything
+		AutoCompactAge:      1 * time.Nanosecond, // compact all non-current revisions
 	})
 
 	// Write 3 versions — 2 stale rows will be eligible for compaction.

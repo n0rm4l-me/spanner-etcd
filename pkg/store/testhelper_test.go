@@ -113,6 +113,7 @@ func newTestStoreWithConfig(t *testing.T, ctx context.Context, cfg store.StoreCo
 	if err != nil {
 		t.Fatalf("admin client: %v", err)
 	}
+	t.Cleanup(func() { adminClient.Close() })
 
 	createOp, err := adminClient.CreateDatabase(ctx, &databasepb.CreateDatabaseRequest{
 		Parent:          fmt.Sprintf("projects/%s/instances/%s", testProject, testInstance),
@@ -148,7 +149,6 @@ func newTestStoreWithConfig(t *testing.T, ctx context.Context, cfg store.StoreCo
 		s.Close()
 		spannerClient.Close()
 		adminClient.DropDatabase(context.Background(), &databasepb.DropDatabaseRequest{Database: dbPath}) //nolint:errcheck
-		adminClient.Close()
 	})
 
 	return s

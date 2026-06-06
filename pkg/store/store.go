@@ -705,20 +705,16 @@ func (s *Store) compactRows(ctx context.Context, targetRev int64) int {
 }
 
 // scanCompactBatch fetches one batch of row IDs eligible for compaction.
-// A row is eligible if:
-//   - it is a tombstone (deleted=true), OR
-//   - it is a stale historical revision — i.e. there exists a newer row for the
-//     same key (the current row is never deleted, only its older siblings are).
+// A row is eligible only if there exists a strictly newer row for the same key.
+// This covers both stale historical revisions AND tombstones — but never deletes
+// the latest row for a key (whether it is a live value or a tombstone).
 func (s *Store) scanCompactBatch(ctx context.Context, targetTS time.Time) ([]spanner.Key, error) {
 	stmt := spanner.Statement{
 		SQL: `SELECT kv.id FROM kv
 		      WHERE kv.rev <= @target
-		        AND (
-		          kv.deleted = true
-		          OR EXISTS (
-		            SELECT 1 FROM kv AS newer
-		            WHERE newer.key = kv.key AND newer.rev > kv.rev
-		          )
+		        AND EXISTS (
+		          SELECT 1 FROM kv AS newer
+		          WHERE newer.key = kv.key AND newer.rev > kv.rev
 		        )
 		      LIMIT @batch`,
 		Params: map[string]interface{}{
