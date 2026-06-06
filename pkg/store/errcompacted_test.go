@@ -118,6 +118,29 @@ func TestAfter_ErrCompacted(t *testing.T) {
 	}
 }
 
+// TestGet_NoErrCompacted_FreshStore verifies that Get at revision 1 on a
+// never-compacted store does NOT return ErrCompacted — compactRevision()
+// returns sentinel value 1 which must not be treated as "compacted".
+func TestGet_NoErrCompacted_FreshStore(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	// Write a key so rev>0 exists.
+	rev, err := s.Create(ctx, "/fresh/k", []byte("v"), 0)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Get at rev=1 on a never-compacted store must not return ErrCompacted.
+	_, kv, err := s.Get(ctx, "/fresh/k", 1)
+	if err == store.ErrCompacted {
+		t.Fatal("Get at rev=1 returned ErrCompacted on a never-compacted store")
+	}
+	// Either the key exists at rev=1 or is not found (if rev>1) — both are valid.
+	_ = kv
+	_ = rev
+}
+
 // waitCompacted polls until Get at the given revision returns ErrCompacted.
 // The test waits for kv_rev to become visible to Single() reads — not for
 // physical row deletion (which is async and tested separately).
