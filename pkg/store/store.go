@@ -644,24 +644,6 @@ func (s *Store) AtomicTxn(
 			commitRev = 0
 			snapshotRev = 0
 
-			// Capture the revision visible at this transaction's snapshot.
-			// Used as the response revision when no mutations are buffered.
-			snapIter := txn.Query(ctx, spanner.Statement{SQL: `SELECT MAX(rev) FROM kv`})
-			snapRow, snapErr := snapIter.Next()
-			snapIter.Stop()
-			if snapErr != nil && !errors.Is(snapErr, iterator.Done) {
-				return fmt.Errorf("snapshot revision query: %w", snapErr)
-			}
-			if snapErr == nil {
-				var ts spanner.NullTime
-				if err := snapRow.Column(0, &ts); err != nil {
-					return fmt.Errorf("snapshot revision decode: %w", err)
-				}
-				if ts.Valid {
-					snapshotRev = tsToRev(ts.Time)
-				}
-			}
-
 			// Evaluate all compare conditions inside the transaction.
 			for _, c := range compares {
 				kv, err := s.getLatestTxn(ctx, txn, c.Key)
@@ -768,6 +750,25 @@ func (s *Store) AtomicTxn(
 
 				default:
 					return fmt.Errorf("unknown TxnOpType: %d", op.Type)
+				}
+			}
+			// Only query MAX(rev) when no mutations were buffered (read-only/no-op Txn).
+			// Write Txns get their revision from the commit timestamp — no extra read needed.
+			if !hasMutations {
+				snapIter := txn.Query(ctx, spanner.Statement{SQL: `SELECT MAX(rev) FROM kv`})
+				snapRow, snapErr := snapIter.Next()
+				snapIter.Stop()
+				if snapErr != nil && !errors.Is(snapErr, iterator.Done) {
+					return fmt.Errorf("snapshot revision query: %w", snapErr)
+				}
+				if snapErr == nil {
+					var ts spanner.NullTime
+					if err := snapRow.Column(0, &ts); err != nil {
+						return fmt.Errorf("snapshot revision decode: %w", err)
+					}
+					if ts.Valid {
+						snapshotRev = tsToRev(ts.Time)
+					}
 				}
 			}
 			return nil
