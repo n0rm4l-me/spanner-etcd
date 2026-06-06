@@ -591,6 +591,227 @@ func (s *Store) After(ctx context.Context, prefix string, afterRev, limit int64)
 	return currentRev, events, nil
 }
 
+// TxnOp represents a single operation within an atomic Txn.
+type TxnOp struct {
+	Type    TxnOpType
+	Key     string
+	Value   []byte
+	LeaseID int64
+}
+
+type TxnOpType int
+
+const (
+	TxnOpPut    TxnOpType = 0
+	TxnOpDelete TxnOpType = 1
+	TxnOpGet    TxnOpType = 2
+)
+
+// TxnResult is the result of a single TxnOp.
+type TxnResult struct {
+	KV *KV
+	Ok bool
+}
+
+// AtomicTxn executes compare+ops in a single Spanner ReadWriteTransaction.
+// All compare reads and op writes are atomic — no TOCTOU window.
+// Returns (succeeded, results, commitRev, error).
+func (s *Store) AtomicTxn(
+	ctx context.Context,
+	compares []TxnCompare,
+	successOps []TxnOp,
+	failureOps []TxnOp,
+) (succeeded bool, results []TxnResult, commitRev int64, err error) {
+	// Validate compares before opening a Spanner transaction.
+	for _, c := range compares {
+		if c.Err != nil {
+			return false, nil, 0, c.Err
+		}
+		if c.Evaluate == nil {
+			return false, nil, 0, fmt.Errorf("TxnCompare.Evaluate must not be nil for key %q", c.Key)
+		}
+	}
+
+	var hasMutations bool
+	var snapshotRev int64
+
+	resp, txnErr := s.client.ReadWriteTransactionWithOptions(ctx,
+		func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			// Reset all per-attempt state — Spanner may retry this callback on ABORTED.
+			succeeded = true
+			results = nil
+			hasMutations = false
+			commitRev = 0
+			snapshotRev = 0
+
+			// Evaluate all compare conditions inside the transaction.
+			for _, c := range compares {
+				kv, err := s.getLatestTxn(ctx, txn, c.Key)
+				if err != nil {
+					return err
+				}
+				if !c.Evaluate(kv) {
+					succeeded = false
+					break
+				}
+			}
+
+			ops := successOps
+			if !succeeded {
+				ops = failureOps
+			}
+
+			// Reject duplicate keys in the same Txn branch — multiple mutations to
+			// the same key share the same PCT timestamp, making the final state
+			// nondeterministic (ORDER BY rev DESC LIMIT 1 can return any of them).
+			mutatedKeys := make(map[string]struct{}, len(ops))
+			for _, op := range ops {
+				if op.Type == TxnOpPut || op.Type == TxnOpDelete {
+					if _, dup := mutatedKeys[op.Key]; dup {
+						return fmt.Errorf("duplicate mutation for key %q in single Txn branch", op.Key)
+					}
+					mutatedKeys[op.Key] = struct{}{}
+				}
+			}
+
+			// Execute ops and buffer mutations.
+			for _, op := range ops {
+				switch op.Type {
+				case TxnOpGet:
+					kv, err := s.getLatestTxn(ctx, txn, op.Key)
+					if err != nil {
+						return err
+					}
+					results = append(results, TxnResult{KV: kv, Ok: kv != nil})
+
+				case TxnOpPut:
+					prev, err := s.getLatestTxn(ctx, txn, op.Key)
+					if err != nil {
+						return err
+					}
+					var createRevTS interface{} = spanner.CommitTimestamp
+					var prevRevTS interface{} = (*time.Time)(nil)
+					if prev != nil {
+						createRevTS = revToTS(prev.CreateRevision)
+						prevRevTS = revToTS(prev.Rev)
+					}
+					if err := txn.BufferWrite([]*spanner.Mutation{
+						spanner.Insert("kv",
+							[]string{"rev", "key", "value", "old_value", "lease_id",
+								"deleted", "created", "create_revision", "prev_revision"},
+							[]interface{}{
+								spanner.CommitTimestamp,
+								op.Key, op.Value,
+								func() []byte {
+									if prev != nil {
+										return prev.Value
+									}
+									return nil
+								}(),
+								op.LeaseID,
+								false,
+								prev == nil, // created=true only on first write
+								createRevTS,
+								prevRevTS,
+							},
+						),
+					}); err != nil {
+						return err
+					}
+					hasMutations = true
+					results = append(results, TxnResult{KV: prev, Ok: true})
+
+				case TxnOpDelete:
+					prev, err := s.getLatestTxn(ctx, txn, op.Key)
+					if err != nil {
+						return err
+					}
+					if prev == nil {
+						results = append(results, TxnResult{Ok: false})
+						continue
+					}
+					if err := txn.BufferWrite([]*spanner.Mutation{
+						spanner.Insert("kv",
+							[]string{"rev", "key", "value", "old_value", "lease_id",
+								"deleted", "created", "create_revision", "prev_revision"},
+							[]interface{}{
+								spanner.CommitTimestamp,
+								op.Key, []byte(nil), prev.Value, int64(0),
+								true, false,
+								revToTS(prev.CreateRevision),
+								revToTS(prev.Rev),
+							},
+						),
+					}); err != nil {
+						return err
+					}
+					hasMutations = true
+					results = append(results, TxnResult{KV: prev, Ok: true})
+
+				default:
+					return fmt.Errorf("unknown TxnOpType: %d", op.Type)
+				}
+			}
+			// Only query MAX(rev) when no mutations were buffered (read-only/no-op Txn).
+			// Write Txns get their revision from the commit timestamp — no extra read needed.
+			if !hasMutations {
+				snapIter := txn.Query(ctx, spanner.Statement{SQL: `SELECT MAX(rev) FROM kv`})
+				snapRow, snapErr := snapIter.Next()
+				snapIter.Stop()
+				if snapErr != nil && !errors.Is(snapErr, iterator.Done) {
+					return fmt.Errorf("snapshot revision query: %w", snapErr)
+				}
+				if snapErr == nil {
+					var ts spanner.NullTime
+					if err := snapRow.Column(0, &ts); err != nil {
+						return fmt.Errorf("snapshot revision decode: %w", err)
+					}
+					if ts.Valid {
+						snapshotRev = tsToRev(ts.Time)
+					}
+				}
+			}
+			return nil
+		}, spanner.TransactionOptions{})
+
+	status := "ok"
+	if txnErr != nil {
+		status = "error"
+	}
+	metrics.KVOperationsTotal.WithLabelValues("txn", status).Inc()
+	metrics.SpannerTransactions.WithLabelValues(status).Inc()
+
+	if txnErr != nil {
+		return false, nil, 0, txnErr
+	}
+	if hasMutations {
+		commitRev = tsToRev(resp.CommitTs)
+		if commitRev > 0 {
+			metrics.CurrentRevision.Set(float64(commitRev))
+			s.watcher.notify(commitRev)
+		}
+	} else {
+		// No mutations — snapshotRev was captured inside the transaction via
+		// SELECT MAX(rev), giving the exact revision visible to the compare reads.
+		commitRev = snapshotRev
+		if commitRev == 0 {
+			// Empty store at transaction snapshot — return the base revision directly.
+			// Do NOT call CurrentRevision() outside the txn: a concurrent writer could
+			// have committed after our snapshot, returning a phantom revision.
+			commitRev = 1
+		}
+	}
+	return succeeded, results, commitRev, nil
+}
+
+// TxnCompare is a single compare predicate for AtomicTxn.
+// If Err is non-nil, AtomicTxn returns it immediately without executing.
+type TxnCompare struct {
+	Key      string
+	Evaluate func(kv *KV) bool
+	Err      error // pre-validation error (e.g. unsupported compare target)
+}
+
 // Compact records the compaction revision.
 func (s *Store) Compact(ctx context.Context, targetRev int64) (int64, error) {
 	targetTS := revToTS(targetRev)

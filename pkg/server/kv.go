@@ -171,25 +171,180 @@ func (k *KVServer) DeleteRange(ctx context.Context, r *etcdserverpb.DeleteRangeR
 }
 
 // Txn processes an etcd transaction — the primary operation used by Kubernetes.
+// All compare reads and op writes execute inside a single Spanner RWT — atomic.
 func (k *KVServer) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error) {
-	// Evaluate Compare conditions.
-	succeeded, err := k.evaluateCompare(ctx, r.Compare)
+	compares := make([]store.TxnCompare, 0, len(r.Compare))
+	for _, c := range r.Compare {
+		c := c
+		tc := store.TxnCompare{Key: string(c.Key)}
+		switch c.Target {
+		case etcdserverpb.Compare_VERSION,
+			etcdserverpb.Compare_CREATE,
+			etcdserverpb.Compare_MOD,
+			etcdserverpb.Compare_VALUE:
+			tc.Evaluate = func(kv *store.KV) bool {
+				switch c.Target {
+				case etcdserverpb.Compare_VERSION:
+					var version int64
+					if kv != nil {
+						version = kv.Rev - kv.CreateRevision + 1
+					}
+					return compareInt(version, c.GetVersion(), c.Result)
+				case etcdserverpb.Compare_CREATE:
+					var createRev int64
+					if kv != nil {
+						createRev = kv.CreateRevision
+					}
+					return compareInt(createRev, c.GetCreateRevision(), c.Result)
+				case etcdserverpb.Compare_MOD:
+					var modRev int64
+					if kv != nil {
+						modRev = kv.Rev
+					}
+					return compareInt(modRev, c.GetModRevision(), c.Result)
+				case etcdserverpb.Compare_VALUE:
+					var val []byte
+					if kv != nil {
+						val = kv.Value
+					}
+					return compareBytes(val, c.GetValue(), c.Result)
+				}
+				return false
+			}
+		default:
+			tc.Err = status.Errorf(codes.InvalidArgument, "unsupported compare target: %v", c.Target)
+		}
+		compares = append(compares, tc)
+	}
+
+	toStoreOps := func(ops []*etcdserverpb.RequestOp) ([]store.TxnOp, error) {
+		result := make([]store.TxnOp, 0, len(ops))
+		for _, op := range ops {
+			switch v := op.Request.(type) {
+			case *etcdserverpb.RequestOp_RequestRange:
+				rr := v.RequestRange
+				if len(rr.RangeEnd) > 0 {
+					return nil, status.Error(codes.Unimplemented, "Txn range scan not supported in atomic mode")
+				}
+				if rr.Revision != 0 {
+					return nil, status.Error(codes.Unimplemented, "Txn historical read not supported in atomic mode")
+				}
+				if rr.CountOnly || rr.KeysOnly || rr.Limit != 0 {
+					return nil, status.Error(codes.Unimplemented, "Txn CountOnly/KeysOnly/Limit not supported in atomic mode")
+				}
+				result = append(result, store.TxnOp{Type: store.TxnOpGet, Key: string(rr.Key)})
+			case *etcdserverpb.RequestOp_RequestPut:
+				pr := v.RequestPut
+				if pr.IgnoreValue || pr.IgnoreLease {
+					return nil, status.Error(codes.Unimplemented, "Txn IgnoreValue/IgnoreLease not supported in atomic mode")
+				}
+				result = append(result, store.TxnOp{
+					Type:    store.TxnOpPut,
+					Key:     string(pr.Key),
+					Value:   pr.Value,
+					LeaseID: pr.Lease,
+				})
+			case *etcdserverpb.RequestOp_RequestDeleteRange:
+				dr := v.RequestDeleteRange
+				if len(dr.RangeEnd) > 0 {
+					return nil, status.Error(codes.Unimplemented, "Txn range delete not supported in atomic mode")
+				}
+				result = append(result, store.TxnOp{Type: store.TxnOpDelete, Key: string(dr.Key)})
+			default:
+				return nil, status.Error(codes.InvalidArgument, "unsupported Txn op type")
+			}
+		}
+		return result, nil
+	}
+
+	successOps, err := toStoreOps(r.Success)
 	if err != nil {
+		return nil, err
+	}
+	failureOps, err := toStoreOps(r.Failure)
+	if err != nil {
+		return nil, err
+	}
+
+	// Detect duplicate keys in each branch and return InvalidArgument early
+	// so clients get a meaningful error rather than codes.Internal from the store.
+	for _, ops := range [][]store.TxnOp{successOps, failureOps} {
+		seen := make(map[string]struct{}, len(ops))
+		for _, op := range ops {
+			if op.Type == store.TxnOpPut || op.Type == store.TxnOpDelete {
+				if _, dup := seen[op.Key]; dup {
+					return nil, status.Errorf(codes.InvalidArgument,
+						"duplicate mutation for key %q in single Txn branch", op.Key)
+				}
+				seen[op.Key] = struct{}{}
+			}
+		}
+	}
+
+	succeeded, results, commitRev, err := k.store.AtomicTxn(ctx, compares, successOps, failureOps)
+	if err != nil {
+		// Pass through gRPC status errors unchanged (e.g. InvalidArgument, Unimplemented).
+		// Only map store domain errors via toGRPCErr.
+		if _, ok := status.FromError(err); ok {
+			return nil, err
+		}
 		return nil, toGRPCErr(err)
 	}
 
+	// Ensure commitRev is set before building response headers.
+	if commitRev == 0 {
+		var cerr error
+		commitRev, cerr = k.store.CurrentRevision(ctx)
+		if cerr != nil {
+			return nil, toGRPCErr(cerr)
+		}
+	}
+
+	// Build gRPC responses from TxnResults.
 	ops := r.Success
 	if !succeeded {
 		ops = r.Failure
 	}
-
-	responses, rev, err := k.executeOps(ctx, ops)
-	if err != nil {
-		return nil, toGRPCErr(err)
+	var responses []*etcdserverpb.ResponseOp
+	for i, op := range ops {
+		var res store.TxnResult
+		if i < len(results) {
+			res = results[i]
+		}
+		switch v := op.Request.(type) {
+		case *etcdserverpb.RequestOp_RequestRange:
+			rresp := &etcdserverpb.RangeResponse{Header: header(commitRev)}
+			if res.KV != nil {
+				rresp.Kvs = []*mvccpb.KeyValue{toProtoKV(res.KV)}
+				rresp.Count = 1
+			}
+			responses = append(responses, &etcdserverpb.ResponseOp{
+				Response: &etcdserverpb.ResponseOp_ResponseRange{ResponseRange: rresp},
+			})
+		case *etcdserverpb.RequestOp_RequestPut:
+			presp := &etcdserverpb.PutResponse{Header: header(commitRev)}
+			if v.RequestPut.PrevKv && res.KV != nil {
+				presp.PrevKv = toProtoKV(res.KV)
+			}
+			responses = append(responses, &etcdserverpb.ResponseOp{
+				Response: &etcdserverpb.ResponseOp_ResponsePut{ResponsePut: presp},
+			})
+		case *etcdserverpb.RequestOp_RequestDeleteRange:
+			dresp := &etcdserverpb.DeleteRangeResponse{
+				Header:  header(commitRev),
+				Deleted: boolToInt(res.Ok),
+			}
+			if v.RequestDeleteRange.PrevKv && res.KV != nil {
+				dresp.PrevKvs = []*mvccpb.KeyValue{toProtoKV(res.KV)}
+			}
+			responses = append(responses, &etcdserverpb.ResponseOp{
+				Response: &etcdserverpb.ResponseOp_ResponseDeleteRange{ResponseDeleteRange: dresp},
+			})
+		}
 	}
 
 	return &etcdserverpb.TxnResponse{
-		Header:    header(rev),
+		Header:    header(commitRev),
 		Succeeded: succeeded,
 		Responses: responses,
 	}, nil
