@@ -111,7 +111,9 @@ func (w *Watcher) notify(rev int64) {
 }
 
 // subscribe returns a channel that delivers events for prefix, starting after afterRev.
-// The caller should drain the channel and stop when it is closed.
+// The channel is never closed — teardown is signalled by sending closedSentinel
+// (an empty non-nil []*Event slice). Callers must select on both the channel and
+// their own context/done signal rather than using for-range semantics.
 func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) <-chan []*Event {
 	subCtx, cancel := context.WithCancel(ctx)
 	sub := &subscriber{
@@ -132,8 +134,9 @@ func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) 
 			w.removeSub(sub)
 			// Mark closed, then drain buffered events until the sentinel fits.
 			// The sentinel MUST be delivered so watchLoop can emit Canceled=true.
-			// After closed=true, dispatchEvents will skip this subscriber, so
-			// no new items will arrive — draining is safe and terminates quickly.
+			// The channel is never closed — sentinel is the teardown signal.
+			// After closed=true, dispatchEvents skips this subscriber so no new
+			// items arrive — draining is safe and terminates quickly.
 			sub.closed.Store(true)
 			for {
 				select {

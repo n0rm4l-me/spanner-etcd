@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -204,7 +205,10 @@ func (lm *LeaseManager) expireLeaseKeys(ctx context.Context, leaseID int64) erro
 	iter := lm.store.client.Single().Query(ctx, stmt)
 	defer iter.Stop()
 
-	var scanErr error
+	var (
+		scanErr    error
+		deleteErrs int
+	)
 	for {
 		row, err := iter.Next()
 		if errors.Is(err, iterator.Done) {
@@ -220,6 +224,7 @@ func (lm *LeaseManager) expireLeaseKeys(ctx context.Context, leaseID int64) erro
 		var key string
 		if err := row.Columns(&key); err != nil {
 			lm.log.Warn("failed to decode lease key row", zap.Error(err))
+			deleteErrs++
 			continue
 		}
 		// Atomic lease_id-conditioned delete: only writes the tombstone if the
@@ -227,6 +232,7 @@ func (lm *LeaseManager) expireLeaseKeys(ctx context.Context, leaseID int64) erro
 		// window — the check and the delete are a single Spanner RW transaction.
 		if _, err := lm.store.DeleteIfLease(ctx, key, leaseID); err != nil {
 			lm.log.Warn("failed to delete lease key", zap.String("key", key), zap.Error(err))
+			deleteErrs++
 		}
 	}
 
@@ -235,8 +241,15 @@ func (lm *LeaseManager) expireLeaseKeys(ctx context.Context, leaseID int64) erro
 			zap.Int64("lease_id", leaseID), zap.Error(scanErr))
 		return scanErr
 	}
+	if deleteErrs > 0 {
+		// Some key deletes failed — preserve the lease record so retries can
+		// attempt to delete the remaining keys rather than orphaning them.
+		lm.log.Warn("expireLeaseKeys: some key deletes failed, lease record preserved",
+			zap.Int64("lease_id", leaseID), zap.Int("failed", deleteErrs))
+		return fmt.Errorf("expireLeaseKeys: %d key delete(s) failed for lease %d", deleteErrs, leaseID)
+	}
 
-	// All keys processed — remove the lease record.
+	// All keys processed successfully — remove the lease record.
 	lm.store.client.Apply(ctx, []*spanner.Mutation{ //nolint:errcheck
 		spanner.Delete("kv_lease", spanner.Key{leaseID}),
 	})

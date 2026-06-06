@@ -42,6 +42,10 @@ func (w *WatchServer) Watch(stream etcdserverpb.Watch_WatchServer) error {
 	// Responses from per-watch goroutines are merged here.
 	respCh := make(chan *etcdserverpb.WatchResponse, 64)
 
+	// cancelledCh carries watch IDs cancelled by the store layer (sentinel path)
+	// so the receive loop can remove them from the watches map.
+	cancelledCh := make(chan int64, 16)
+
 	// Send loop — runs in this goroutine.
 	go func() {
 		for {
@@ -72,6 +76,20 @@ func (w *WatchServer) Watch(stream etcdserverpb.Watch_WatchServer) error {
 			return err
 		}
 
+		// Drain any store-cancelled watch IDs before processing the next request.
+		for {
+			select {
+			case id := <-cancelledCh:
+				if cancel, ok := watches[id]; ok {
+					cancel()
+					delete(watches, id)
+				}
+			default:
+				goto doneCancel
+			}
+		}
+	doneCancel:
+
 		switch v := req.RequestUnion.(type) {
 		case *etcdserverpb.WatchRequest_CreateRequest:
 			cr := v.CreateRequest
@@ -92,7 +110,7 @@ func (w *WatchServer) Watch(stream etcdserverpb.Watch_WatchServer) error {
 				Created: true,
 			}
 
-			go w.watchLoop(watchCtx, id, prefix, startRev, respCh)
+			go w.watchLoop(watchCtx, id, prefix, startRev, respCh, cancelledCh)
 
 		case *etcdserverpb.WatchRequest_CancelRequest:
 			id := v.CancelRequest.WatchId
@@ -122,6 +140,7 @@ func (w *WatchServer) watchLoop(
 	prefix string,
 	startRev int64,
 	respCh chan<- *etcdserverpb.WatchResponse,
+	cancelledCh chan<- int64,
 ) {
 	// Use a background-cancelled context.
 	goctx, ok := ctx.(interface {
@@ -151,7 +170,7 @@ func (w *WatchServer) watchLoop(
 		case events := <-eventCh:
 			// closedSentinel (empty non-nil slice) signals the subscription was
 			// torn down by the store layer (channel overflow, compaction, or
-			// other internal error). Notify the client to reconnect.
+			// other internal error). Notify the client and clean up the watches map.
 			if len(events) == 0 {
 				select {
 				case respCh <- &etcdserverpb.WatchResponse{
@@ -160,6 +179,11 @@ func (w *WatchServer) watchLoop(
 					Canceled: true,
 				}:
 				case <-stdCtx.Done():
+				}
+				// Signal the receive loop to remove this watch ID from the map.
+				select {
+				case cancelledCh <- watchID:
+				default:
 				}
 				return
 			}
