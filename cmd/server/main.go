@@ -192,7 +192,11 @@ func parseFlags() appConfig {
 			if val == "0" || val == "off" || val == "disable" {
 				cfg.autoCompactInterval = -1 // sentinel: disabled
 			} else if d, err := time.ParseDuration(val); err == nil {
-				cfg.autoCompactInterval = d
+				if d == 0 {
+					cfg.autoCompactInterval = -1 // "0s" also disables
+				} else {
+					cfg.autoCompactInterval = d
+				}
 			}
 		case strings.HasPrefix(arg, "--auto-compact-age="):
 			d, err := time.ParseDuration(strings.TrimPrefix(arg, "--auto-compact-age="))

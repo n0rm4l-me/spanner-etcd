@@ -93,14 +93,20 @@ func TestCompact_DoesNotDeleteCurrentRevision(t *testing.T) {
 		t.Fatalf("compact: %v", err)
 	}
 
-	// Poll until rev1 is gone (confirms compaction ran), then check rev3 is still alive.
+	// Poll until rev1 is gone — this confirms compaction actually ran.
+	// Fail explicitly if the deadline passes without compaction completing.
 	deadline := time.Now().Add(10 * time.Second)
+	var compacted bool
 	for time.Now().Before(deadline) {
 		time.Sleep(300 * time.Millisecond)
 		_, kv, _ := s.Get(ctx, "/compact/cur/a", rev1)
 		if kv == nil {
-			break // rev1 compacted — now verify current
+			compacted = true
+			break
 		}
+	}
+	if !compacted {
+		t.Fatal("rev1 still readable after compaction deadline — compaction did not run")
 	}
 
 	_, kv, err := s.Get(ctx, "/compact/cur/a", 0)

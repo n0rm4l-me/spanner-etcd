@@ -77,10 +77,12 @@ const (
 // StoreConfig holds optional tuning parameters for the Store.
 type StoreConfig struct {
 	// AutoCompactInterval controls how often the background compaction loop runs.
-	// 0 uses DefaultAutoCompactInterval. Use -1 to disable auto-compaction entirely.
+	// 0 (unset) uses DefaultAutoCompactInterval.
+	// -1 disables auto-compaction entirely (rely on explicit Compact calls).
 	AutoCompactInterval time.Duration
 	// AutoCompactAge controls how far behind current revision to compact.
-	// Keeps this much history for Watch replay. 0 uses DefaultAutoCompactAge.
+	// Keeps this much history for Watch replay.
+	// 0 (unset) uses DefaultAutoCompactAge.
 	AutoCompactAge time.Duration
 }
 
@@ -111,7 +113,10 @@ func NewWithConfig(ctx context.Context, client *spanner.Client, log *zap.Logger,
 		cfg.AutoCompactAge = DefaultAutoCompactAge
 	}
 
-	bgCtx, bgCancel := context.WithCancel(context.Background())
+	// Derive bgCtx from the caller's ctx so that cancelling the server lifetime
+	// context also stops background goroutines even without an explicit Close().
+	// bgCancel is called from Close() for the normal shutdown path.
+	bgCtx, bgCancel := context.WithCancel(ctx)
 	s := &Store{
 		client:   client,
 		log:      log,
