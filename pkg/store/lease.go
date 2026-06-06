@@ -317,6 +317,7 @@ func (lm *LeaseManager) loadLeases(ctx context.Context, stmt spanner.Statement) 
 		lm.mu.Lock()
 		if _, exists := lm.leases[id]; !exists {
 			lm.leases[id] = lease
+			metrics.ActiveLeases.Inc()
 			go lm.scheduleExpiry(ctx, lease)
 		}
 		lm.mu.Unlock()

@@ -149,10 +149,17 @@ loop:
 				watchCtx, cancel := contextWithCancel(ctx)
 				watches[id] = cancel
 
-				respCh <- &etcdserverpb.WatchResponse{
+				select {
+				case respCh <- &etcdserverpb.WatchResponse{
 					Header:  header(0),
 					WatchId: id,
 					Created: true,
+				}:
+				case <-ctx.Done():
+					break loop
+				case err := <-sendErrCh:
+					sendErr = err
+					break loop
 				}
 
 				go w.watchLoop(watchCtx, id, prefix, startRev, respCh, cancelledCh)
@@ -163,10 +170,17 @@ loop:
 					cancel()
 					delete(watches, id)
 				}
-				respCh <- &etcdserverpb.WatchResponse{
+				select {
+				case respCh <- &etcdserverpb.WatchResponse{
 					Header:   header(0),
 					WatchId:  id,
 					Canceled: true,
+				}:
+				case <-ctx.Done():
+					break loop
+				case err := <-sendErrCh:
+					sendErr = err
+					break loop
 				}
 			}
 		}

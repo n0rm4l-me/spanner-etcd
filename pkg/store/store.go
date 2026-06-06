@@ -195,7 +195,7 @@ func (s *Store) Get(ctx context.Context, key string, revision int64) (currentRev
 		if cerr != nil {
 			return 0, nil, fmt.Errorf("get compact revision: %w", cerr)
 		}
-		if revision < compactRev {
+		if revision <= compactRev {
 			return currentRev, nil, ErrCompacted
 		}
 	}
@@ -268,7 +268,7 @@ func (s *Store) List(ctx context.Context, prefix, startKey string, limit, revisi
 	if err != nil {
 		return 0, 0, nil, err
 	}
-	if revision > 0 && revision < compactRev {
+	if revision > 0 && revision <= compactRev {
 		return currentRev, compactRev, nil, ErrCompacted
 	}
 
@@ -304,7 +304,7 @@ func (s *Store) Count(ctx context.Context, prefix, startKey string, revision int
 		if cerr != nil {
 			return 0, 0, fmt.Errorf("get compact revision: %w", cerr)
 		}
-		if revision < compactRev {
+		if revision <= compactRev {
 			return currentRev, 0, ErrCompacted
 		}
 	}
@@ -544,10 +544,11 @@ func (s *Store) After(ctx context.Context, prefix string, afterRev, limit int64)
 		if cerr != nil {
 			return 0, nil, fmt.Errorf("get compact revision: %w", cerr)
 		}
-		// afterRev is exclusive (returns rev > afterRev), so the effective start
-		// revision is afterRev+1. Only return ErrCompacted when that start
-		// revision is below the compact horizon.
-		if afterRev+1 < compactRev {
+		// afterRev is exclusive (returns rev > afterRev). etcd compaction is
+		// inclusive: reads at compactRev itself are disallowed. So we error when
+		// afterRev < compactRev (meaning the first possible event is at or below
+		// the compact horizon).
+		if afterRev < compactRev {
 			return currentRev, nil, ErrCompacted
 		}
 	}

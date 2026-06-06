@@ -163,7 +163,7 @@ func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) 
 		// Check compaction before starting replay. afterRev-1 can be 0 when
 		// afterRev=1 (epoch), which bypasses the afterRev>0 guard in After().
 		// Explicitly check the compaction horizon here to avoid silent empty replay.
-		if compactRev, cerr := w.store.compactRevision(w.store.bgCtx); cerr == nil && compactRev > 1 && afterRev < compactRev {
+		if compactRev, cerr := w.store.compactRevision(w.store.bgCtx); cerr == nil && compactRev > 1 && afterRev <= compactRev {
 			w.log.Warn("watch replay: startRevision already compacted",
 				zap.Int64("start_rev", afterRev), zap.Int64("compact_rev", compactRev))
 			return
