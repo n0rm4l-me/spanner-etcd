@@ -80,6 +80,26 @@ func TestTxn_ReadOnly_SnapshotRevision(t *testing.T) {
 	t.Logf("write_rev=%d txn_rev=%d", knownRev, txn.Header.Revision)
 }
 
+// TestTxn_DuplicateKey_InvalidArgument verifies that a Txn with duplicate
+// mutations for the same key returns InvalidArgument.
+func TestTxn_DuplicateKey_InvalidArgument(t *testing.T) {
+	cli := testServer(t)
+	ctx := context.Background()
+
+	_, err := cli.Txn(ctx).
+		Then(
+			clientv3.OpPut("/dup/k", "v1"),
+			clientv3.OpPut("/dup/k", "v2"), // duplicate
+		).
+		Commit()
+	if err == nil {
+		t.Fatal("expected error for duplicate key in Txn, got nil")
+	}
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("want InvalidArgument, got %v: %v", status.Code(err), err)
+	}
+}
+
 // TestTxn_NoMutations_RevisionNotZero verifies that a Txn with no mutations
 // returns a non-zero revision even on an otherwise empty response.
 func TestTxn_NoMutations_RevisionNotZero(t *testing.T) {
