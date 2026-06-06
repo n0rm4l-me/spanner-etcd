@@ -43,9 +43,9 @@ func (w *WatchServer) Watch(stream etcdserverpb.Watch_WatchServer) error {
 	respCh := make(chan *etcdserverpb.WatchResponse, 64)
 
 	// cancelledCh carries watch IDs cancelled by the store layer (sentinel path).
-	// Buffered to decouple watchLoop senders from receive loop availability —
-	// prevents watchLoop from blocking if the receive loop is temporarily busy.
-	// Buffer sized to the maximum number of concurrent watches per stream.
+	// Buffered to absorb bursts; senders use a non-blocking send so they never
+	// block regardless of how many concurrent watches a client creates.
+	// Entries not drained during the stream are cleaned up by the cancel-all loop.
 	cancelledCh := make(chan int64, 64)
 
 	// sendErrCh receives the first stream.Send error so the main loop can exit
@@ -248,12 +248,12 @@ func (w *WatchServer) watchLoop(
 				}:
 				case <-stdCtx.Done():
 				}
-				// Signal the receive loop to remove this watch ID from the map.
-				// Block until delivered or the stream context is done — ensures
-				// cleanup is never silently lost even under cancellation bursts.
+				// Non-blocking send — never blocks regardless of how many concurrent
+				// watches exist. Any unsent IDs are cleaned up by the cancel-all loop
+				// when the stream ends.
 				select {
 				case cancelledCh <- watchID:
-				case <-stdCtx.Done():
+				default:
 				}
 				return
 			}

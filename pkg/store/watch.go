@@ -146,7 +146,13 @@ func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) 
 				}
 			}
 		sendSentinel:
-			sub.ch <- closedSentinel
+			// Non-blocking: if dispatchEvents refilled the channel after draining,
+			// the sentinel may not fit. That's acceptable — watchLoop will exit
+			// via stdCtx.Done() when the stream ends anyway.
+			select {
+			case sub.ch <- closedSentinel:
+			default:
+			}
 		}()
 
 		// afterRev=0 means "live watch from now" — no replay needed.
