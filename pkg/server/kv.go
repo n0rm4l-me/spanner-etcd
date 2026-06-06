@@ -266,6 +266,21 @@ func (k *KVServer) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdse
 		return nil, err
 	}
 
+	// Detect duplicate keys in each branch and return InvalidArgument early
+	// so clients get a meaningful error rather than codes.Internal from the store.
+	for _, ops := range [][]store.TxnOp{successOps, failureOps} {
+		seen := make(map[string]struct{}, len(ops))
+		for _, op := range ops {
+			if op.Type == store.TxnOpPut || op.Type == store.TxnOpDelete {
+				if _, dup := seen[op.Key]; dup {
+					return nil, status.Errorf(codes.InvalidArgument,
+						"duplicate mutation for key %q in single Txn branch", op.Key)
+				}
+				seen[op.Key] = struct{}{}
+			}
+		}
+	}
+
 	succeeded, results, commitRev, err := k.store.AtomicTxn(ctx, compares, successOps, failureOps)
 	if err != nil {
 		// Pass through gRPC status errors unchanged (e.g. InvalidArgument, Unimplemented).

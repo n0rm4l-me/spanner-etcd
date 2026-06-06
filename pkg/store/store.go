@@ -627,6 +627,9 @@ func (s *Store) AtomicTxn(
 		if c.Err != nil {
 			return false, nil, 0, c.Err
 		}
+		if c.Evaluate == nil {
+			return false, nil, 0, fmt.Errorf("TxnCompare.Evaluate must not be nil for key %q", c.Key)
+		}
 	}
 
 	var hasMutations bool
