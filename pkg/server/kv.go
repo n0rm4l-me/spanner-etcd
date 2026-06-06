@@ -175,10 +175,14 @@ func (k *KVServer) DeleteRange(ctx context.Context, r *etcdserverpb.DeleteRangeR
 func (k *KVServer) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error) {
 	compares := make([]store.TxnCompare, 0, len(r.Compare))
 	for _, c := range r.Compare {
-		c := c // capture
-		compares = append(compares, store.TxnCompare{
-			Key: string(c.Key),
-			Evaluate: func(kv *store.KV) bool {
+		c := c
+		tc := store.TxnCompare{Key: string(c.Key)}
+		switch c.Target {
+		case etcdserverpb.Compare_VERSION,
+			etcdserverpb.Compare_CREATE,
+			etcdserverpb.Compare_MOD,
+			etcdserverpb.Compare_VALUE:
+			tc.Evaluate = func(kv *store.KV) bool {
 				switch c.Target {
 				case etcdserverpb.Compare_VERSION:
 					var version int64
@@ -206,16 +210,28 @@ func (k *KVServer) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdse
 					return compareBytes(val, c.GetValue(), c.Result)
 				}
 				return false
-			},
-		})
+			}
+		default:
+			tc.Err = status.Errorf(codes.InvalidArgument, "unsupported compare target: %v", c.Target)
+		}
+		compares = append(compares, tc)
 	}
 
-	toStoreOps := func(ops []*etcdserverpb.RequestOp) []store.TxnOp {
+	toStoreOps := func(ops []*etcdserverpb.RequestOp) ([]store.TxnOp, error) {
 		result := make([]store.TxnOp, 0, len(ops))
 		for _, op := range ops {
 			switch v := op.Request.(type) {
 			case *etcdserverpb.RequestOp_RequestRange:
-				result = append(result, store.TxnOp{Type: store.TxnOpGet, Key: string(v.RequestRange.Key)})
+				rr := v.RequestRange
+				// Range scans, historical reads, and count-only are not supported
+				// inside an atomic Txn — only single-key current-value Gets.
+				if len(rr.RangeEnd) > 0 {
+					return nil, status.Error(codes.Unimplemented, "Txn range scan not supported in atomic mode")
+				}
+				if rr.Revision != 0 {
+					return nil, status.Error(codes.Unimplemented, "Txn historical read not supported in atomic mode")
+				}
+				result = append(result, store.TxnOp{Type: store.TxnOpGet, Key: string(rr.Key)})
 			case *etcdserverpb.RequestOp_RequestPut:
 				result = append(result, store.TxnOp{
 					Type:    store.TxnOpPut,
@@ -224,14 +240,28 @@ func (k *KVServer) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdse
 					LeaseID: v.RequestPut.Lease,
 				})
 			case *etcdserverpb.RequestOp_RequestDeleteRange:
-				result = append(result, store.TxnOp{Type: store.TxnOpDelete, Key: string(v.RequestDeleteRange.Key)})
+				dr := v.RequestDeleteRange
+				if len(dr.RangeEnd) > 0 {
+					return nil, status.Error(codes.Unimplemented, "Txn range delete not supported in atomic mode")
+				}
+				result = append(result, store.TxnOp{Type: store.TxnOpDelete, Key: string(dr.Key)})
+			default:
+				return nil, status.Error(codes.InvalidArgument, "unsupported Txn op type")
 			}
 		}
-		return result
+		return result, nil
 	}
 
-	succeeded, results, commitRev, err := k.store.AtomicTxn(ctx, compares,
-		toStoreOps(r.Success), toStoreOps(r.Failure))
+	successOps, err := toStoreOps(r.Success)
+	if err != nil {
+		return nil, err
+	}
+	failureOps, err := toStoreOps(r.Failure)
+	if err != nil {
+		return nil, err
+	}
+
+	succeeded, results, commitRev, err := k.store.AtomicTxn(ctx, compares, successOps, failureOps)
 	if err != nil {
 		return nil, toGRPCErr(err)
 	}

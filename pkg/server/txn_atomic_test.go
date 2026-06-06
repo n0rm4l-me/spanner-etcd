@@ -25,11 +25,14 @@ func TestTxn_Atomic_ConcurrentCreate(t *testing.T) {
 
 	for i := 0; i < iterations; i++ {
 		// Reset: delete the key.
-		cli.Delete(ctx, key)
+		if _, err := cli.Delete(ctx, key); err != nil {
+			t.Fatalf("iteration %d: delete: %v", i, err)
+		}
 		time.Sleep(50 * time.Millisecond)
 
 		var wg sync.WaitGroup
 		results := make([]bool, 2)
+		errs := make([]error, 2)
 
 		for j := 0; j < 2; j++ {
 			j := j
@@ -40,12 +43,19 @@ func TestTxn_Atomic_ConcurrentCreate(t *testing.T) {
 					If(clientv3.Compare(clientv3.Version(key), "=", 0)).
 					Then(clientv3.OpPut(key, "value")).
 					Commit()
+				errs[j] = err
 				if err == nil {
 					results[j] = txn.Succeeded
 				}
 			}()
 		}
 		wg.Wait()
+
+		for j, e := range errs {
+			if e != nil {
+				t.Fatalf("iteration %d goroutine %d: txn error: %v", i, j, e)
+			}
+		}
 
 		successCount := 0
 		for _, r := range results {

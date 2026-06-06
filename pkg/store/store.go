@@ -623,13 +623,20 @@ func (s *Store) AtomicTxn(
 	successOps []TxnOp,
 	failureOps []TxnOp,
 ) (succeeded bool, results []TxnResult, commitRev int64, err error) {
-	var commitTS time.Time
+	var hasMutations bool
 
 	resp, txnErr := s.client.ReadWriteTransactionWithOptions(ctx,
 		func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 			succeeded = true
 			results = nil
-			commitTS = time.Time{}
+			hasMutations = false
+
+			// Fail fast on pre-validation errors (e.g. unsupported compare target).
+			for _, c := range compares {
+				if c.Err != nil {
+					return c.Err
+				}
+			}
 
 			// Evaluate all compare conditions inside the transaction.
 			for _, c := range compares {
@@ -692,6 +699,7 @@ func (s *Store) AtomicTxn(
 					}); err != nil {
 						return err
 					}
+					hasMutations = true
 					results = append(results, TxnResult{KV: prev, Ok: true})
 
 				case TxnOpDelete:
@@ -718,6 +726,7 @@ func (s *Store) AtomicTxn(
 					}); err != nil {
 						return err
 					}
+					hasMutations = true
 					results = append(results, TxnResult{KV: prev, Ok: true})
 				}
 			}
@@ -735,9 +744,9 @@ func (s *Store) AtomicTxn(
 		return false, nil, 0, txnErr
 	}
 	commitRev = tsToRev(resp.CommitTs)
-	commitTS = resp.CommitTs
-	_ = commitTS
-	if commitRev > 0 {
+	// Only update revision and notify watchers if mutations were actually written.
+	// A read-only or failed-compare txn must not create phantom revisions.
+	if hasMutations && commitRev > 0 {
 		metrics.CurrentRevision.Set(float64(commitRev))
 		s.watcher.notify(commitRev)
 	}
@@ -745,9 +754,11 @@ func (s *Store) AtomicTxn(
 }
 
 // TxnCompare is a single compare predicate for AtomicTxn.
+// If Err is non-nil, AtomicTxn returns it immediately without executing.
 type TxnCompare struct {
 	Key      string
 	Evaluate func(kv *KV) bool
+	Err      error // pre-validation error (e.g. unsupported compare target)
 }
 
 // Compact records the compaction revision.
