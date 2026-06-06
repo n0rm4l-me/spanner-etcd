@@ -95,7 +95,10 @@ func run(ctx context.Context, cfg appConfig, log *zap.Logger) error {
 	}
 
 	// ── Store ─────────────────────────────────────────────────────────────────
-	kvStore, err := store.New(ctx, spannerClient, log)
+	kvStore, err := store.NewWithConfig(ctx, spannerClient, log, store.StoreConfig{
+		AutoCompactInterval: cfg.autoCompactInterval,
+		AutoCompactAge:      cfg.autoCompactAge,
+	})
 	if err != nil {
 		return fmt.Errorf("create store: %w", err)
 	}
@@ -136,6 +139,8 @@ type appConfig struct {
 	authTokenTTL         time.Duration // 0 = DefaultTokenTTL (5m)
 	peerURLs             []string
 	logLevel             string
+	autoCompactInterval  time.Duration // 0 = unset (use default 5m); any negative = disabled
+	autoCompactAge       time.Duration // 0 = DefaultAutoCompactAge (5m)
 }
 
 func parseFlags() appConfig {
@@ -182,6 +187,26 @@ func parseFlags() appConfig {
 			cfg.logLevel = strings.TrimPrefix(arg, "--log-level=")
 		case strings.HasPrefix(arg, "--peer-urls="):
 			cfg.peerURLs = splitCSV(strings.TrimPrefix(arg, "--peer-urls="))
+		case strings.HasPrefix(arg, "--auto-compact-interval="):
+			val := strings.TrimPrefix(arg, "--auto-compact-interval=")
+			if val == "0" || val == "off" || val == "disable" {
+				cfg.autoCompactInterval = -1 // sentinel: disabled
+			} else if d, err := time.ParseDuration(val); err != nil {
+				fmt.Fprintf(os.Stderr, "error: invalid --auto-compact-interval=%q: %v\n", val, err)
+				os.Exit(1)
+			} else if d == 0 {
+				cfg.autoCompactInterval = -1 // "0s" also disables
+			} else {
+				cfg.autoCompactInterval = d
+			}
+		case strings.HasPrefix(arg, "--auto-compact-age="):
+			val := strings.TrimPrefix(arg, "--auto-compact-age=")
+			d, err := time.ParseDuration(val)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: invalid --auto-compact-age=%q: %v\n", val, err)
+				os.Exit(1)
+			}
+			cfg.autoCompactAge = d
 		}
 		_ = i
 	}

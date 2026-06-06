@@ -89,7 +89,74 @@ func newTestStore(t *testing.T) *store.Store {
 	t.Cleanup(func() {
 		s.Close()
 		spannerClient.Close()
-		adminClient.DropDatabase(context.Background(), &databasepb.DropDatabaseRequest{Database: dbPath}) //nolint:errcheck
+		dropCtx, dropCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer dropCancel()
+		if err := adminClient.DropDatabase(dropCtx, &databasepb.DropDatabaseRequest{Database: dbPath}); err != nil {
+			t.Logf("DropDatabase %s: %v", dbPath, err)
+		}
+	})
+	return s
+}
+
+// newTestStoreWithConfig creates a Store with explicit StoreConfig for tests that
+// need to tune auto-compaction or other store-level settings.
+func newTestStoreWithConfig(t *testing.T, ctx context.Context, cfg store.StoreConfig) *store.Store {
+	t.Helper()
+
+	if !emulatorRunning() {
+		t.Skip("Spanner emulator not running — set SPANNER_EMULATOR_HOST or start it")
+	}
+
+	dbName := fmt.Sprintf("test-%d", time.Now().UnixNano())
+	dbPath := fmt.Sprintf("projects/%s/instances/%s/databases/%s",
+		testProject, testInstance, dbName)
+
+	ensureInstance(t, ctx)
+
+	adminClient, err := database.NewDatabaseAdminClient(ctx)
+	if err != nil {
+		t.Fatalf("admin client: %v", err)
+	}
+	t.Cleanup(func() { adminClient.Close() })
+
+	createOp, err := adminClient.CreateDatabase(ctx, &databasepb.CreateDatabaseRequest{
+		Parent:          fmt.Sprintf("projects/%s/instances/%s", testProject, testInstance),
+		CreateStatement: fmt.Sprintf("CREATE DATABASE `%s`", dbName),
+	})
+	if err != nil {
+		t.Fatalf("create database: %v", err)
+	}
+	if _, err := createOp.Wait(ctx); err != nil {
+		t.Fatalf("wait create database: %v", err)
+	}
+
+	log := zap.NewNop()
+	if err := schema.Ensure(ctx, adminClient, dbPath, log); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
+
+	spannerClient, err := spanner.NewClient(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("spanner client: %v", err)
+	}
+
+	if err := schema.SeedRevCounter(ctx, spannerClient); err != nil {
+		t.Fatalf("seed rev counter: %v", err)
+	}
+
+	s, err := store.NewWithConfig(ctx, spannerClient, log, cfg)
+	if err != nil {
+		t.Fatalf("new store with config: %v", err)
+	}
+
+	t.Cleanup(func() {
+		s.Close()
+		spannerClient.Close()
+		dropCtx, dropCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer dropCancel()
+		if err := adminClient.DropDatabase(dropCtx, &databasepb.DropDatabaseRequest{Database: dbPath}); err != nil {
+			t.Logf("DropDatabase %s: %v", dbPath, err)
+		}
 	})
 
 	return s

@@ -97,6 +97,25 @@ var (
 		Help:      "Total leases expired via natural TTL.",
 	})
 
+	// ── Compaction ───────────────────────────────────────────────────────────
+
+	// CompactedRowsTotal counts rows physically deleted by compaction.
+	// Labels: trigger ("manual" | "auto")
+	CompactedRowsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "spanner_etcd",
+		Name:      "compacted_rows_total",
+		Help:      "Total kv rows physically deleted by compaction.",
+	}, []string{"trigger"})
+
+	// CompactionDuration tracks how long each compaction run takes.
+	// Labels: trigger ("manual" | "auto")
+	CompactionDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "spanner_etcd",
+		Name:      "compaction_duration_seconds",
+		Help:      "Time spent in each compaction run.",
+		Buckets:   prometheus.ExponentialBuckets(0.1, 2, 11), // 100ms → ~102s
+	}, []string{"trigger"})
+
 	// ── Spanner ───────────────────────────────────────────────────────────────
 
 	// SpannerTransactions counts Spanner RW transactions by outcome.

@@ -65,29 +65,89 @@ const (
 	EventDelete EventType = 1
 )
 
+const (
+	// compactBatchSize is the number of rows deleted per Spanner transaction.
+	// Spanner has a 20k mutation limit per transaction; 1000 rows = safe headroom.
+	compactBatchSize = 1000
+
+	DefaultAutoCompactInterval = 5 * time.Minute
+	DefaultAutoCompactAge      = 5 * time.Minute
+)
+
+// StoreConfig holds optional tuning parameters for the Store.
+type StoreConfig struct {
+	// AutoCompactInterval controls how often the background compaction loop runs.
+	// 0 (unset) uses DefaultAutoCompactInterval.
+	// -1 disables auto-compaction entirely (rely on explicit Compact calls).
+	AutoCompactInterval time.Duration
+	// AutoCompactAge controls how far behind current revision to compact.
+	// Keeps this much history for Watch replay.
+	// 0 (unset) uses DefaultAutoCompactAge.
+	AutoCompactAge time.Duration
+}
+
 // Store is the central Spanner-backed store. It is safe for concurrent use.
 type Store struct {
 	client    *spanner.Client
 	log       *zap.Logger
 	bgCtx     context.Context
+	bgCancel  context.CancelFunc
+	cfg       StoreConfig
 	watcher   *Watcher
 	leasesMgr *LeaseManager
 }
 
-// New creates a Store. The caller is responsible for calling Close.
+// New creates a Store with default configuration. The caller is responsible for calling Close.
 func New(ctx context.Context, client *spanner.Client, log *zap.Logger) (*Store, error) {
-	s := &Store{
-		client: client,
-		log:    log,
-		bgCtx:  ctx,
+	return NewWithConfig(ctx, client, log, StoreConfig{})
+}
+
+// NewWithConfig creates a Store with explicit tuning parameters.
+// Pass AutoCompactInterval = -1 to disable background auto-compaction.
+func NewWithConfig(ctx context.Context, client *spanner.Client, log *zap.Logger, cfg StoreConfig) (*Store, error) {
+	// Negative age would compact future revisions — reject it.
+	if cfg.AutoCompactAge < 0 {
+		return nil, fmt.Errorf("AutoCompactAge must be >= 0, got %v", cfg.AutoCompactAge)
 	}
-	s.watcher = newWatcher(ctx, s, log)
-	s.leasesMgr = newLeaseManager(ctx, s, log)
+	// Any negative interval disables auto-compaction (normalized to -1).
+	// This avoids surprising startup failures for callers that pass
+	// unit-suffixed negative values such as -1*time.Second.
+	// Note: the CLI maps "0/off/disable" to -1 before calling NewWithConfig;
+	// programmatic callers must pass -1 explicitly to disable.
+	if cfg.AutoCompactInterval < 0 {
+		cfg.AutoCompactInterval = -1
+	}
+
+	// -1 = disabled; 0 = unset, use default.
+	if cfg.AutoCompactInterval == 0 {
+		cfg.AutoCompactInterval = DefaultAutoCompactInterval
+	}
+	if cfg.AutoCompactAge == 0 {
+		cfg.AutoCompactAge = DefaultAutoCompactAge
+	}
+
+	// Derive bgCtx from the caller's ctx so that cancelling the server lifetime
+	// context also stops background goroutines even without an explicit Close().
+	// bgCancel is called from Close() for the normal shutdown path.
+	bgCtx, bgCancel := context.WithCancel(ctx)
+	s := &Store{
+		client:   client,
+		log:      log,
+		bgCtx:    bgCtx,
+		bgCancel: bgCancel,
+		cfg:      cfg,
+	}
+	s.watcher = newWatcher(bgCtx, s, log)
+	s.leasesMgr = newLeaseManager(bgCtx, s, log)
+	if cfg.AutoCompactInterval > 0 {
+		go s.autoCompactLoop(bgCtx)
+	}
 	return s, nil
 }
 
 // Close shuts down background goroutines.
 func (s *Store) Close() {
+	s.bgCancel()
 	s.watcher.close()
 	s.leasesMgr.close()
 }
@@ -100,9 +160,9 @@ func (s *Store) Leases() *LeaseManager {
 // CurrentRevision returns the latest global revision as int64 (UnixNano).
 // With PCT, current revision = MAX(rev) FROM kv — no lock, no contention.
 func (s *Store) CurrentRevision(ctx context.Context) (int64, error) {
-	row, err := s.client.Single().Query(ctx, spanner.Statement{
-		SQL: `SELECT MAX(rev) FROM kv`,
-	}).Next()
+	iter := s.client.Single().Query(ctx, spanner.Statement{SQL: `SELECT MAX(rev) FROM kv`})
+	defer iter.Stop()
+	row, err := iter.Next()
 	if errors.Is(err, iterator.Done) {
 		return 1, nil
 	}
@@ -460,6 +520,21 @@ func (s *Store) After(ctx context.Context, prefix string, afterRev, limit int64)
 func (s *Store) Compact(ctx context.Context, targetRev int64) (int64, error) {
 	targetTS := revToTS(targetRev)
 	_, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		// CAS: only advance compact revision if targetTS is larger than existing.
+		// This prevents a race where auto-compact overwrites a larger manual target.
+		row, err := txn.ReadRow(ctx, "kv_rev", spanner.Key{schema.CompactRevRow}, []string{"rev"})
+		if err != nil && spanner.ErrCode(err) != codes.NotFound {
+			return err
+		}
+		if err == nil {
+			var existing time.Time
+			if scanErr := row.Column(0, &existing); scanErr != nil {
+				return fmt.Errorf("decode existing compact rev: %w", scanErr)
+			}
+			if !existing.Before(targetTS) {
+				return nil // already at or beyond targetRev
+			}
+		}
 		return txn.BufferWrite([]*spanner.Mutation{
 			spanner.InsertOrUpdateMap("kv_rev", map[string]interface{}{
 				"id":  schema.CompactRevRow,
@@ -471,10 +546,29 @@ func (s *Store) Compact(ctx context.Context, targetRev int64) (int64, error) {
 		return 0, err
 	}
 
+	// Use the effective compact revision for deletion: if kv_rev was already
+	// at a larger value (prior incomplete compaction), delete up to that larger
+	// revision so stale rows above targetRev are not left behind.
+	effectiveRev := targetRev
+	if stored, err := s.compactRevision(ctx); err == nil && stored > effectiveRev {
+		effectiveRev = stored
+	}
+
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		ctx, cancel := context.WithTimeout(s.bgCtx, 30*time.Minute)
 		defer cancel()
-		s.compactRows(ctx, targetRev)
+		t0 := time.Now()
+		total := s.compactRows(ctx, effectiveRev)
+		dur := time.Since(t0)
+		metrics.CompactedRowsTotal.WithLabelValues("manual").Add(float64(total))
+		metrics.CompactionDuration.WithLabelValues("manual").Observe(dur.Seconds())
+		if total > 0 {
+			s.log.Info("compacted old revisions",
+				zap.Int("deleted", total),
+				zap.Int64("requested_rev", targetRev),
+				zap.Int64("effective_rev", effectiveRev),
+				zap.Duration("duration", dur))
+		}
 	}()
 
 	return targetRev, nil
@@ -572,15 +666,132 @@ func (s *Store) compactRevision(ctx context.Context) (int64, error) {
 	return tsToRev(ts), nil
 }
 
-// compactRows physically deletes old revisions asynchronously.
-func (s *Store) compactRows(ctx context.Context, targetRev int64) {
+// autoCompactLoop runs in the background and compacts old revisions periodically.
+// It targets currentRevision - autoCompactAge, keeping recent history for Watch replay.
+func (s *Store) autoCompactLoop(ctx context.Context) {
+	ticker := time.NewTicker(s.cfg.AutoCompactInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			curRev, err := s.CurrentRevision(ctx)
+			if err != nil {
+				s.log.Warn("auto-compact: failed to read current revision", zap.Error(err))
+				continue
+			}
+			if curRev <= 1 {
+				continue
+			}
+			targetRev := tsToRev(revToTS(curRev).Add(-s.cfg.AutoCompactAge))
+			if targetRev <= 1 {
+				continue
+			}
+			// If a manual Compact() has already set a larger compact revision,
+			// use that as the deletion target so stale rows above our age-based
+			// target are not left behind indefinitely.
+			if existingRev, err := s.compactRevision(ctx); err == nil && existingRev > targetRev {
+				targetRev = existingRev
+			}
+			// Record the compact revision in kv_rev before deleting rows so that
+			// CompactRevision() reflects what background compaction has done.
+			// Use CAS inside the transaction: only advance kv_rev if the new target
+			// is larger than what is already stored — prevents auto-compact from
+			// overwriting a larger manual compact revision with a smaller value.
+			targetTS := revToTS(targetRev)
+			if _, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+				row, err := txn.ReadRow(ctx, "kv_rev", spanner.Key{schema.CompactRevRow}, []string{"rev"})
+				if err != nil && spanner.ErrCode(err) != codes.NotFound {
+					return err
+				}
+				if err == nil {
+					var existing time.Time
+					if scanErr := row.Column(0, &existing); scanErr != nil {
+						return fmt.Errorf("decode existing compact rev: %w", scanErr)
+					}
+					if !existing.Before(targetTS) {
+						return nil // existing compact rev is already >= target, skip
+					}
+				}
+				return txn.BufferWrite([]*spanner.Mutation{
+					spanner.InsertOrUpdateMap("kv_rev", map[string]interface{}{
+						"id":  schema.CompactRevRow,
+						"rev": targetTS,
+					}),
+				})
+			}); err != nil {
+				s.log.Warn("auto-compact: failed to record compact revision", zap.Error(err))
+				continue
+			}
+
+			runCtx, runCancel := context.WithTimeout(ctx, 30*time.Minute)
+			t0 := time.Now()
+			total := s.compactRows(runCtx, targetRev)
+			dur := time.Since(t0)
+			runCancel()
+			metrics.CompactedRowsTotal.WithLabelValues("auto").Add(float64(total))
+			metrics.CompactionDuration.WithLabelValues("auto").Observe(dur.Seconds())
+			if total > 0 {
+				s.log.Info("auto-compacted old revisions",
+					zap.Int("deleted", total),
+					zap.Int64("target_rev", targetRev),
+					zap.Duration("duration", dur))
+			}
+		}
+	}
+}
+
+// compactRows physically deletes old revisions in batches until none remain.
+// Returns the total number of rows deleted.
+func (s *Store) compactRows(ctx context.Context, targetRev int64) int {
 	targetTS := revToTS(targetRev)
+	total := 0
+	for {
+		ids, err := s.scanCompactBatch(ctx, targetTS)
+		if err != nil {
+			s.log.Warn("compact rows scan failed",
+				zap.Int64("target_rev", targetRev), zap.Error(err))
+			return total
+		}
+		if len(ids) == 0 {
+			return total
+		}
+
+		mutations := make([]*spanner.Mutation, len(ids))
+		for i, id := range ids {
+			mutations[i] = spanner.Delete("kv", id)
+		}
+		if _, err := s.client.Apply(ctx, mutations); err != nil {
+			s.log.Warn("compact rows delete failed",
+				zap.Int64("target_rev", targetRev), zap.Int("count", len(ids)), zap.Error(err))
+			return total
+		}
+		total += len(ids)
+
+		if len(ids) < compactBatchSize {
+			return total
+		}
+	}
+}
+
+// scanCompactBatch fetches one batch of row IDs eligible for compaction.
+// A row is eligible only if there exists a strictly newer row for the same key.
+// This covers both stale historical revisions AND tombstones — but never deletes
+// the latest row for a key (whether it is a live value or a tombstone).
+func (s *Store) scanCompactBatch(ctx context.Context, targetTS time.Time) ([]spanner.Key, error) {
 	stmt := spanner.Statement{
-		SQL: `SELECT id FROM kv
-		      WHERE rev <= @target
-		        AND (deleted = true OR prev_revision IS NOT NULL)
-		      LIMIT 5000`,
-		Params: map[string]interface{}{"target": targetTS},
+		SQL: `SELECT kv.id FROM kv
+		      WHERE kv.rev <= @target
+		        AND EXISTS (
+		          SELECT 1 FROM kv AS newer
+		          WHERE newer.key = kv.key AND newer.rev > kv.rev
+		        )
+		      LIMIT @batch`,
+		Params: map[string]interface{}{
+			"target": targetTS,
+			"batch":  int64(compactBatchSize),
+		},
 	}
 
 	iter := s.client.Single().Query(ctx, stmt)
@@ -590,34 +801,17 @@ func (s *Store) compactRows(ctx context.Context, targetRev int64) {
 	for {
 		row, err := iter.Next()
 		if errors.Is(err, iterator.Done) {
-			break
+			return ids, nil
 		}
 		if err != nil {
-			s.log.Warn("compact rows scan failed", zap.Error(err))
-			return
+			return nil, err
 		}
 		var id int64
 		if err := row.Column(0, &id); err != nil {
-			continue
+			return nil, fmt.Errorf("decode compact row id: %w", err)
 		}
 		ids = append(ids, spanner.Key{id})
 	}
-
-	if len(ids) == 0 {
-		return
-	}
-
-	var mutations []*spanner.Mutation
-	for _, id := range ids {
-		mutations = append(mutations, spanner.Delete("kv", id))
-	}
-
-	_, err := s.client.Apply(ctx, mutations)
-	if err != nil {
-		s.log.Warn("compact rows delete failed", zap.Int("count", len(ids)), zap.Error(err))
-		return
-	}
-	s.log.Info("compacted old revisions", zap.Int("deleted", len(ids)), zap.Int64("target_rev", targetRev))
 }
 
 // scanKV reads a Spanner row into a KV struct.
