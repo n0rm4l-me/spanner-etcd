@@ -268,6 +268,11 @@ func (k *KVServer) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdse
 
 	succeeded, results, commitRev, err := k.store.AtomicTxn(ctx, compares, successOps, failureOps)
 	if err != nil {
+		// Pass through gRPC status errors unchanged (e.g. InvalidArgument, Unimplemented).
+		// Only map store domain errors via toGRPCErr.
+		if _, ok := status.FromError(err); ok {
+			return nil, err
+		}
 		return nil, toGRPCErr(err)
 	}
 

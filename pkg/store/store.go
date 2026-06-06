@@ -753,10 +753,15 @@ func (s *Store) AtomicTxn(
 			s.watcher.notify(commitRev)
 		}
 	} else {
-		// No mutations — return current revision without creating a phantom entry.
-		commitRev, err = s.CurrentRevision(ctx)
-		if err != nil {
-			return false, nil, 0, err
+		// No mutations — return the revision observed inside the transaction
+		// snapshot so callers get a consistent read revision, not a later one.
+		commitRev = tsToRev(resp.CommitTs)
+		if commitRev <= 1 {
+			// Fallback: empty store or no prior writes.
+			commitRev, err = s.CurrentRevision(ctx)
+			if err != nil {
+				return false, nil, 0, err
+			}
 		}
 	}
 	return succeeded, results, commitRev, nil
