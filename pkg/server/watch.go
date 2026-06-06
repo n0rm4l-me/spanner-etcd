@@ -150,14 +150,14 @@ func (w *WatchServer) watchLoop(
 			return
 		case events := <-eventCh:
 			// closedSentinel (empty non-nil slice) signals the subscription was
-			// dropped (e.g. channel overflow). Notify the client before returning.
+			// torn down by the store layer (channel overflow, compaction, or
+			// other internal error). Notify the client to reconnect.
 			if len(events) == 0 {
 				select {
 				case respCh <- &etcdserverpb.WatchResponse{
-					Header:       header(0),
-					WatchId:      watchID,
-					Canceled:     true,
-					CancelReason: "subscriber channel overflow — reconnect required",
+					Header:   header(0),
+					WatchId:  watchID,
+					Canceled: true,
 				}:
 				case <-stdCtx.Done():
 				}

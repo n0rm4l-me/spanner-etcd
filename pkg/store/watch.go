@@ -130,14 +130,22 @@ func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) 
 	go func() {
 		defer func() {
 			w.removeSub(sub)
-			// Mark closed and send the sentinel so watchLoop can emit
-			// a Canceled WatchResponse before returning. Use a non-blocking
-			// send — if watchLoop already exited and sub.ch is full, drop
-			// the sentinel (watchLoop is gone, nobody needs the signal).
+			// Mark closed, then drain buffered events until the sentinel fits.
+			// The sentinel MUST be delivered so watchLoop can emit Canceled=true.
+			// After closed=true, dispatchEvents will skip this subscriber, so
+			// no new items will arrive — draining is safe and terminates quickly.
 			sub.closed.Store(true)
-			select {
-			case sub.ch <- closedSentinel:
-			default:
+			for {
+				select {
+				case sub.ch <- closedSentinel:
+					return
+				default:
+					// Discard one buffered batch to make room.
+					select {
+					case <-sub.ch:
+					default:
+					}
+				}
 			}
 		}()
 

@@ -32,6 +32,12 @@ Standard etcd is a single-region, single-cluster system. At Google scale, the GK
 # Start Spanner emulator
 docker run -d -p 9010:9010 -p 9020:9020 gcr.io/cloud-spanner-emulator/emulator
 
+# Create instance and database
+curl -s -X POST http://localhost:9020/v1/projects/my-project/instances \
+  -d '{"instanceId":"my-instance","instance":{"config":"emulator-config","displayName":"dev","nodeCount":1}}'
+curl -s -X POST http://localhost:9020/v1/projects/my-project/instances/my-instance/databases \
+  -d '{"createStatement":"CREATE DATABASE `my-db`"}'
+
 # Run spanner-etcd
 SPANNER_EMULATOR_HOST=localhost:9010 spanner-etcd \
   --spanner-database=projects/my-project/instances/my-instance/databases/my-db

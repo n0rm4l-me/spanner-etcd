@@ -107,21 +107,29 @@ func (lm *LeaseManager) Get(id int64) *Lease {
 	return lm.leases[id]
 }
 
-// GetTTL returns the lease, its original grant TTL, and the remaining TTL in seconds.
-// All fields are read under the mutex to avoid a data race with Keepalive.
-// Returns (nil, 0, 0) if the lease is not found.
-func (lm *LeaseManager) GetTTL(id int64) (*Lease, int64, int64) {
+// LeaseSnapshot is an immutable point-in-time copy of a Lease's fields.
+// Safe to read without holding lm.mu.
+type LeaseSnapshot struct {
+	ID         int64
+	TTL        int64 // original grant TTL
+	Remaining  int64 // seconds until expiry (0 if already expired)
+}
+
+// GetTTL returns a snapshot of the lease and its remaining TTL.
+// All fields are read under the mutex — no pointer to the live Lease is exposed.
+// Returns (zero, false) if the lease is not found.
+func (lm *LeaseManager) GetTTL(id int64) (LeaseSnapshot, bool) {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 	lease, ok := lm.leases[id]
 	if !ok {
-		return nil, 0, 0
+		return LeaseSnapshot{}, false
 	}
 	remaining := int64(time.Until(lease.ExpiresAt).Seconds())
 	if remaining < 0 {
 		remaining = 0
 	}
-	return lease, lease.TTL, remaining
+	return LeaseSnapshot{ID: lease.ID, TTL: lease.TTL, Remaining: remaining}, true
 }
 
 // Keepalive resets the expiry time for the lease.

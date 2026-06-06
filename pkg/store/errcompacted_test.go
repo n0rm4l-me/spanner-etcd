@@ -118,16 +118,17 @@ func TestAfter_ErrCompacted(t *testing.T) {
 	}
 }
 
-// waitCompacted polls until Get at the given revision returns nil (compacted).
+// waitCompacted polls until Get at the given revision returns ErrCompacted,
+// indicating that physical deletion has advanced past that revision.
 func waitCompacted(t *testing.T, s *store.Store, ctx context.Context, key string, rev int64) {
 	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		time.Sleep(300 * time.Millisecond)
-		_, kv, _ := s.Get(ctx, key, rev)
-		if kv == nil {
+		_, _, err := s.Get(ctx, key, rev)
+		if err == store.ErrCompacted {
 			return
 		}
 	}
-	t.Fatalf("key %q still readable at rev=%d after compaction deadline", key, rev)
+	t.Fatalf("Get(%q, rev=%d) did not return ErrCompacted within deadline", key, rev)
 }

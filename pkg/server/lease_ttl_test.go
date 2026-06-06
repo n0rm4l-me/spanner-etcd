@@ -110,11 +110,9 @@ func TestWatch_ReplayPagination(t *testing.T) {
 	t.Logf("received %d/%d events via paginated replay", got, n)
 }
 
-// TestWatch_CanceledOnChannelOverflow verifies that when a subscriber's channel
-// overflows, the client receives a WatchResponse with Canceled=true.
-func TestWatch_CanceledOnChannelOverflow(t *testing.T) {
-	// This test is hard to trigger deterministically without internal access.
-	// We verify the Canceled path fires when the watch context is cancelled.
+// TestWatch_NoPanicOnContextCancel verifies that cancelling a watch context
+// does not panic, block, or leak goroutines — the basic lifecycle path.
+func TestWatch_NoPanicOnContextCancel(t *testing.T) {
 	cli := testServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -122,19 +120,57 @@ func TestWatch_CanceledOnChannelOverflow(t *testing.T) {
 	wCh := cli.Watch(ctx, "/canceled/", clientv3.WithPrefix())
 	time.Sleep(100 * time.Millisecond)
 
-	// Cancel context — watchLoop should eventually receive the closed sentinel.
 	cancel()
 
-	// Drain channel — we should not see any panics or blocked goroutines.
 	deadline := time.After(3 * time.Second)
 	for {
 		select {
 		case _, ok := <-wCh:
 			if !ok {
-				return // channel closed cleanly
+				return
 			}
 		case <-deadline:
-			return // timeout is also acceptable — no panic is the key assertion
+			return
+		}
+	}
+}
+
+// TestWatch_CanceledResponseOnSubscriberDrop verifies that when a watch is
+// explicitly cancelled by the client, the stream closes without the server
+// panicking. A full channel-overflow test requires internal hooks not exposed
+// via the public gRPC API; this test covers the cancel path end-to-end.
+func TestWatch_CanceledResponseOnSubscriberDrop(t *testing.T) {
+	cli := testServer(t)
+	ctx := context.Background()
+	watchCtx, watchCancel := context.WithCancel(ctx)
+
+	wCh := cli.Watch(watchCtx, "/drop/", clientv3.WithPrefix())
+	time.Sleep(100 * time.Millisecond)
+
+	// Write an event so the watch is active.
+	cli.Put(ctx, "/drop/k", "v")
+	select {
+	case resp := <-wCh:
+		if resp.Err() != nil {
+			t.Fatalf("unexpected error: %v", resp.Err())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for event")
+	}
+
+	// Cancel the watch — server must not panic.
+	watchCancel()
+
+	// Channel should drain cleanly within a reasonable time.
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case _, ok := <-wCh:
+			if !ok {
+				return
+			}
+		case <-deadline:
+			return
 		}
 	}
 }

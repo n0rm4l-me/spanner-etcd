@@ -75,14 +75,14 @@ func (l *LeaseServer) LeaseKeepAlive(stream etcdserverpb.Lease_LeaseKeepAliveSer
 
 // LeaseTimeToLive returns TTL info for a lease.
 func (l *LeaseServer) LeaseTimeToLive(ctx context.Context, r *etcdserverpb.LeaseTimeToLiveRequest) (*etcdserverpb.LeaseTimeToLiveResponse, error) {
-	lease, ttl, remaining := l.leases.GetTTL(r.ID)
-	if lease == nil {
+	snap, ok := l.leases.GetTTL(r.ID)
+	if !ok {
 		return nil, status.Errorf(codes.NotFound, "lease not found: %d", r.ID)
 	}
 	return &etcdserverpb.LeaseTimeToLiveResponse{
 		Header:     header(0),
-		ID:         lease.ID,
-		TTL:        remaining,
-		GrantedTTL: ttl,
+		ID:         snap.ID,
+		TTL:        snap.Remaining,
+		GrantedTTL: snap.TTL,
 	}, nil
 }
