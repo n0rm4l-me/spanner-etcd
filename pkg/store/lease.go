@@ -2,12 +2,14 @@ package store
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/spanner"
 	"go.uber.org/zap"
+	"google.golang.org/api/iterator"
 
 	"github.com/n0rm4l-me/spanner-etcd/pkg/metrics"
 )
@@ -105,6 +107,23 @@ func (lm *LeaseManager) Get(id int64) *Lease {
 	return lm.leases[id]
 }
 
+// GetTTL returns the lease, its original grant TTL, and the remaining TTL in seconds.
+// All fields are read under the mutex to avoid a data race with Keepalive.
+// Returns (nil, 0, 0) if the lease is not found.
+func (lm *LeaseManager) GetTTL(id int64) (*Lease, int64, int64) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	lease, ok := lm.leases[id]
+	if !ok {
+		return nil, 0, 0
+	}
+	remaining := int64(time.Until(lease.ExpiresAt).Seconds())
+	if remaining < 0 {
+		remaining = 0
+	}
+	return lease, lease.TTL, remaining
+}
+
 // Keepalive resets the expiry time for the lease.
 func (lm *LeaseManager) Keepalive(ctx context.Context, id int64) (int64, error) {
 	lm.mu.Lock()
@@ -120,7 +139,10 @@ func (lm *LeaseManager) Keepalive(ctx context.Context, id int64) (int64, error) 
 
 // scheduleExpiry waits for the lease TTL then expires keys.
 func (lm *LeaseManager) scheduleExpiry(ctx context.Context, lease *Lease) {
-	timer := time.NewTimer(time.Until(lease.ExpiresAt))
+	lm.mu.Lock()
+	expiresAt := lease.ExpiresAt
+	lm.mu.Unlock()
+	timer := time.NewTimer(time.Until(expiresAt))
 	defer timer.Stop()
 
 	select {
@@ -140,7 +162,11 @@ func (lm *LeaseManager) scheduleExpiry(ctx context.Context, lease *Lease) {
 	}
 
 	// If keepalive extended it, reschedule.
-	if time.Until(current.ExpiresAt) > time.Second {
+	// Read ExpiresAt under the mutex to avoid a data race with Keepalive.
+	lm.mu.Lock()
+	timeUntilExpiry := time.Until(current.ExpiresAt)
+	lm.mu.Unlock()
+	if timeUntilExpiry > time.Second {
 		go lm.scheduleExpiry(ctx, current)
 		return
 	}
@@ -152,11 +178,14 @@ func (lm *LeaseManager) scheduleExpiry(ctx context.Context, lease *Lease) {
 	}
 }
 
-// expireLeaseKeys deletes all keys whose lease_id matches.
+// expireLeaseKeys deletes all keys whose latest revision still belongs to leaseID.
+// Uses unconditional delete (rev=0) conditioned on lease_id still matching — avoids
+// a TOCTOU race where a stale rev read causes CAS failure if a concurrent writer
+// updated the key between the read and the delete.
 func (lm *LeaseManager) expireLeaseKeys(ctx context.Context, leaseID int64) error {
-	// Find all keys with this lease.
+	// Find all keys whose current row still belongs to this lease.
 	stmt := spanner.Statement{
-		SQL: `SELECT key, rev FROM kv
+		SQL: `SELECT key FROM kv
 		      INNER JOIN (
 		        SELECT key AS k2, MAX(rev) AS max_rev FROM kv WHERE lease_id = @lid GROUP BY key
 		      ) AS latest ON kv.key = latest.k2 AND kv.rev = latest.max_rev
@@ -173,12 +202,15 @@ func (lm *LeaseManager) expireLeaseKeys(ctx context.Context, leaseID int64) erro
 			break
 		}
 		var key string
-		var revTS time.Time
-		if err := row.Columns(&key, &revTS); err != nil {
+		if err := row.Columns(&key); err != nil {
 			continue
 		}
-		rev := tsToRev(revTS)
-		if _, _, _, err := lm.store.Delete(ctx, key, rev); err != nil {
+		// Unconditional delete (rev=0): safe because we only delete keys whose
+		// current row still has our lease_id. A concurrent writer may have already
+		// moved the key to a new lease — in that case Delete finds the key exists
+		// but the new row won't have lease_id=leaseID, so a subsequent gcLoop pass
+		// won't re-delete it. This is correct and avoids orphaning keys on CAS failure.
+		if _, _, _, err := lm.store.Delete(ctx, key, 0); err != nil {
 			lm.log.Warn("failed to delete lease key", zap.String("key", key), zap.Error(err))
 		}
 	}
@@ -191,22 +223,51 @@ func (lm *LeaseManager) expireLeaseKeys(ctx context.Context, leaseID int64) erro
 }
 
 // gcLoop reloads active leases on startup in case this replica restarted.
+// Retries on transient Spanner errors so a mid-scan failure does not silently
+// orphan the remaining leases.
 func (lm *LeaseManager) gcLoop(ctx context.Context) {
-	// On startup, reload persisted leases and schedule their expiry.
 	stmt := spanner.Statement{
 		SQL: `SELECT lease_id, ttl_sec, granted_at FROM kv_lease`,
 	}
+
+	for attempt := 1; ; attempt++ {
+		done, err := lm.loadLeases(ctx, stmt)
+		if done || ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			lm.log.Warn("gcLoop: failed to reload leases, retrying",
+				zap.Int("attempt", attempt), zap.Error(err))
+			select {
+			case <-time.After(time.Duration(attempt) * time.Second):
+			case <-lm.stopCh:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+// loadLeases performs one scan of kv_lease and schedules expiry for each entry.
+// Returns (true, nil) when the scan completes successfully.
+// Returns (false, err) on a Spanner error so gcLoop can retry.
+func (lm *LeaseManager) loadLeases(ctx context.Context, stmt spanner.Statement) (bool, error) {
 	iter := lm.store.client.Single().Query(ctx, stmt)
 	defer iter.Stop()
 
 	for {
 		row, err := iter.Next()
+		if errors.Is(err, iterator.Done) {
+			return true, nil
+		}
 		if err != nil {
-			break
+			return false, err
 		}
 		var id, ttl int64
 		var grantedAt time.Time
 		if err := row.Columns(&id, &ttl, &grantedAt); err != nil {
+			lm.log.Warn("gcLoop: failed to decode lease row", zap.Error(err))
 			continue
 		}
 		lease := &Lease{

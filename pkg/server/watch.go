@@ -148,8 +148,19 @@ func (w *WatchServer) watchLoop(
 		select {
 		case <-stdCtx.Done():
 			return
-		case events, ok := <-eventCh:
-			if !ok {
+		case events := <-eventCh:
+			// closedSentinel (empty non-nil slice) signals the subscription was
+			// dropped (e.g. channel overflow). Notify the client before returning.
+			if len(events) == 0 {
+				select {
+				case respCh <- &etcdserverpb.WatchResponse{
+					Header:       header(0),
+					WatchId:      watchID,
+					Canceled:     true,
+					CancelReason: "subscriber channel overflow — reconnect required",
+				}:
+				case <-stdCtx.Done():
+				}
 				return
 			}
 			var pbEvents []*mvccpb.Event
@@ -161,16 +172,24 @@ func (w *WatchServer) watchLoop(
 					maxRev = ev.KV.Rev
 				}
 			}
-			respCh <- &etcdserverpb.WatchResponse{
+			select {
+			case respCh <- &etcdserverpb.WatchResponse{
 				Header:  header(maxRev),
 				WatchId: watchID,
 				Events:  pbEvents,
+			}:
+			case <-stdCtx.Done():
+				return
 			}
 		case <-progressTicker.C:
 			curRev, _ := w.store.CurrentRevision(stdCtx)
-			respCh <- &etcdserverpb.WatchResponse{
+			select {
+			case respCh <- &etcdserverpb.WatchResponse{
 				Header:  header(curRev),
 				WatchId: watchID,
+			}:
+			case <-stdCtx.Done():
+				return
 			}
 		}
 	}

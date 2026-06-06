@@ -190,6 +190,11 @@ func (s *Store) Get(ctx context.Context, key string, revision int64) (currentRev
 	if err != nil {
 		return 0, nil, err
 	}
+	if revision > 0 {
+		if compactRev, cerr := s.compactRevision(ctx); cerr == nil && revision < compactRev {
+			return currentRev, nil, ErrCompacted
+		}
+	}
 
 	capTS := revToTS(revCap(revision, currentRev))
 	stmt := spanner.Statement{
@@ -259,6 +264,9 @@ func (s *Store) List(ctx context.Context, prefix, startKey string, limit, revisi
 	if err != nil {
 		return 0, 0, nil, err
 	}
+	if revision > 0 && revision < compactRev {
+		return currentRev, compactRev, nil, ErrCompacted
+	}
 
 	iter := s.client.Single().Query(ctx, stmt)
 	defer iter.Stop()
@@ -287,6 +295,11 @@ func (s *Store) Count(ctx context.Context, prefix, startKey string, revision int
 	if err != nil {
 		return 0, 0, err
 	}
+	if revision > 0 {
+		if compactRev, cerr := s.compactRevision(ctx); cerr == nil && revision < compactRev {
+			return currentRev, 0, ErrCompacted
+		}
+	}
 	capTS := revToTS(revCap(revision, currentRev))
 
 	stmt := spanner.Statement{
@@ -306,7 +319,9 @@ func (s *Store) Count(ctx context.Context, prefix, startKey string, revision int
 		},
 	}
 
-	row, err := s.client.Single().Query(ctx, stmt).Next()
+	iter := s.client.Single().Query(ctx, stmt)
+	defer iter.Stop()
+	row, err := iter.Next()
 	if err != nil {
 		return 0, 0, fmt.Errorf("count %s: %w", prefix, err)
 	}
@@ -476,6 +491,13 @@ func (s *Store) After(ctx context.Context, prefix string, afterRev, limit int64)
 	currentRev, err := s.CurrentRevision(ctx)
 	if err != nil {
 		return 0, nil, err
+	}
+	// afterRev=0 means "from beginning" — used by the poll loop, not for client replay.
+	// Only check compaction for explicit client-supplied revisions.
+	if afterRev > 0 {
+		if compactRev, cerr := s.compactRevision(ctx); cerr == nil && afterRev < compactRev {
+			return currentRev, nil, ErrCompacted
+		}
 	}
 
 	afterTS := revToTS(afterRev)

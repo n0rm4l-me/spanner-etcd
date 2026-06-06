@@ -38,6 +38,11 @@ import (
 	"github.com/n0rm4l-me/spanner-etcd/pkg/metrics"
 )
 
+// closedSentinel is sent on sub.ch when the subscription is being torn down.
+// It signals watchLoop to emit a Canceled WatchResponse before returning.
+// Using a sentinel avoids sending to a closed channel (which panics).
+var closedSentinel = []*Event{}
+
 const (
 	pollInterval      = time.Second
 	pollSlowInterval  = 30 * time.Second // heartbeat poll when CS is healthy
@@ -51,6 +56,7 @@ type subscriber struct {
 	prefix string
 	ch     chan []*Event
 	cancel context.CancelFunc
+	closed atomic.Bool // guards against sending to ch after closedSentinel
 }
 
 // Watcher orchestrates event delivery to Watch subscribers.
@@ -124,7 +130,15 @@ func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) 
 	go func() {
 		defer func() {
 			w.removeSub(sub)
-			close(sub.ch)
+			// Mark closed and send the sentinel so watchLoop can emit
+			// a Canceled WatchResponse before returning. Use a non-blocking
+			// send — if watchLoop already exited and sub.ch is full, drop
+			// the sentinel (watchLoop is gone, nobody needs the signal).
+			sub.closed.Store(true)
+			select {
+			case sub.ch <- closedSentinel:
+			default:
+			}
 		}()
 
 		// afterRev=0 means "live watch from now" — no replay needed.
@@ -134,16 +148,37 @@ func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) 
 			<-subCtx.Done()
 			return
 		}
-		_, events, err := w.store.After(w.store.bgCtx, prefix, afterRev-1, pollBatchSize)
-		if err != nil {
-			w.log.Warn("watch replay error", zap.String("prefix", prefix), zap.Error(err))
+
+		// Check compaction before starting replay. afterRev-1 can be 0 when
+		// afterRev=1 (epoch), which bypasses the afterRev>0 guard in After().
+		// Explicitly check the compaction horizon here to avoid silent empty replay.
+		if compactRev, cerr := w.store.compactRevision(w.store.bgCtx); cerr == nil && compactRev > 1 && afterRev < compactRev {
+			w.log.Warn("watch replay: startRevision already compacted",
+				zap.Int64("start_rev", afterRev), zap.Int64("compact_rev", compactRev))
 			return
 		}
-		if len(events) > 0 {
-			select {
-			case sub.ch <- events:
-			case <-subCtx.Done():
+
+		// Paginate replay until we have delivered all historical events.
+		// A single batch is limited to pollBatchSize — loop until a partial
+		// batch signals there are no more pages.
+		replayRev := afterRev - 1
+		for {
+			_, events, err := w.store.After(w.store.bgCtx, prefix, replayRev, pollBatchSize)
+			if err != nil {
+				w.log.Warn("watch replay error", zap.String("prefix", prefix), zap.Error(err))
 				return
+			}
+			if len(events) > 0 {
+				select {
+				case sub.ch <- events:
+				case <-subCtx.Done():
+					return
+				}
+				replayRev = events[len(events)-1].KV.Rev
+			}
+			// Fewer than a full batch means we have caught up.
+			if int64(len(events)) < pollBatchSize {
+				break
 			}
 		}
 		<-subCtx.Done()
@@ -195,10 +230,16 @@ func (w *Watcher) dispatchEvents(events []*Event) {
 		if len(matching) == 0 {
 			continue
 		}
+		// Skip already-closed subscribers (closed.Store happens before sentinel send).
+		if sub.closed.Load() {
+			continue
+		}
 		select {
 		case sub.ch <- matching:
 		default:
-			// Channel full — drop subscription (etcd semantics: client reconnects).
+			// Channel full — cancel subscription (etcd semantics: client must reconnect).
+			// Do NOT close sub.ch here — the subscriber goroutine is the sole closer
+			// and will send closedSentinel when it exits, preventing a closed-channel panic.
 			w.log.Warn("subscriber channel full, closing watch",
 				zap.String("prefix", sub.prefix))
 			metrics.WatchSubscriberDropsTotal.Inc()
@@ -243,6 +284,15 @@ func (w *Watcher) pollLoop(ctx context.Context) {
 func (w *Watcher) doPoll(ctx context.Context, lastRev int64) int64 {
 	curRev, events, err := w.store.After(ctx, "", lastRev, pollBatchSize)
 	if err != nil {
+		// ErrCompacted means lastRev was compacted away — advance to current
+		// revision so the poll loop doesn't spin forever on the same stale revision.
+		if err == ErrCompacted {
+			if cur, cerr := w.store.CurrentRevision(ctx); cerr == nil {
+				w.log.Warn("poll: revision compacted, advancing to current",
+					zap.Int64("old_rev", lastRev), zap.Int64("new_rev", cur))
+				return cur
+			}
+		}
 		w.log.Warn("poll error", zap.Error(err))
 		return lastRev
 	}

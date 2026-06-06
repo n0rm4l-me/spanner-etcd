@@ -37,6 +37,7 @@ type AuthServer struct {
 	enabled bool
 	ttl     time.Duration
 	log     *zap.Logger
+	stopCh  chan struct{}
 }
 
 type tokenInfo struct {
@@ -54,6 +55,7 @@ func newAuthServer(users map[string]string, ttl time.Duration, log *zap.Logger) 
 		enabled: len(users) > 0,
 		ttl:     ttl,
 		log:     log,
+		stopCh:  make(chan struct{}),
 	}
 	// Background GC: remove expired tokens every TTL period.
 	// Without this, tokens accumulate on every client reconnect/redeploy.
@@ -62,21 +64,32 @@ func newAuthServer(users map[string]string, ttl time.Duration, log *zap.Logger) 
 }
 
 func (a *AuthServer) gcLoop() {
-	for range time.Tick(a.ttl) {
-		now := time.Now()
-		a.mu.Lock()
-		before := len(a.tokens)
-		for tok, info := range a.tokens {
-			if now.After(info.expiresAt) {
-				delete(a.tokens, tok)
+	ticker := time.NewTicker(a.ttl)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-a.stopCh:
+			return
+		case <-ticker.C:
+			now := time.Now()
+			a.mu.Lock()
+			before := len(a.tokens)
+			for tok, info := range a.tokens {
+				if now.After(info.expiresAt) {
+					delete(a.tokens, tok)
+				}
+			}
+			after := len(a.tokens)
+			a.mu.Unlock()
+			if before != after {
+				a.log.Debug("auth token GC", zap.Int("removed", before-after), zap.Int("remaining", after))
 			}
 		}
-		after := len(a.tokens)
-		a.mu.Unlock()
-		if before != after {
-			a.log.Debug("auth token GC", zap.Int("removed", before-after), zap.Int("remaining", after))
-		}
 	}
+}
+
+func (a *AuthServer) close() {
+	close(a.stopCh)
 }
 
 // Authenticate validates credentials and returns a token.

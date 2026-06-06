@@ -50,6 +50,7 @@ type Config struct {
 type Server struct {
 	grpc     *grpc.Server
 	store    *store.Store
+	auth     *AuthServer
 	config   Config
 	log      *zap.Logger
 	listener net.Listener // set during Serve, used by Addr()
@@ -122,7 +123,7 @@ func New(ctx context.Context, s *store.Store, cfg Config, log *zap.Logger) (*Ser
 	// Reflection for grpcurl / debugging.
 	reflection.Register(grpcServer)
 
-	return &Server{grpc: grpcServer, store: s, config: cfg, log: log}, nil
+	return &Server{grpc: grpcServer, store: s, auth: auth, config: cfg, log: log}, nil
 }
 
 // buildServerCreds builds gRPC server TLS credentials.
@@ -168,6 +169,8 @@ func (s *Server) Serve(ctx context.Context) error {
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- s.grpc.Serve(lis) }()
+
+	defer s.auth.close()
 
 	select {
 	case <-ctx.Done():
