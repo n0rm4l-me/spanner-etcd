@@ -609,9 +609,8 @@ const (
 
 // TxnResult is the result of a single TxnOp.
 type TxnResult struct {
-	KV  *KV
-	Rev int64
-	Ok  bool
+	KV *KV
+	Ok bool
 }
 
 // AtomicTxn executes compare+ops in a single Spanner ReadWriteTransaction.
@@ -642,17 +641,23 @@ func (s *Store) AtomicTxn(
 			commitRev = 0
 			snapshotRev = 0
 
-			// Capture the revision visible at the start of this transaction snapshot.
-			// Used as the response revision when no mutations are buffered, so clients
-			// get a consistent revision for subsequent Watch calls.
-			iter := txn.Query(ctx, spanner.Statement{SQL: `SELECT MAX(rev) FROM kv`})
-			if row, err := iter.Next(); err == nil {
+			// Capture the revision visible at this transaction's snapshot.
+			// Used as the response revision when no mutations are buffered.
+			snapIter := txn.Query(ctx, spanner.Statement{SQL: `SELECT MAX(rev) FROM kv`})
+			snapRow, snapErr := snapIter.Next()
+			snapIter.Stop()
+			if snapErr != nil && !errors.Is(snapErr, iterator.Done) {
+				return fmt.Errorf("snapshot revision query: %w", snapErr)
+			}
+			if snapErr == nil {
 				var ts spanner.NullTime
-				if err := row.Column(0, &ts); err == nil && ts.Valid {
+				if err := snapRow.Column(0, &ts); err != nil {
+					return fmt.Errorf("snapshot revision decode: %w", err)
+				}
+				if ts.Valid {
 					snapshotRev = tsToRev(ts.Time)
 				}
 			}
-			iter.Stop()
 
 			// Evaluate all compare conditions inside the transaction.
 			for _, c := range compares {
@@ -669,6 +674,19 @@ func (s *Store) AtomicTxn(
 			ops := successOps
 			if !succeeded {
 				ops = failureOps
+			}
+
+			// Reject duplicate keys in the same Txn branch — multiple mutations to
+			// the same key share the same PCT timestamp, making the final state
+			// nondeterministic (ORDER BY rev DESC LIMIT 1 can return any of them).
+			mutatedKeys := make(map[string]struct{}, len(ops))
+			for _, op := range ops {
+				if op.Type == TxnOpPut || op.Type == TxnOpDelete {
+					if _, dup := mutatedKeys[op.Key]; dup {
+						return fmt.Errorf("duplicate mutation for key %q in single Txn branch", op.Key)
+					}
+					mutatedKeys[op.Key] = struct{}{}
+				}
 			}
 
 			// Execute ops and buffer mutations.
