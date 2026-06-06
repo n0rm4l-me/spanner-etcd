@@ -754,7 +754,10 @@ func (s *Store) AtomicTxn(
 		}
 	} else {
 		// No mutations — return current revision without creating a phantom entry.
-		commitRev, _ = s.CurrentRevision(ctx)
+		commitRev, err = s.CurrentRevision(ctx)
+		if err != nil {
+			return false, nil, 0, err
+		}
 	}
 	return succeeded, results, commitRev, nil
 }

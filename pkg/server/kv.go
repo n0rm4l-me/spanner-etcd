@@ -273,7 +273,11 @@ func (k *KVServer) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdse
 
 	// Ensure commitRev is set before building response headers.
 	if commitRev == 0 {
-		commitRev, _ = k.store.CurrentRevision(ctx)
+		var cerr error
+		commitRev, cerr = k.store.CurrentRevision(ctx)
+		if cerr != nil {
+			return nil, toGRPCErr(cerr)
+		}
 	}
 
 	// Build gRPC responses from TxnResults.
