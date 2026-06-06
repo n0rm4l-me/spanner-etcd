@@ -432,6 +432,40 @@ func (s *Store) Update(ctx context.Context, key string, value []byte, revision, 
 	return rev, prev, true, nil
 }
 
+// DeleteIfLease removes key only if its current row's lease_id matches leaseID.
+// This closes the TOCTOU window in expireLeaseKeys: the lease_id check and the
+// tombstone write are atomic inside a single Spanner ReadWriteTransaction.
+func (s *Store) DeleteIfLease(ctx context.Context, key string, leaseID int64) (bool, error) {
+	_, err := s.client.ReadWriteTransactionWithOptions(ctx,
+		func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			prev, err := s.getLatestTxn(ctx, txn, key)
+			if err != nil {
+				return err
+			}
+			if prev == nil || prev.LeaseID != leaseID {
+				// Key gone or reassigned to a different lease — nothing to do.
+				return nil
+			}
+			return txn.BufferWrite([]*spanner.Mutation{
+				spanner.Insert("kv",
+					[]string{"rev", "key", "value", "old_value", "lease_id",
+						"deleted", "created", "create_revision", "prev_revision"},
+					[]interface{}{
+						spanner.CommitTimestamp,
+						key, []byte(nil), prev.Value, int64(0),
+						true, false,
+						revToTS(prev.CreateRevision),
+						revToTS(prev.Rev),
+					},
+				),
+			})
+		}, spanner.TransactionOptions{})
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Delete removes key at the given revision (CAS). revision=0 = unconditional.
 func (s *Store) Delete(ctx context.Context, key string, revision int64) (int64, *KV, bool, error) {
 	var commitTS time.Time

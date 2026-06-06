@@ -118,12 +118,12 @@ func TestAfter_ErrCompacted(t *testing.T) {
 	}
 }
 
-// waitCompacted verifies that Get at the given revision immediately returns
-// ErrCompacted — compaction is recorded synchronously so no polling is needed.
+// waitCompacted polls until Get at the given revision returns ErrCompacted.
+// Compact() records the compact revision synchronously but the kv_rev write
+// may take a short time to be visible to subsequent Single() reads. Polling
+// with a short sleep avoids a flaky test on slow CI machines.
 func waitCompacted(t *testing.T, s *store.Store, ctx context.Context, key string, rev int64) {
 	t.Helper()
-	// Give the async compaction goroutine a moment to record the compact revision.
-	// The ErrCompacted guard is based on kv_rev, not physical row deletion.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		_, _, err := s.Get(ctx, key, rev)

@@ -222,12 +222,10 @@ func (lm *LeaseManager) expireLeaseKeys(ctx context.Context, leaseID int64) erro
 			lm.log.Warn("failed to decode lease key row", zap.Error(err))
 			continue
 		}
-		// Unconditional delete (rev=0): safe because we only delete keys whose
-		// current row still has our lease_id. A concurrent writer may have already
-		// moved the key to a new lease — in that case Delete finds the key exists
-		// but the new row won't have lease_id=leaseID, so a subsequent gcLoop pass
-		// won't re-delete it. This is correct and avoids orphaning keys on CAS failure.
-		if _, _, _, err := lm.store.Delete(ctx, key, 0); err != nil {
+		// Atomic lease_id-conditioned delete: only writes the tombstone if the
+		// key's current row still belongs to leaseID. This closes the TOCTOU
+		// window — the check and the delete are a single Spanner RW transaction.
+		if _, err := lm.store.DeleteIfLease(ctx, key, leaseID); err != nil {
 			lm.log.Warn("failed to delete lease key", zap.String("key", key), zap.Error(err))
 		}
 	}
