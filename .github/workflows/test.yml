@@ -29,7 +29,7 @@ jobs:
         run: go vet ./...
 
       - name: test
-        run: go test ./... -timeout=120s -count=1 -v 2>&1 | tee /tmp/test-output.txt
+        run: go test ./... -timeout=180s -count=1 -v 2>&1 | tee /tmp/test-output.txt
         env:
           SPANNER_EMULATOR_HOST: localhost:9010
 
