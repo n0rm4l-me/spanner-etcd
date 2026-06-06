@@ -128,7 +128,6 @@ func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) 
 	metrics.ActiveWatches.Inc()
 
 	// Replay existing events from afterRev before switching to the live feed.
-	// Use bgCtx so the query isn't cancelled when the gRPC request context ends.
 	go func() {
 		defer func() {
 			// Mark closed BEFORE removeSub so dispatchEvents stops enqueueing
@@ -166,7 +165,7 @@ func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) 
 		// Check compaction before starting replay. afterRev-1 can be 0 when
 		// afterRev=1 (epoch), which bypasses the afterRev>0 guard in After().
 		// Explicitly check the compaction horizon here to avoid silent empty replay.
-		if compactRev, cerr := w.store.compactRevision(w.store.bgCtx); cerr != nil {
+		if compactRev, cerr := w.store.compactRevision(subCtx); cerr != nil {
 			w.log.Warn("watch replay: failed to read compact revision, cancelling watch",
 				zap.String("prefix", prefix), zap.Error(cerr))
 			return
@@ -181,7 +180,7 @@ func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) 
 		// batch signals there are no more pages.
 		replayRev := afterRev - 1
 		for {
-			_, events, err := w.store.After(w.store.bgCtx, prefix, replayRev, pollBatchSize)
+			_, events, err := w.store.After(subCtx, prefix, replayRev, pollBatchSize)
 			if err != nil {
 				w.log.Warn("watch replay error", zap.String("prefix", prefix), zap.Error(err))
 				return
