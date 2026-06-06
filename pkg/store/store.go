@@ -105,12 +105,14 @@ func New(ctx context.Context, client *spanner.Client, log *zap.Logger) (*Store, 
 // NewWithConfig creates a Store with explicit tuning parameters.
 // Pass AutoCompactInterval = -1 to disable background auto-compaction.
 func NewWithConfig(ctx context.Context, client *spanner.Client, log *zap.Logger, cfg StoreConfig) (*Store, error) {
-	// Validate: negative age or interval (other than the -1 disabled sentinel) are
-	// programming errors — a negative age would compact future revisions.
+	// Negative age would compact future revisions — reject it.
 	if cfg.AutoCompactAge < 0 {
 		return nil, fmt.Errorf("AutoCompactAge must be >= 0, got %v", cfg.AutoCompactAge)
 	}
-	// Treat any negative interval as "disabled" (the -1 sentinel).
+	// Any negative interval (including -1) disables auto-compaction.
+	// This avoids surprising startup failures for callers using unit-suffixed
+	// negative values (e.g. -1*time.Second) and matches the CLI convention
+	// where --auto-compact-interval=0 is also treated as disabled.
 	if cfg.AutoCompactInterval < 0 {
 		cfg.AutoCompactInterval = -1
 	}
@@ -672,6 +674,12 @@ func (s *Store) autoCompactLoop(ctx context.Context) {
 			targetRev := tsToRev(revToTS(curRev).Add(-s.cfg.AutoCompactAge))
 			if targetRev <= 1 {
 				continue
+			}
+			// If a manual Compact() has already set a larger compact revision,
+			// use that as the deletion target so stale rows above our age-based
+			// target are not left behind indefinitely.
+			if existingRev, err := s.compactRevision(ctx); err == nil && existingRev > targetRev {
+				targetRev = existingRev
 			}
 			// Record the compact revision in kv_rev before deleting rows so that
 			// CompactRevision() reflects what background compaction has done.

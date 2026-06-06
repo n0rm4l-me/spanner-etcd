@@ -89,7 +89,11 @@ func newTestStore(t *testing.T) *store.Store {
 	t.Cleanup(func() {
 		s.Close()
 		spannerClient.Close()
-		adminClient.DropDatabase(context.Background(), &databasepb.DropDatabaseRequest{Database: dbPath}) //nolint:errcheck
+		dropCtx, dropCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer dropCancel()
+		if err := adminClient.DropDatabase(dropCtx, &databasepb.DropDatabaseRequest{Database: dbPath}); err != nil {
+			t.Logf("DropDatabase %s: %v", dbPath, err)
+		}
 	})
 	return s
 }
@@ -148,7 +152,11 @@ func newTestStoreWithConfig(t *testing.T, ctx context.Context, cfg store.StoreCo
 	t.Cleanup(func() {
 		s.Close()
 		spannerClient.Close()
-		adminClient.DropDatabase(context.Background(), &databasepb.DropDatabaseRequest{Database: dbPath}) //nolint:errcheck
+		dropCtx, dropCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer dropCancel()
+		if err := adminClient.DropDatabase(dropCtx, &databasepb.DropDatabaseRequest{Database: dbPath}); err != nil {
+			t.Logf("DropDatabase %s: %v", dbPath, err)
+		}
 	})
 
 	return s
