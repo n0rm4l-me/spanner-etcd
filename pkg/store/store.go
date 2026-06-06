@@ -542,11 +542,19 @@ func (s *Store) Compact(ctx context.Context, targetRev int64) (int64, error) {
 		return 0, err
 	}
 
+	// Use the effective compact revision for deletion: if kv_rev was already
+	// at a larger value (prior incomplete compaction), delete up to that larger
+	// revision so stale rows above targetRev are not left behind.
+	effectiveRev := targetRev
+	if stored, err := s.compactRevision(ctx); err == nil && stored > effectiveRev {
+		effectiveRev = stored
+	}
+
 	go func() {
 		ctx, cancel := context.WithTimeout(s.bgCtx, 30*time.Minute)
 		defer cancel()
 		t0 := time.Now()
-		total := s.compactRows(ctx, targetRev)
+		total := s.compactRows(ctx, effectiveRev)
 		dur := time.Since(t0)
 		metrics.CompactedRowsTotal.WithLabelValues("manual").Add(float64(total))
 		metrics.CompactionDuration.WithLabelValues("manual").Observe(dur.Seconds())
