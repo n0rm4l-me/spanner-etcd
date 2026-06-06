@@ -28,7 +28,7 @@ func TestGet_ErrCompacted(t *testing.T) {
 		t.Fatalf("compact: %v", err)
 	}
 
-	// Wait for physical deletion.
+	// Wait for the compact revision to become visible to reads.
 	waitCompacted(t, s, ctx, "/compact/key", rev1)
 
 	_, _, err = s.Get(ctx, "/compact/key", rev1)

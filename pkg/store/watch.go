@@ -249,8 +249,8 @@ func (w *Watcher) dispatchEvents(events []*Event) {
 		case sub.ch <- matching:
 		default:
 			// Channel full — cancel subscription (etcd semantics: client must reconnect).
-			// Do NOT close sub.ch here — the subscriber goroutine is the sole closer
-			// and will send closedSentinel when it exits, preventing a closed-channel panic.
+			// Do NOT close sub.ch here — the channel is never closed; the subscriber
+			// goroutine sends closedSentinel when it exits, preventing a closed-channel panic.
 			w.log.Warn("subscriber channel full, closing watch",
 				zap.String("prefix", sub.prefix))
 			metrics.WatchSubscriberDropsTotal.Inc()
