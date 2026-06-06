@@ -171,25 +171,120 @@ func (k *KVServer) DeleteRange(ctx context.Context, r *etcdserverpb.DeleteRangeR
 }
 
 // Txn processes an etcd transaction — the primary operation used by Kubernetes.
+// All compare reads and op writes execute inside a single Spanner RWT — atomic.
 func (k *KVServer) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error) {
-	// Evaluate Compare conditions.
-	succeeded, err := k.evaluateCompare(ctx, r.Compare)
+	compares := make([]store.TxnCompare, 0, len(r.Compare))
+	for _, c := range r.Compare {
+		c := c // capture
+		compares = append(compares, store.TxnCompare{
+			Key: string(c.Key),
+			Evaluate: func(kv *store.KV) bool {
+				switch c.Target {
+				case etcdserverpb.Compare_VERSION:
+					var version int64
+					if kv != nil {
+						version = kv.Rev - kv.CreateRevision + 1
+					}
+					return compareInt(version, c.GetVersion(), c.Result)
+				case etcdserverpb.Compare_CREATE:
+					var createRev int64
+					if kv != nil {
+						createRev = kv.CreateRevision
+					}
+					return compareInt(createRev, c.GetCreateRevision(), c.Result)
+				case etcdserverpb.Compare_MOD:
+					var modRev int64
+					if kv != nil {
+						modRev = kv.Rev
+					}
+					return compareInt(modRev, c.GetModRevision(), c.Result)
+				case etcdserverpb.Compare_VALUE:
+					var val []byte
+					if kv != nil {
+						val = kv.Value
+					}
+					return compareBytes(val, c.GetValue(), c.Result)
+				}
+				return false
+			},
+		})
+	}
+
+	toStoreOps := func(ops []*etcdserverpb.RequestOp) []store.TxnOp {
+		result := make([]store.TxnOp, 0, len(ops))
+		for _, op := range ops {
+			switch v := op.Request.(type) {
+			case *etcdserverpb.RequestOp_RequestRange:
+				result = append(result, store.TxnOp{Type: store.TxnOpGet, Key: string(v.RequestRange.Key)})
+			case *etcdserverpb.RequestOp_RequestPut:
+				result = append(result, store.TxnOp{
+					Type:    store.TxnOpPut,
+					Key:     string(v.RequestPut.Key),
+					Value:   v.RequestPut.Value,
+					LeaseID: v.RequestPut.Lease,
+				})
+			case *etcdserverpb.RequestOp_RequestDeleteRange:
+				result = append(result, store.TxnOp{Type: store.TxnOpDelete, Key: string(v.RequestDeleteRange.Key)})
+			}
+		}
+		return result
+	}
+
+	succeeded, results, commitRev, err := k.store.AtomicTxn(ctx, compares,
+		toStoreOps(r.Success), toStoreOps(r.Failure))
 	if err != nil {
 		return nil, toGRPCErr(err)
 	}
 
+	// Build gRPC responses from TxnResults.
 	ops := r.Success
 	if !succeeded {
 		ops = r.Failure
 	}
+	var responses []*etcdserverpb.ResponseOp
+	for i, op := range ops {
+		var res store.TxnResult
+		if i < len(results) {
+			res = results[i]
+		}
+		switch v := op.Request.(type) {
+		case *etcdserverpb.RequestOp_RequestRange:
+			rresp := &etcdserverpb.RangeResponse{Header: header(commitRev)}
+			if res.KV != nil {
+				rresp.Kvs = []*mvccpb.KeyValue{toProtoKV(res.KV)}
+				rresp.Count = 1
+			}
+			responses = append(responses, &etcdserverpb.ResponseOp{
+				Response: &etcdserverpb.ResponseOp_ResponseRange{ResponseRange: rresp},
+			})
+		case *etcdserverpb.RequestOp_RequestPut:
+			presp := &etcdserverpb.PutResponse{Header: header(commitRev)}
+			if v.RequestPut.PrevKv && res.KV != nil {
+				presp.PrevKv = toProtoKV(res.KV)
+			}
+			responses = append(responses, &etcdserverpb.ResponseOp{
+				Response: &etcdserverpb.ResponseOp_ResponsePut{ResponsePut: presp},
+			})
+		case *etcdserverpb.RequestOp_RequestDeleteRange:
+			dresp := &etcdserverpb.DeleteRangeResponse{
+				Header:  header(commitRev),
+				Deleted: boolToInt(res.Ok),
+			}
+			if v.RequestDeleteRange.PrevKv && res.KV != nil {
+				dresp.PrevKvs = []*mvccpb.KeyValue{toProtoKV(res.KV)}
+			}
+			responses = append(responses, &etcdserverpb.ResponseOp{
+				Response: &etcdserverpb.ResponseOp_ResponseDeleteRange{ResponseDeleteRange: dresp},
+			})
+		}
+	}
 
-	responses, rev, err := k.executeOps(ctx, ops)
-	if err != nil {
-		return nil, toGRPCErr(err)
+	if commitRev == 0 {
+		commitRev, _ = k.store.CurrentRevision(ctx)
 	}
 
 	return &etcdserverpb.TxnResponse{
-		Header:    header(rev),
+		Header:    header(commitRev),
 		Succeeded: succeeded,
 		Responses: responses,
 	}, nil

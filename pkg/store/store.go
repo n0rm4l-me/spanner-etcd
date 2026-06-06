@@ -591,6 +591,165 @@ func (s *Store) After(ctx context.Context, prefix string, afterRev, limit int64)
 	return currentRev, events, nil
 }
 
+// TxnOp represents a single operation within an atomic Txn.
+type TxnOp struct {
+	Type    TxnOpType
+	Key     string
+	Value   []byte
+	LeaseID int64
+}
+
+type TxnOpType int
+
+const (
+	TxnOpPut    TxnOpType = 0
+	TxnOpDelete TxnOpType = 1
+	TxnOpGet    TxnOpType = 2
+)
+
+// TxnResult is the result of a single TxnOp.
+type TxnResult struct {
+	KV  *KV
+	Rev int64
+	Ok  bool
+}
+
+// AtomicTxn executes compare+ops in a single Spanner ReadWriteTransaction.
+// All compare reads and op writes are atomic — no TOCTOU window.
+// Returns (succeeded, results, commitRev, error).
+func (s *Store) AtomicTxn(
+	ctx context.Context,
+	compares []TxnCompare,
+	successOps []TxnOp,
+	failureOps []TxnOp,
+) (succeeded bool, results []TxnResult, commitRev int64, err error) {
+	var commitTS time.Time
+
+	resp, txnErr := s.client.ReadWriteTransactionWithOptions(ctx,
+		func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			succeeded = true
+			results = nil
+			commitTS = time.Time{}
+
+			// Evaluate all compare conditions inside the transaction.
+			for _, c := range compares {
+				kv, err := s.getLatestTxn(ctx, txn, c.Key)
+				if err != nil {
+					return err
+				}
+				if !c.Evaluate(kv) {
+					succeeded = false
+					break
+				}
+			}
+
+			ops := successOps
+			if !succeeded {
+				ops = failureOps
+			}
+
+			// Execute ops and buffer mutations.
+			for _, op := range ops {
+				switch op.Type {
+				case TxnOpGet:
+					kv, err := s.getLatestTxn(ctx, txn, op.Key)
+					if err != nil {
+						return err
+					}
+					results = append(results, TxnResult{KV: kv, Ok: kv != nil})
+
+				case TxnOpPut:
+					prev, err := s.getLatestTxn(ctx, txn, op.Key)
+					if err != nil {
+						return err
+					}
+					var createRevTS interface{} = spanner.CommitTimestamp
+					var prevRevTS interface{} = (*time.Time)(nil)
+					if prev != nil {
+						createRevTS = revToTS(prev.CreateRevision)
+						prevRevTS = revToTS(prev.Rev)
+					}
+					if err := txn.BufferWrite([]*spanner.Mutation{
+						spanner.Insert("kv",
+							[]string{"rev", "key", "value", "old_value", "lease_id",
+								"deleted", "created", "create_revision", "prev_revision"},
+							[]interface{}{
+								spanner.CommitTimestamp,
+								op.Key, op.Value,
+								func() []byte {
+									if prev != nil {
+										return prev.Value
+									}
+									return nil
+								}(),
+								op.LeaseID,
+								false,
+								prev == nil, // created=true only on first write
+								createRevTS,
+								prevRevTS,
+							},
+						),
+					}); err != nil {
+						return err
+					}
+					results = append(results, TxnResult{KV: prev, Ok: true})
+
+				case TxnOpDelete:
+					prev, err := s.getLatestTxn(ctx, txn, op.Key)
+					if err != nil {
+						return err
+					}
+					if prev == nil {
+						results = append(results, TxnResult{Ok: false})
+						continue
+					}
+					if err := txn.BufferWrite([]*spanner.Mutation{
+						spanner.Insert("kv",
+							[]string{"rev", "key", "value", "old_value", "lease_id",
+								"deleted", "created", "create_revision", "prev_revision"},
+							[]interface{}{
+								spanner.CommitTimestamp,
+								op.Key, []byte(nil), prev.Value, int64(0),
+								true, false,
+								revToTS(prev.CreateRevision),
+								revToTS(prev.Rev),
+							},
+						),
+					}); err != nil {
+						return err
+					}
+					results = append(results, TxnResult{KV: prev, Ok: true})
+				}
+			}
+			return nil
+		}, spanner.TransactionOptions{})
+
+	status := "ok"
+	if txnErr != nil {
+		status = "error"
+	}
+	metrics.KVOperationsTotal.WithLabelValues("txn", status).Inc()
+	metrics.SpannerTransactions.WithLabelValues(status).Inc()
+
+	if txnErr != nil {
+		return false, nil, 0, txnErr
+	}
+	commitRev = tsToRev(resp.CommitTs)
+	commitTS = resp.CommitTs
+	_ = commitTS
+	if commitRev > 0 {
+		metrics.CurrentRevision.Set(float64(commitRev))
+		s.watcher.notify(commitRev)
+	}
+	return succeeded, results, commitRev, nil
+}
+
+// TxnCompare is a single compare predicate for AtomicTxn.
+type TxnCompare struct {
+	Key      string
+	Evaluate func(kv *KV) bool
+}
+
 // Compact records the compaction revision.
 func (s *Store) Compact(ctx context.Context, targetRev int64) (int64, error) {
 	targetTS := revToTS(targetRev)
