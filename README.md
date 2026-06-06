@@ -319,8 +319,8 @@ On pod restart, Watch clients reconnect automatically via the etcd client retry 
 ```
 t=0    preStop sleep (15s) — endpoint propagation
 t=15s  SIGTERM → GracefulStop (10s timeout for in-flight RPCs)
-t=25s  Force stop if needed
-t=25s  Spanner connections closed
+t=25s  Force stop if needed; Spanner connections closed
+t=60s  terminationGracePeriodSeconds — pod hard-killed by kubelet if still running
 ```
 
 Tested: 45 Watch streams migrated to the surviving replica in ~10s, zero application errors.
@@ -398,7 +398,7 @@ The emulator does not support the `READ_kv_changes` TVF. spanner-etcd falls back
 
 ## Testing
 
-48 integration tests against the Spanner emulator.
+53 integration tests against the Spanner emulator.
 
 ```bash
 SPANNER_EMULATOR_HOST=localhost:9010 go test ./...
@@ -406,8 +406,8 @@ SPANNER_EMULATOR_HOST=localhost:9010 go test ./...
 
 | Package | Tests | What's covered |
 |---------|-------|----------------|
-| `pkg/store` | 25 | Create/Get/Update/Delete/List/Count/After/Compact/Watch/Lease/Lease+Watch |
-| `pkg/server` | 13 + 3 auth | Full gRPC stack, Txn multi-op, Watch cancel/fanout/concurrent, graceful shutdown, auth token expiry / re-auth |
+| `pkg/store` | 33 | Create/Get/Update/Delete/List/Count/After/Compact/Watch/Lease/Lease+Watch/AutoCompact |
+| `pkg/server` | 17 + 3 auth | Full gRPC stack, Txn multi-op, Watch cancel/fanout/concurrent, graceful shutdown, auth token expiry / re-auth |
 
 ## Production validation
 
@@ -428,7 +428,7 @@ Tested with **22 production Java/Kotlin microservices** (Vert.x + jetcd) on GKE:
 - [x] Helm chart with WIF, PDB, HPA, graceful shutdown (preStop + GracefulStop)
 - [x] Kubernetes v1.31 (kubeadm) — full control plane tested
 - [x] Production validation: 22 microservices, 45 Watch streams
-- [x] 38 integration tests (emulator)
+- [x] 53 integration tests (emulator)
 - [ ] Auth RBAC (UserAdd/RoleGrantPermission)
 - [ ] Change Streams support on Spanner emulator
 
@@ -438,10 +438,7 @@ Tested with **22 production Java/Kotlin microservices** (Vert.x + jetcd) on GKE:
 # Build local binary
 make build
 
-# Vendor dependencies (required before Docker build)
-make vendor
-
-# Build Docker image (linux/amd64)
+# Build Docker image (linux/amd64) — runs 'make vendor' automatically
 make docker VERSION=0.4.0
 
 # Build + push
