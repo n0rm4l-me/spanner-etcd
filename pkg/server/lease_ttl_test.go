@@ -130,10 +130,11 @@ func TestWatch_NoPanicOnContextCancel(t *testing.T) {
 	}
 }
 
-// TestWatch_CanceledResponseOnSubscriberDrop verifies that cancelling a watch
-// causes the WatchChan to close cleanly. A full channel-overflow test requires
-// internal hooks not exposed via the public gRPC API.
-func TestWatch_CanceledResponseOnSubscriberDrop(t *testing.T) {
+// TestWatch_StreamClosesAfterClientCancel verifies that cancelling a watch
+// causes the WatchChan to close cleanly without panic or goroutine leak.
+// Note: channel-overflow cancellation requires internal store hooks not
+// accessible via the public gRPC API and is not tested here.
+func TestWatch_StreamClosesAfterClientCancel(t *testing.T) {
 	cli := testServer(t)
 	ctx := context.Background()
 	watchCtx, watchCancel := context.WithCancel(ctx)

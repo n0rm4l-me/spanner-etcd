@@ -191,7 +191,11 @@ func (s *Store) Get(ctx context.Context, key string, revision int64) (currentRev
 		return 0, nil, err
 	}
 	if revision > 0 {
-		if compactRev, cerr := s.compactRevision(ctx); cerr == nil && revision < compactRev {
+		compactRev, cerr := s.compactRevision(ctx)
+		if cerr != nil {
+			return 0, nil, fmt.Errorf("get compact revision: %w", cerr)
+		}
+		if revision < compactRev {
 			return currentRev, nil, ErrCompacted
 		}
 	}
@@ -296,7 +300,11 @@ func (s *Store) Count(ctx context.Context, prefix, startKey string, revision int
 		return 0, 0, err
 	}
 	if revision > 0 {
-		if compactRev, cerr := s.compactRevision(ctx); cerr == nil && revision < compactRev {
+		compactRev, cerr := s.compactRevision(ctx)
+		if cerr != nil {
+			return 0, 0, fmt.Errorf("get compact revision: %w", cerr)
+		}
+		if revision < compactRev {
 			return currentRev, 0, ErrCompacted
 		}
 	}
@@ -433,10 +441,11 @@ func (s *Store) Update(ctx context.Context, key string, value []byte, revision, 
 }
 
 // DeleteIfLease removes key only if its current row's lease_id matches leaseID.
-// This closes the TOCTOU window in expireLeaseKeys: the lease_id check and the
-// tombstone write are atomic inside a single Spanner ReadWriteTransaction.
-func (s *Store) DeleteIfLease(ctx context.Context, key string, leaseID int64) (bool, error) {
-	_, err := s.client.ReadWriteTransactionWithOptions(ctx,
+// Returns (true, nil) if the tombstone was written, (false, nil) if the key
+// was missing or belonged to a different lease, and (false, err) on failure.
+// The lease_id check and the tombstone write are atomic in one Spanner RW txn.
+func (s *Store) DeleteIfLease(ctx context.Context, key string, leaseID int64) (deleted bool, err error) {
+	_, err = s.client.ReadWriteTransactionWithOptions(ctx,
 		func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 			prev, err := s.getLatestTxn(ctx, txn, key)
 			if err != nil {
@@ -444,8 +453,10 @@ func (s *Store) DeleteIfLease(ctx context.Context, key string, leaseID int64) (b
 			}
 			if prev == nil || prev.LeaseID != leaseID {
 				// Key gone or reassigned to a different lease — nothing to do.
+				deleted = false
 				return nil
 			}
+			deleted = true
 			return txn.BufferWrite([]*spanner.Mutation{
 				spanner.Insert("kv",
 					[]string{"rev", "key", "value", "old_value", "lease_id",
@@ -463,7 +474,7 @@ func (s *Store) DeleteIfLease(ctx context.Context, key string, leaseID int64) (b
 	if err != nil {
 		return false, err
 	}
-	return true, nil
+	return deleted, nil
 }
 
 // Delete removes key at the given revision (CAS). revision=0 = unconditional.
@@ -529,7 +540,11 @@ func (s *Store) After(ctx context.Context, prefix string, afterRev, limit int64)
 	// afterRev=0 means "from beginning" — used by the poll loop, not for client replay.
 	// Only check compaction for explicit client-supplied revisions.
 	if afterRev > 0 {
-		if compactRev, cerr := s.compactRevision(ctx); cerr == nil && afterRev < compactRev {
+		compactRev, cerr := s.compactRevision(ctx)
+		if cerr != nil {
+			return 0, nil, fmt.Errorf("get compact revision: %w", cerr)
+		}
+		if afterRev < compactRev {
 			return currentRev, nil, ErrCompacted
 		}
 	}
