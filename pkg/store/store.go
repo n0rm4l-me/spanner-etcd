@@ -656,6 +656,22 @@ func (s *Store) autoCompactLoop(ctx context.Context) {
 			if targetRev <= 1 {
 				continue
 			}
+			// Record the compact revision in kv_rev before deleting rows so that
+			// CompactRevision() reflects what background compaction has done,
+			// matching the semantics of explicit Compact() calls.
+			targetTS := revToTS(targetRev)
+			if _, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+				return txn.BufferWrite([]*spanner.Mutation{
+					spanner.InsertOrUpdateMap("kv_rev", map[string]interface{}{
+						"id":  schema.CompactRevRow,
+						"rev": targetTS,
+					}),
+				})
+			}); err != nil {
+				s.log.Warn("auto-compact: failed to record compact revision", zap.Error(err))
+				continue
+			}
+
 			t0 := time.Now()
 			total := s.compactRows(ctx, targetRev)
 			dur := time.Since(t0)
