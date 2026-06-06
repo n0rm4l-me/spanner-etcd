@@ -1,12 +1,19 @@
 IMAGE_REPO ?= asia-docker.pkg.dev/onepoint-paas-tardis-4492/docker-paas-tardis-asia-1/spanner-etcd
 VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 
-.PHONY: build vendor docker push test lint clean
+.PHONY: build build-linux vendor docker push test lint clean
 
 ## Build local binary (host OS/arch)
 build:
 	go build -ldflags="-s -w" -o spanner-etcd ./cmd/server/
 	go build -ldflags="-s -w" -o spanner-etcd-migrate ./cmd/migrate/
+
+## Build linux/amd64 binary for deployment to VMs
+build-linux:
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+	  go build -ldflags="-s -w" -o spanner-etcd-linux-amd64 ./cmd/server/
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+	  go build -ldflags="-s -w" -o spanner-etcd-migrate-linux-amd64 ./cmd/migrate/
 
 ## Download and vendor dependencies (required before docker)
 vendor:
@@ -48,4 +55,5 @@ lint:
 ## Remove built binaries and vendor
 clean:
 	rm -f spanner-etcd spanner-etcd-migrate
+	rm -f spanner-etcd-linux-amd64 spanner-etcd-migrate-linux-amd64
 	rm -rf vendor/
