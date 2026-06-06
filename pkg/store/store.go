@@ -136,7 +136,7 @@ func NewWithConfig(ctx context.Context, client *spanner.Client, log *zap.Logger,
 		bgCancel: bgCancel,
 		cfg:      cfg,
 	}
-	s.watcher = newWatcher(ctx, s, log)
+	s.watcher = newWatcher(bgCtx, s, log)
 	s.leasesMgr = newLeaseManager(bgCtx, s, log)
 	if cfg.AutoCompactInterval > 0 {
 		go s.autoCompactLoop(bgCtx)
