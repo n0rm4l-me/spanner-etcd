@@ -623,6 +623,13 @@ func (s *Store) AtomicTxn(
 	successOps []TxnOp,
 	failureOps []TxnOp,
 ) (succeeded bool, results []TxnResult, commitRev int64, err error) {
+	// Validate compares before opening a Spanner transaction.
+	for _, c := range compares {
+		if c.Err != nil {
+			return false, nil, 0, c.Err
+		}
+	}
+
 	var hasMutations bool
 
 	resp, txnErr := s.client.ReadWriteTransactionWithOptions(ctx,
@@ -630,13 +637,6 @@ func (s *Store) AtomicTxn(
 			succeeded = true
 			results = nil
 			hasMutations = false
-
-			// Fail fast on pre-validation errors (e.g. unsupported compare target).
-			for _, c := range compares {
-				if c.Err != nil {
-					return c.Err
-				}
-			}
 
 			// Evaluate all compare conditions inside the transaction.
 			for _, c := range compares {

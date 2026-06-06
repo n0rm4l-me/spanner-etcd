@@ -64,10 +64,13 @@ func TestTxn_Atomic_ConcurrentCreate(t *testing.T) {
 		}
 
 		mu.Lock()
-		if successCount == 1 {
+		switch successCount {
+		case 1:
 			wins++
-		} else if successCount == 2 {
-			t.Errorf("iteration %d: both concurrent Txn calls succeeded — atomicity broken", i)
+		case 0:
+			t.Errorf("iteration %d: neither Txn succeeded — both lost, expected exactly one winner", i)
+		case 2:
+			t.Errorf("iteration %d: both Txn calls succeeded — atomicity broken", i)
 		}
 		mu.Unlock()
 	}
