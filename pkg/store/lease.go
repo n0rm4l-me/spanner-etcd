@@ -88,7 +88,15 @@ func (lm *LeaseManager) Grant(ctx context.Context, ttl int64) (*Lease, error) {
 }
 
 // Revoke removes a lease and deletes all keys associated with it.
+// The lease is removed from the in-memory map only after expireLeaseKeys
+// succeeds — if the key deletion fails transiently, the lease remains in
+// memory so scheduleExpiry can retry and the gcLoop can reload it on restart.
 func (lm *LeaseManager) Revoke(ctx context.Context, id int64) error {
+	// Use bgCtx so expiry works even when called from a short-lived request ctx.
+	if err := lm.expireLeaseKeys(lm.bgCtx, id); err != nil {
+		return err
+	}
+
 	lm.mu.Lock()
 	_, existed := lm.leases[id]
 	delete(lm.leases, id)
@@ -96,9 +104,7 @@ func (lm *LeaseManager) Revoke(ctx context.Context, id int64) error {
 	if existed {
 		metrics.ActiveLeases.Dec()
 	}
-
-	// Use bgCtx so expiry works even when called from a short-lived request ctx.
-	return lm.expireLeaseKeys(lm.bgCtx, id)
+	return nil
 }
 
 // Get returns a lease by ID, or nil.
