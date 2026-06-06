@@ -631,6 +631,7 @@ func (s *Store) AtomicTxn(
 	}
 
 	var hasMutations bool
+	var snapshotRev int64
 
 	resp, txnErr := s.client.ReadWriteTransactionWithOptions(ctx,
 		func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
@@ -639,6 +640,19 @@ func (s *Store) AtomicTxn(
 			results = nil
 			hasMutations = false
 			commitRev = 0
+			snapshotRev = 0
+
+			// Capture the revision visible at the start of this transaction snapshot.
+			// Used as the response revision when no mutations are buffered, so clients
+			// get a consistent revision for subsequent Watch calls.
+			iter := txn.Query(ctx, spanner.Statement{SQL: `SELECT MAX(rev) FROM kv`})
+			if row, err := iter.Next(); err == nil {
+				var ts spanner.NullTime
+				if err := row.Column(0, &ts); err == nil && ts.Valid {
+					snapshotRev = tsToRev(ts.Time)
+				}
+			}
+			iter.Stop()
 
 			// Evaluate all compare conditions inside the transaction.
 			for _, c := range compares {
@@ -755,11 +769,11 @@ func (s *Store) AtomicTxn(
 			s.watcher.notify(commitRev)
 		}
 	} else {
-		// No mutations — return the revision observed inside the transaction
-		// snapshot so callers get a consistent read revision, not a later one.
-		commitRev = tsToRev(resp.CommitTs)
-		if commitRev <= 1 {
-			// Fallback: empty store or no prior writes.
+		// No mutations — snapshotRev was captured inside the transaction via
+		// SELECT MAX(rev), giving the exact revision visible to the compare reads.
+		commitRev = snapshotRev
+		if commitRev == 0 {
+			// Empty store — fall back to current revision (also 0/1).
 			commitRev, err = s.CurrentRevision(ctx)
 			if err != nil {
 				return false, nil, 0, err
