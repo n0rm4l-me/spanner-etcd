@@ -118,17 +118,19 @@ func TestAfter_ErrCompacted(t *testing.T) {
 	}
 }
 
-// waitCompacted polls until Get at the given revision returns ErrCompacted,
-// indicating that physical deletion has advanced past that revision.
+// waitCompacted verifies that Get at the given revision immediately returns
+// ErrCompacted — compaction is recorded synchronously so no polling is needed.
 func waitCompacted(t *testing.T, s *store.Store, ctx context.Context, key string, rev int64) {
 	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
+	// Give the async compaction goroutine a moment to record the compact revision.
+	// The ErrCompacted guard is based on kv_rev, not physical row deletion.
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		time.Sleep(300 * time.Millisecond)
 		_, _, err := s.Get(ctx, key, rev)
 		if err == store.ErrCompacted {
 			return
 		}
+		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatalf("Get(%q, rev=%d) did not return ErrCompacted within deadline", key, rev)
 }

@@ -204,13 +204,22 @@ func (lm *LeaseManager) expireLeaseKeys(ctx context.Context, leaseID int64) erro
 	iter := lm.store.client.Single().Query(ctx, stmt)
 	defer iter.Stop()
 
+	var scanErr error
 	for {
 		row, err := iter.Next()
+		if errors.Is(err, iterator.Done) {
+			break
+		}
 		if err != nil {
+			// Transient Spanner error mid-scan: stop without deleting the lease
+			// record so the caller can retry. Deleting kv_lease on a partial scan
+			// would orphan keys that were not yet processed.
+			scanErr = err
 			break
 		}
 		var key string
 		if err := row.Columns(&key); err != nil {
+			lm.log.Warn("failed to decode lease key row", zap.Error(err))
 			continue
 		}
 		// Unconditional delete (rev=0): safe because we only delete keys whose
@@ -223,7 +232,13 @@ func (lm *LeaseManager) expireLeaseKeys(ctx context.Context, leaseID int64) erro
 		}
 	}
 
-	// Remove lease record.
+	if scanErr != nil {
+		lm.log.Warn("expireLeaseKeys: scan failed, lease record preserved for retry",
+			zap.Int64("lease_id", leaseID), zap.Error(scanErr))
+		return scanErr
+	}
+
+	// All keys processed — remove the lease record.
 	lm.store.client.Apply(ctx, []*spanner.Mutation{ //nolint:errcheck
 		spanner.Delete("kv_lease", spanner.Key{leaseID}),
 	})

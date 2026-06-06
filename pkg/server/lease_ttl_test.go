@@ -111,7 +111,7 @@ func TestWatch_ReplayPagination(t *testing.T) {
 }
 
 // TestWatch_NoPanicOnContextCancel verifies that cancelling a watch context
-// does not panic, block, or leak goroutines — the basic lifecycle path.
+// causes the WatchChan to close cleanly without panicking or blocking.
 func TestWatch_NoPanicOnContextCancel(t *testing.T) {
 	cli := testServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -122,32 +122,27 @@ func TestWatch_NoPanicOnContextCancel(t *testing.T) {
 
 	cancel()
 
-	deadline := time.After(3 * time.Second)
-	for {
-		select {
-		case _, ok := <-wCh:
-			if !ok {
-				return
-			}
-		case <-deadline:
-			return
-		}
+	select {
+	case _, ok := <-wCh:
+		_ = ok // channel closed or drained — either is fine
+	case <-time.After(3 * time.Second):
+		t.Fatal("watch channel did not close within 3s after context cancellation")
 	}
 }
 
-// TestWatch_CanceledResponseOnSubscriberDrop verifies that when a watch is
-// explicitly cancelled by the client, the stream closes without the server
-// panicking. A full channel-overflow test requires internal hooks not exposed
-// via the public gRPC API; this test covers the cancel path end-to-end.
+// TestWatch_CanceledResponseOnSubscriberDrop verifies that cancelling a watch
+// causes the WatchChan to close cleanly. A full channel-overflow test requires
+// internal hooks not exposed via the public gRPC API.
 func TestWatch_CanceledResponseOnSubscriberDrop(t *testing.T) {
 	cli := testServer(t)
 	ctx := context.Background()
 	watchCtx, watchCancel := context.WithCancel(ctx)
+	defer watchCancel()
 
 	wCh := cli.Watch(watchCtx, "/drop/", clientv3.WithPrefix())
 	time.Sleep(100 * time.Millisecond)
 
-	// Write an event so the watch is active.
+	// Write an event so the watch is confirmed live.
 	cli.Put(ctx, "/drop/k", "v")
 	select {
 	case resp := <-wCh:
@@ -158,19 +153,12 @@ func TestWatch_CanceledResponseOnSubscriberDrop(t *testing.T) {
 		t.Fatal("timeout waiting for event")
 	}
 
-	// Cancel the watch — server must not panic.
+	// Cancel — the WatchChan must close or drain within a reasonable time.
 	watchCancel()
-
-	// Channel should drain cleanly within a reasonable time.
-	deadline := time.After(3 * time.Second)
-	for {
-		select {
-		case _, ok := <-wCh:
-			if !ok {
-				return
-			}
-		case <-deadline:
-			return
-		}
+	select {
+	case _, ok := <-wCh:
+		_ = ok
+	case <-time.After(3 * time.Second):
+		t.Fatal("watch channel did not close within 3s after watchCancel()")
 	}
 }
