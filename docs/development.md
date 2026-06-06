@@ -44,12 +44,12 @@ go run -race ./cmd/server/ \
 
 ### Test coverage
 
-53 integration tests against the Spanner emulator.
+62 integration tests against the Spanner emulator.
 
 | Package | Tests | What's covered |
 |---------|-------|----------------|
-| `pkg/store` | 33 | Create/Get/Update/Delete/List/Count/After/Compact/Watch/Lease/Lease+Watch/AutoCompact/ErrCompacted |
-| `pkg/server` | 17 + 3 auth | Full gRPC stack, Txn multi-op, Watch cancel/fanout/concurrent/replay-pagination, graceful shutdown, auth token expiry / re-auth, LeaseTimeToLive remaining TTL |
+| `pkg/store` | 37 | Create/Get/Update/Delete/List/Count/After/Compact/Watch/Lease/Lease+Watch/AutoCompact/ErrCompacted |
+| `pkg/server` | 22 + 3 auth | Full gRPC stack, Txn multi-op, Watch cancel/fanout/concurrent/replay-pagination, graceful shutdown, auth token expiry / re-auth, LeaseTimeToLive remaining TTL |
 
 ## CI
 

@@ -63,7 +63,7 @@ etcdctl put /hello world && etcdctl get /hello
 - [x] Helm chart with WIF, PDB, HPA, graceful shutdown (preStop + GracefulStop)
 - [x] Kubernetes v1.31 (kubeadm) — full control plane tested
 - [x] Production validation: 22 microservices, 45 Watch streams
-- [x] 53 integration tests (emulator)
+- [x] 62 integration tests (emulator)
 - [ ] Auth RBAC (UserAdd/RoleGrantPermission)
 - [ ] Change Streams support on Spanner emulator
 
