@@ -182,9 +182,28 @@ func (lm *LeaseManager) scheduleExpiry(ctx context.Context, lease *Lease) {
 
 	lm.log.Info("lease expired", zap.Int64("lease_id", lease.ID))
 	metrics.LeaseExpirations.Inc()
-	if err := lm.Revoke(ctx, lease.ID); err != nil {
-		lm.log.Warn("lease expiry error", zap.Int64("lease_id", lease.ID), zap.Error(err))
+
+	// Retry expiry with backoff on transient Spanner errors so a temporary
+	// failure does not leave the lease record and its keys stuck indefinitely.
+	for attempt := 1; attempt <= 5; attempt++ {
+		if err := lm.Revoke(ctx, lease.ID); err == nil {
+			return
+		} else {
+			lm.log.Warn("lease expiry error, retrying",
+				zap.Int64("lease_id", lease.ID),
+				zap.Int("attempt", attempt),
+				zap.Error(err))
+			select {
+			case <-time.After(time.Duration(attempt) * time.Second):
+			case <-lm.stopCh:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
 	}
+	lm.log.Error("lease expiry failed after retries — lease may be stuck",
+		zap.Int64("lease_id", lease.ID))
 }
 
 // expireLeaseKeys deletes all keys whose latest revision still belongs to leaseID.

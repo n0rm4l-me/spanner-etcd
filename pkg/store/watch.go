@@ -131,19 +131,18 @@ func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) 
 	// Use bgCtx so the query isn't cancelled when the gRPC request context ends.
 	go func() {
 		defer func() {
-			w.removeSub(sub)
-			// Mark closed, then drain buffered events until the sentinel fits.
-			// The sentinel MUST be delivered so watchLoop can emit Canceled=true.
-			// The channel is never closed — sentinel is the teardown signal.
-			// After closed=true, dispatchEvents skips this subscriber so no new
-			// items arrive — draining is safe and terminates quickly.
+			// Mark closed BEFORE removeSub so dispatchEvents stops enqueueing
+			// new items immediately — no window between removal and closed flag.
 			sub.closed.Store(true)
+			w.removeSub(sub)
+			// Drain any already-buffered batches and deliver the sentinel.
+			// The sentinel MUST arrive so watchLoop emits Canceled=true.
+			// The channel is never closed — sentinel is the sole teardown signal.
 			for {
 				select {
 				case sub.ch <- closedSentinel:
 					return
 				default:
-					// Discard one buffered batch to make room.
 					select {
 					case <-sub.ch:
 					default:

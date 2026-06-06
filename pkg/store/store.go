@@ -195,7 +195,7 @@ func (s *Store) Get(ctx context.Context, key string, revision int64) (currentRev
 		if cerr != nil {
 			return 0, nil, fmt.Errorf("get compact revision: %w", cerr)
 		}
-		if revision <= compactRev {
+		if compactRev > 1 && revision <= compactRev {
 			return currentRev, nil, ErrCompacted
 		}
 	}
@@ -268,7 +268,7 @@ func (s *Store) List(ctx context.Context, prefix, startKey string, limit, revisi
 	if err != nil {
 		return 0, 0, nil, err
 	}
-	if revision > 0 && revision <= compactRev {
+	if compactRev > 1 && revision > 0 && revision <= compactRev {
 		return currentRev, compactRev, nil, ErrCompacted
 	}
 
@@ -304,7 +304,7 @@ func (s *Store) Count(ctx context.Context, prefix, startKey string, revision int
 		if cerr != nil {
 			return 0, 0, fmt.Errorf("get compact revision: %w", cerr)
 		}
-		if revision <= compactRev {
+		if compactRev > 1 && revision <= compactRev {
 			return currentRev, 0, ErrCompacted
 		}
 	}
