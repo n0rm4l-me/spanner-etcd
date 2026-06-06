@@ -144,7 +144,9 @@ func TestWatch_StreamClosesAfterClientCancel(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Write an event so the watch is confirmed live.
-	cli.Put(ctx, "/drop/k", "v")
+	if _, err := cli.Put(ctx, "/drop/k", "v"); err != nil {
+		t.Fatalf("put: %v", err)
+	}
 	select {
 	case resp := <-wCh:
 		if resp.Err() != nil {

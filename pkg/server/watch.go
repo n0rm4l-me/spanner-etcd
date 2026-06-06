@@ -47,6 +47,9 @@ func (w *WatchServer) Watch(stream etcdserverpb.Watch_WatchServer) error {
 	// guarantees no IDs are dropped even when stream.Recv() is blocking.
 	cancelledCh := make(chan int64)
 
+	// sendErrCh receives the first stream.Send error so the main loop can exit.
+	sendErrCh := make(chan error, 1)
+
 	// Send loop — runs in its own goroutine.
 	go func() {
 		for {
@@ -58,6 +61,10 @@ func (w *WatchServer) Watch(stream etcdserverpb.Watch_WatchServer) error {
 					return
 				}
 				if err := stream.Send(resp); err != nil {
+					select {
+					case sendErrCh <- err:
+					default:
+					}
 					return
 				}
 			}
@@ -74,7 +81,11 @@ func (w *WatchServer) Watch(stream etcdserverpb.Watch_WatchServer) error {
 	go func() {
 		for {
 			req, err := stream.Recv()
-			reqCh <- recvResult{req, err}
+			select {
+			case reqCh <- recvResult{req, err}:
+			case <-ctx.Done():
+				return
+			}
 			if err != nil {
 				return
 			}
@@ -100,6 +111,8 @@ loop:
 	for {
 		select {
 		case <-ctx.Done():
+			break loop
+		case <-sendErrCh:
 			break loop
 		case id := <-cancelledCh:
 			if cancel, ok := watches[id]; ok {
@@ -211,9 +224,10 @@ func (w *WatchServer) watchLoop(
 				case <-stdCtx.Done():
 				}
 				// Signal the receive loop to remove this watch ID from the map.
+				// Block until delivered or the stream context is done — never drop.
 				select {
 				case cancelledCh <- watchID:
-				default:
+				case <-stdCtx.Done():
 				}
 				return
 			}

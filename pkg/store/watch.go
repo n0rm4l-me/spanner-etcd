@@ -295,14 +295,12 @@ func (w *Watcher) pollLoop(ctx context.Context) {
 func (w *Watcher) doPoll(ctx context.Context, lastRev int64) int64 {
 	curRev, events, err := w.store.After(ctx, "", lastRev, pollBatchSize)
 	if err != nil {
-		// ErrCompacted means lastRev was compacted away — advance to current
-		// revision so the poll loop doesn't spin forever on the same stale revision.
+		// ErrCompacted means lastRev was compacted away. After() already returns
+		// curRev even on error, so use it directly — no extra Spanner round-trip.
 		if err == ErrCompacted {
-			if cur, cerr := w.store.CurrentRevision(ctx); cerr == nil {
-				w.log.Warn("poll: revision compacted, advancing to current",
-					zap.Int64("old_rev", lastRev), zap.Int64("new_rev", cur))
-				return cur
-			}
+			w.log.Warn("poll: revision compacted, advancing to current",
+				zap.Int64("old_rev", lastRev), zap.Int64("new_rev", curRev))
+			return curRev
 		}
 		w.log.Warn("poll error", zap.Error(err))
 		return lastRev
