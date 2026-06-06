@@ -634,9 +634,11 @@ func (s *Store) AtomicTxn(
 
 	resp, txnErr := s.client.ReadWriteTransactionWithOptions(ctx,
 		func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			// Reset all per-attempt state — Spanner may retry this callback on ABORTED.
 			succeeded = true
 			results = nil
 			hasMutations = false
+			commitRev = 0
 
 			// Evaluate all compare conditions inside the transaction.
 			for _, c := range compares {
