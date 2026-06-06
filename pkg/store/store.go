@@ -794,11 +794,10 @@ func (s *Store) AtomicTxn(
 		// SELECT MAX(rev), giving the exact revision visible to the compare reads.
 		commitRev = snapshotRev
 		if commitRev == 0 {
-			// Empty store — fall back to current revision (also 0/1).
-			commitRev, err = s.CurrentRevision(ctx)
-			if err != nil {
-				return false, nil, 0, err
-			}
+			// Empty store at transaction snapshot — return the base revision directly.
+			// Do NOT call CurrentRevision() outside the txn: a concurrent writer could
+			// have committed after our snapshot, returning a phantom revision.
+			commitRev = 1
 		}
 	}
 	return succeeded, results, commitRev, nil
