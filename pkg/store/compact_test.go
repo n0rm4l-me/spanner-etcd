@@ -5,7 +5,56 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/n0rm4l-me/spanner-etcd/pkg/store"
 )
+
+// TestAutoCompactLoop verifies that the background auto-compaction loop triggers
+// and physically removes stale rows within the configured interval.
+func TestAutoCompactLoop(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s := newTestStoreWithConfig(t, ctx, store.StoreConfig{
+		AutoCompactInterval: 2 * time.Second,
+		AutoCompactAge:      1 * time.Millisecond, // compact nearly everything
+	})
+
+	// Write 3 versions — 2 stale rows will be eligible for compaction.
+	rev1, err := s.Create(ctx, "/autocompact/k", []byte("v1"), 0)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	rev2, _, _, err := s.Update(ctx, "/autocompact/k", []byte("v2"), rev1, 0)
+	if err != nil {
+		t.Fatalf("update v2: %v", err)
+	}
+	if _, _, _, err := s.Update(ctx, "/autocompact/k", []byte("v3"), rev2, 0); err != nil {
+		t.Fatalf("update v3: %v", err)
+	}
+
+	// Wait for the loop to fire (interval=2s) plus a poll cycle (1s) buffer.
+	t.Log("waiting for auto-compaction loop to fire (up to 8s)...")
+	deadline := time.Now().Add(8 * time.Second)
+	var compacted bool
+	for time.Now().Before(deadline) {
+		time.Sleep(500 * time.Millisecond)
+		_, kv, _ := s.Get(ctx, "/autocompact/k", rev1)
+		if kv == nil {
+			compacted = true
+			break
+		}
+	}
+	if !compacted {
+		t.Fatal("auto-compaction loop did not compact stale rows within deadline")
+	}
+
+	// Current value must still be readable.
+	_, kv, err := s.Get(ctx, "/autocompact/k", 0)
+	if err != nil || kv == nil || string(kv.Value) != "v3" {
+		t.Fatalf("want current value=v3, got kv=%v err=%v", kv, err)
+	}
+}
 
 // TestCompact_LargeVolume verifies that compaction correctly handles more rows
 // than a single batch (> compactBatchSize), looping until all are deleted.

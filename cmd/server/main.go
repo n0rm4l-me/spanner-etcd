@@ -139,7 +139,7 @@ type appConfig struct {
 	authTokenTTL         time.Duration // 0 = DefaultTokenTTL (5m)
 	peerURLs             []string
 	logLevel             string
-	autoCompactInterval  time.Duration // 0 = DefaultAutoCompactInterval (5m)
+	autoCompactInterval  time.Duration // 0 = DefaultAutoCompactInterval (5m); -1 = disabled
 	autoCompactAge       time.Duration // 0 = DefaultAutoCompactAge (5m)
 }
 

@@ -105,6 +105,15 @@ func New(ctx context.Context, client *spanner.Client, log *zap.Logger) (*Store, 
 // NewWithConfig creates a Store with explicit tuning parameters.
 // Pass AutoCompactInterval = -1 to disable background auto-compaction.
 func NewWithConfig(ctx context.Context, client *spanner.Client, log *zap.Logger, cfg StoreConfig) (*Store, error) {
+	// Validate: negative age or interval (other than the -1 disabled sentinel) are
+	// programming errors — a negative age would compact future revisions.
+	if cfg.AutoCompactAge < 0 {
+		return nil, fmt.Errorf("AutoCompactAge must be >= 0, got %v", cfg.AutoCompactAge)
+	}
+	if cfg.AutoCompactInterval < -1 {
+		return nil, fmt.Errorf("AutoCompactInterval must be >= -1, got %v", cfg.AutoCompactInterval)
+	}
+
 	// -1 sentinel = disabled; 0 = use default.
 	if cfg.AutoCompactInterval == 0 {
 		cfg.AutoCompactInterval = DefaultAutoCompactInterval
@@ -147,9 +156,9 @@ func (s *Store) Leases() *LeaseManager {
 // CurrentRevision returns the latest global revision as int64 (UnixNano).
 // With PCT, current revision = MAX(rev) FROM kv — no lock, no contention.
 func (s *Store) CurrentRevision(ctx context.Context) (int64, error) {
-	row, err := s.client.Single().Query(ctx, spanner.Statement{
-		SQL: `SELECT MAX(rev) FROM kv`,
-	}).Next()
+	iter := s.client.Single().Query(ctx, spanner.Statement{SQL: `SELECT MAX(rev) FROM kv`})
+	defer iter.Stop()
+	row, err := iter.Next()
 	if errors.Is(err, iterator.Done) {
 		return 1, nil
 	}
@@ -670,7 +679,8 @@ func (s *Store) compactRows(ctx context.Context, targetRev int64) int {
 	for {
 		ids, err := s.scanCompactBatch(ctx, targetTS)
 		if err != nil {
-			s.log.Warn("compact rows scan failed", zap.Error(err))
+			s.log.Warn("compact rows scan failed",
+				zap.Int64("target_rev", targetRev), zap.Error(err))
 			return total
 		}
 		if len(ids) == 0 {
@@ -682,7 +692,8 @@ func (s *Store) compactRows(ctx context.Context, targetRev int64) int {
 			mutations[i] = spanner.Delete("kv", id)
 		}
 		if _, err := s.client.Apply(ctx, mutations); err != nil {
-			s.log.Warn("compact rows delete failed", zap.Int("count", len(ids)), zap.Error(err))
+			s.log.Warn("compact rows delete failed",
+				zap.Int64("target_rev", targetRev), zap.Int("count", len(ids)), zap.Error(err))
 			return total
 		}
 		total += len(ids)
@@ -730,7 +741,7 @@ func (s *Store) scanCompactBatch(ctx context.Context, targetTS time.Time) ([]spa
 		}
 		var id int64
 		if err := row.Column(0, &id); err != nil {
-			continue
+			return nil, fmt.Errorf("decode compact row id: %w", err)
 		}
 		ids = append(ids, spanner.Key{id})
 	}
