@@ -728,6 +728,9 @@ func (s *Store) AtomicTxn(
 					}
 					hasMutations = true
 					results = append(results, TxnResult{KV: prev, Ok: true})
+
+				default:
+					return fmt.Errorf("unknown TxnOpType: %d", op.Type)
 				}
 			}
 			return nil
@@ -743,12 +746,15 @@ func (s *Store) AtomicTxn(
 	if txnErr != nil {
 		return false, nil, 0, txnErr
 	}
-	commitRev = tsToRev(resp.CommitTs)
-	// Only update revision and notify watchers if mutations were actually written.
-	// A read-only or failed-compare txn must not create phantom revisions.
-	if hasMutations && commitRev > 0 {
-		metrics.CurrentRevision.Set(float64(commitRev))
-		s.watcher.notify(commitRev)
+	if hasMutations {
+		commitRev = tsToRev(resp.CommitTs)
+		if commitRev > 0 {
+			metrics.CurrentRevision.Set(float64(commitRev))
+			s.watcher.notify(commitRev)
+		}
+	} else {
+		// No mutations — return current revision without creating a phantom entry.
+		commitRev, _ = s.CurrentRevision(ctx)
 	}
 	return succeeded, results, commitRev, nil
 }

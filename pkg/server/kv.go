@@ -223,21 +223,26 @@ func (k *KVServer) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdse
 			switch v := op.Request.(type) {
 			case *etcdserverpb.RequestOp_RequestRange:
 				rr := v.RequestRange
-				// Range scans, historical reads, and count-only are not supported
-				// inside an atomic Txn — only single-key current-value Gets.
 				if len(rr.RangeEnd) > 0 {
 					return nil, status.Error(codes.Unimplemented, "Txn range scan not supported in atomic mode")
 				}
 				if rr.Revision != 0 {
 					return nil, status.Error(codes.Unimplemented, "Txn historical read not supported in atomic mode")
 				}
+				if rr.CountOnly || rr.KeysOnly || rr.Limit != 0 {
+					return nil, status.Error(codes.Unimplemented, "Txn CountOnly/KeysOnly/Limit not supported in atomic mode")
+				}
 				result = append(result, store.TxnOp{Type: store.TxnOpGet, Key: string(rr.Key)})
 			case *etcdserverpb.RequestOp_RequestPut:
+				pr := v.RequestPut
+				if pr.IgnoreValue || pr.IgnoreLease {
+					return nil, status.Error(codes.Unimplemented, "Txn IgnoreValue/IgnoreLease not supported in atomic mode")
+				}
 				result = append(result, store.TxnOp{
 					Type:    store.TxnOpPut,
-					Key:     string(v.RequestPut.Key),
-					Value:   v.RequestPut.Value,
-					LeaseID: v.RequestPut.Lease,
+					Key:     string(pr.Key),
+					Value:   pr.Value,
+					LeaseID: pr.Lease,
 				})
 			case *etcdserverpb.RequestOp_RequestDeleteRange:
 				dr := v.RequestDeleteRange
@@ -264,6 +269,11 @@ func (k *KVServer) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdse
 	succeeded, results, commitRev, err := k.store.AtomicTxn(ctx, compares, successOps, failureOps)
 	if err != nil {
 		return nil, toGRPCErr(err)
+	}
+
+	// Ensure commitRev is set before building response headers.
+	if commitRev == 0 {
+		commitRev, _ = k.store.CurrentRevision(ctx)
 	}
 
 	// Build gRPC responses from TxnResults.
@@ -307,10 +317,6 @@ func (k *KVServer) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdse
 				Response: &etcdserverpb.ResponseOp_ResponseDeleteRange{ResponseDeleteRange: dresp},
 			})
 		}
-	}
-
-	if commitRev == 0 {
-		commitRev, _ = k.store.CurrentRevision(ctx)
 	}
 
 	return &etcdserverpb.TxnResponse{

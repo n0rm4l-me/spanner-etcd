@@ -20,7 +20,7 @@ func TestTxn_Atomic_ConcurrentCreate(t *testing.T) {
 
 	const key = "/atomic/leader"
 	const iterations = 20
-	var wins, losses int
+	var wins int
 	var mu sync.Mutex
 
 	for i := 0; i < iterations; i++ {
@@ -68,10 +68,8 @@ func TestTxn_Atomic_ConcurrentCreate(t *testing.T) {
 		if successCount == 1 {
 			wins++
 		} else if successCount == 2 {
-			// Both succeeded — atomicity violated
 			t.Errorf("iteration %d: both concurrent Txn calls succeeded — atomicity broken", i)
 		}
-		losses++
 		mu.Unlock()
 	}
 	t.Logf("ran %d iterations, %d clean races detected", iterations, wins)
