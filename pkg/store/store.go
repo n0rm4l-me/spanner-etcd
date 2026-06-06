@@ -527,7 +527,10 @@ func (s *Store) Compact(ctx context.Context, targetRev int64) (int64, error) {
 		}
 		if err == nil {
 			var existing time.Time
-			if scanErr := row.Column(0, &existing); scanErr == nil && !existing.Before(targetTS) {
+			if scanErr := row.Column(0, &existing); scanErr != nil {
+				return fmt.Errorf("decode existing compact rev: %w", scanErr)
+			}
+			if !existing.Before(targetTS) {
 				return nil // already at or beyond targetRev
 			}
 		}
@@ -561,7 +564,8 @@ func (s *Store) Compact(ctx context.Context, targetRev int64) (int64, error) {
 		if total > 0 {
 			s.log.Info("compacted old revisions",
 				zap.Int("deleted", total),
-				zap.Int64("target_rev", targetRev),
+				zap.Int64("requested_rev", targetRev),
+				zap.Int64("effective_rev", effectiveRev),
 				zap.Duration("duration", dur))
 		}
 	}()
@@ -702,10 +706,11 @@ func (s *Store) autoCompactLoop(ctx context.Context) {
 				}
 				if err == nil {
 					var existing time.Time
-					if scanErr := row.Column(0, &existing); scanErr == nil {
-						if !existing.Before(targetTS) {
-							return nil // existing compact rev is already >= target, skip
-						}
+					if scanErr := row.Column(0, &existing); scanErr != nil {
+						return fmt.Errorf("decode existing compact rev: %w", scanErr)
+					}
+					if !existing.Before(targetTS) {
+						return nil // existing compact rev is already >= target, skip
 					}
 				}
 				return txn.BufferWrite([]*spanner.Mutation{
@@ -719,9 +724,11 @@ func (s *Store) autoCompactLoop(ctx context.Context) {
 				continue
 			}
 
+			runCtx, runCancel := context.WithTimeout(ctx, 30*time.Minute)
 			t0 := time.Now()
-			total := s.compactRows(ctx, targetRev)
+			total := s.compactRows(runCtx, targetRev)
 			dur := time.Since(t0)
+			runCancel()
 			metrics.CompactedRowsTotal.WithLabelValues("auto").Add(float64(total))
 			metrics.CompactionDuration.WithLabelValues("auto").Observe(dur.Seconds())
 			if total > 0 {

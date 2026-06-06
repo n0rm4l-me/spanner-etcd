@@ -191,18 +191,22 @@ func parseFlags() appConfig {
 			val := strings.TrimPrefix(arg, "--auto-compact-interval=")
 			if val == "0" || val == "off" || val == "disable" {
 				cfg.autoCompactInterval = -1 // sentinel: disabled
-			} else if d, err := time.ParseDuration(val); err == nil {
-				if d == 0 {
-					cfg.autoCompactInterval = -1 // "0s" also disables
-				} else {
-					cfg.autoCompactInterval = d
-				}
+			} else if d, err := time.ParseDuration(val); err != nil {
+				fmt.Fprintf(os.Stderr, "error: invalid --auto-compact-interval=%q: %v\n", val, err)
+				os.Exit(1)
+			} else if d == 0 {
+				cfg.autoCompactInterval = -1 // "0s" also disables
+			} else {
+				cfg.autoCompactInterval = d
 			}
 		case strings.HasPrefix(arg, "--auto-compact-age="):
-			d, err := time.ParseDuration(strings.TrimPrefix(arg, "--auto-compact-age="))
-			if err == nil {
-				cfg.autoCompactAge = d
+			val := strings.TrimPrefix(arg, "--auto-compact-age=")
+			d, err := time.ParseDuration(val)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: invalid --auto-compact-age=%q: %v\n", val, err)
+				os.Exit(1)
 			}
+			cfg.autoCompactAge = d
 		}
 		_ = i
 	}
