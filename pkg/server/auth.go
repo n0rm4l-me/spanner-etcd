@@ -89,7 +89,12 @@ func (a *AuthServer) gcLoop() {
 }
 
 func (a *AuthServer) close() {
-	close(a.stopCh)
+	select {
+	case <-a.stopCh:
+		// already closed — idempotent
+	default:
+		close(a.stopCh)
+	}
 }
 
 // Authenticate validates credentials and returns a token.

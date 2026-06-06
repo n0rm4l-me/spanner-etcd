@@ -544,7 +544,10 @@ func (s *Store) After(ctx context.Context, prefix string, afterRev, limit int64)
 		if cerr != nil {
 			return 0, nil, fmt.Errorf("get compact revision: %w", cerr)
 		}
-		if afterRev < compactRev {
+		// afterRev is exclusive (returns rev > afterRev), so the effective start
+		// revision is afterRev+1. Only return ErrCompacted when that start
+		// revision is below the compact horizon.
+		if afterRev+1 < compactRev {
 			return currentRev, nil, ErrCompacted
 		}
 	}

@@ -42,11 +42,12 @@ func (w *WatchServer) Watch(stream etcdserverpb.Watch_WatchServer) error {
 	// Responses from per-watch goroutines are merged here.
 	respCh := make(chan *etcdserverpb.WatchResponse, 64)
 
-	// cancelledCh carries watch IDs cancelled by the store layer (sentinel path)
-	// so the receive loop can remove them from the watches map.
-	cancelledCh := make(chan int64, 16)
+	// cancelledCh carries watch IDs cancelled by the store layer (sentinel path).
+	// Unbuffered so senders block until the receive loop drains it — this
+	// guarantees no IDs are dropped even when stream.Recv() is blocking.
+	cancelledCh := make(chan int64)
 
-	// Send loop — runs in this goroutine.
+	// Send loop — runs in its own goroutine.
 	go func() {
 		for {
 			select {
@@ -63,20 +64,24 @@ func (w *WatchServer) Watch(stream etcdserverpb.Watch_WatchServer) error {
 		}
 	}()
 
-	// Receive loop.
-	for {
-		req, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			if status.Code(err) == codes.Canceled {
-				break
+	// reqCh merges stream.Recv() results with store-side cancellations so the
+	// receive loop never misses a cancelled watch while blocked on Recv().
+	type recvResult struct {
+		req *etcdserverpb.WatchRequest
+		err error
+	}
+	reqCh := make(chan recvResult, 1)
+	go func() {
+		for {
+			req, err := stream.Recv()
+			reqCh <- recvResult{req, err}
+			if err != nil {
+				return
 			}
-			return err
 		}
+	}()
 
-		// Drain any store-cancelled watch IDs before processing the next request.
+	drainCancelled := func() {
 		for {
 			select {
 			case id := <-cancelledCh:
@@ -85,43 +90,68 @@ func (w *WatchServer) Watch(stream etcdserverpb.Watch_WatchServer) error {
 					delete(watches, id)
 				}
 			default:
-				goto doneCancel
+				return
 			}
 		}
-	doneCancel:
+	}
 
-		switch v := req.RequestUnion.(type) {
-		case *etcdserverpb.WatchRequest_CreateRequest:
-			cr := v.CreateRequest
-			id := nextID
-			nextID++
-
-			key := string(cr.Key)
-			prefix := watchPrefix(key, string(cr.RangeEnd))
-			startRev := cr.StartRevision
-
-			watchCtx, cancel := contextWithCancel(ctx)
-			watches[id] = cancel
-
-			// Send initial confirmation.
-			respCh <- &etcdserverpb.WatchResponse{
-				Header:  header(0),
-				WatchId: id,
-				Created: true,
-			}
-
-			go w.watchLoop(watchCtx, id, prefix, startRev, respCh, cancelledCh)
-
-		case *etcdserverpb.WatchRequest_CancelRequest:
-			id := v.CancelRequest.WatchId
+	// Receive loop — selects across incoming requests AND store cancellations.
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			break loop
+		case id := <-cancelledCh:
 			if cancel, ok := watches[id]; ok {
 				cancel()
 				delete(watches, id)
 			}
-			respCh <- &etcdserverpb.WatchResponse{
-				Header:   header(0),
-				WatchId:  id,
-				Canceled: true,
+		case rr := <-reqCh:
+			req, err := rr.req, rr.err
+			if err == io.EOF {
+				break loop
+			}
+			if err != nil {
+				if status.Code(err) == codes.Canceled {
+					break loop
+				}
+				return err
+			}
+
+			drainCancelled()
+
+			switch v := req.RequestUnion.(type) {
+			case *etcdserverpb.WatchRequest_CreateRequest:
+				cr := v.CreateRequest
+				id := nextID
+				nextID++
+
+				key := string(cr.Key)
+				prefix := watchPrefix(key, string(cr.RangeEnd))
+				startRev := cr.StartRevision
+
+				watchCtx, cancel := contextWithCancel(ctx)
+				watches[id] = cancel
+
+				respCh <- &etcdserverpb.WatchResponse{
+					Header:  header(0),
+					WatchId: id,
+					Created: true,
+				}
+
+				go w.watchLoop(watchCtx, id, prefix, startRev, respCh, cancelledCh)
+
+			case *etcdserverpb.WatchRequest_CancelRequest:
+				id := v.CancelRequest.WatchId
+				if cancel, ok := watches[id]; ok {
+					cancel()
+					delete(watches, id)
+				}
+				respCh <- &etcdserverpb.WatchResponse{
+					Header:   header(0),
+					WatchId:  id,
+					Canceled: true,
+				}
 			}
 		}
 	}
