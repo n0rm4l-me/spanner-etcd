@@ -249,12 +249,11 @@ func (w *WatchServer) watchLoop(
 				case <-stdCtx.Done():
 				}
 				// Signal the receive loop to remove this watch ID from the map.
-				// Non-blocking send into the buffered channel — if it's full the
-				// receive loop is draining it; the entry will be cleaned up when
-				// the stream ends via the cancel-all-watches loop anyway.
+				// Block until delivered or the stream context is done — ensures
+				// cleanup is never silently lost even under cancellation bursts.
 				select {
 				case cancelledCh <- watchID:
-				default:
+				case <-stdCtx.Done():
 				}
 				return
 			}
