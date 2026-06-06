@@ -190,6 +190,15 @@ func (s *Store) Get(ctx context.Context, key string, revision int64) (currentRev
 	if err != nil {
 		return 0, nil, err
 	}
+	if revision > 0 {
+		compactRev, cerr := s.compactRevision(ctx)
+		if cerr != nil {
+			return 0, nil, fmt.Errorf("get compact revision: %w", cerr)
+		}
+		if compactRev > 1 && revision <= compactRev {
+			return currentRev, nil, ErrCompacted
+		}
+	}
 
 	capTS := revToTS(revCap(revision, currentRev))
 	stmt := spanner.Statement{
@@ -259,6 +268,9 @@ func (s *Store) List(ctx context.Context, prefix, startKey string, limit, revisi
 	if err != nil {
 		return 0, 0, nil, err
 	}
+	if compactRev > 1 && revision > 0 && revision <= compactRev {
+		return currentRev, compactRev, nil, ErrCompacted
+	}
 
 	iter := s.client.Single().Query(ctx, stmt)
 	defer iter.Stop()
@@ -287,6 +299,15 @@ func (s *Store) Count(ctx context.Context, prefix, startKey string, revision int
 	if err != nil {
 		return 0, 0, err
 	}
+	if revision > 0 {
+		compactRev, cerr := s.compactRevision(ctx)
+		if cerr != nil {
+			return 0, 0, fmt.Errorf("get compact revision: %w", cerr)
+		}
+		if compactRev > 1 && revision <= compactRev {
+			return currentRev, 0, ErrCompacted
+		}
+	}
 	capTS := revToTS(revCap(revision, currentRev))
 
 	stmt := spanner.Statement{
@@ -306,7 +327,9 @@ func (s *Store) Count(ctx context.Context, prefix, startKey string, revision int
 		},
 	}
 
-	row, err := s.client.Single().Query(ctx, stmt).Next()
+	iter := s.client.Single().Query(ctx, stmt)
+	defer iter.Stop()
+	row, err := iter.Next()
 	if err != nil {
 		return 0, 0, fmt.Errorf("count %s: %w", prefix, err)
 	}
@@ -417,6 +440,43 @@ func (s *Store) Update(ctx context.Context, key string, value []byte, revision, 
 	return rev, prev, true, nil
 }
 
+// DeleteIfLease removes key only if its current row's lease_id matches leaseID.
+// Returns (true, nil) if the tombstone was written, (false, nil) if the key
+// was missing or belonged to a different lease, and (false, err) on failure.
+// The lease_id check and the tombstone write are atomic in one Spanner RW txn.
+func (s *Store) DeleteIfLease(ctx context.Context, key string, leaseID int64) (deleted bool, err error) {
+	_, err = s.client.ReadWriteTransactionWithOptions(ctx,
+		func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			prev, err := s.getLatestTxn(ctx, txn, key)
+			if err != nil {
+				return err
+			}
+			if prev == nil || prev.LeaseID != leaseID {
+				// Key gone or reassigned to a different lease — nothing to do.
+				deleted = false
+				return nil
+			}
+			deleted = true
+			return txn.BufferWrite([]*spanner.Mutation{
+				spanner.Insert("kv",
+					[]string{"rev", "key", "value", "old_value", "lease_id",
+						"deleted", "created", "create_revision", "prev_revision"},
+					[]interface{}{
+						spanner.CommitTimestamp,
+						key, []byte(nil), prev.Value, int64(0),
+						true, false,
+						revToTS(prev.CreateRevision),
+						revToTS(prev.Rev),
+					},
+				),
+			})
+		}, spanner.TransactionOptions{})
+	if err != nil {
+		return false, err
+	}
+	return deleted, nil
+}
+
 // Delete removes key at the given revision (CAS). revision=0 = unconditional.
 func (s *Store) Delete(ctx context.Context, key string, revision int64) (int64, *KV, bool, error) {
 	var commitTS time.Time
@@ -476,6 +536,21 @@ func (s *Store) After(ctx context.Context, prefix string, afterRev, limit int64)
 	currentRev, err := s.CurrentRevision(ctx)
 	if err != nil {
 		return 0, nil, err
+	}
+	// afterRev=0 means "from beginning" — used by the poll loop, not for client replay.
+	// Only check compaction for explicit client-supplied revisions.
+	if afterRev > 0 {
+		compactRev, cerr := s.compactRevision(ctx)
+		if cerr != nil {
+			return 0, nil, fmt.Errorf("get compact revision: %w", cerr)
+		}
+		// afterRev is exclusive (returns rev > afterRev). etcd compaction is
+		// inclusive: reads at compactRev itself are disallowed. So we error when
+		// afterRev < compactRev (meaning the first possible event is at or below
+		// the compact horizon).
+		if afterRev < compactRev {
+			return currentRev, nil, ErrCompacted
+		}
 	}
 
 	afterTS := revToTS(afterRev)

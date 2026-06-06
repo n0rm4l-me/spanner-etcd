@@ -114,14 +114,25 @@ func (r *ChangeStreamReader) Start(ctx context.Context) error {
 		zap.Time("start", startTime),
 	)
 
-	for _, p := range initialPartitions {
-		if resume, ok := cursors[p.token]; ok {
-			p.resumeTimestamp = resume
-		} else {
-			p.resumeTimestamp = startTime
+	// Enqueue initial partitions in a separate goroutine so the consumer select
+	// loop below can start immediately. Without this, if len(initialPartitions) > 64
+	// (partitionWorkersBuf), the blocking send deadlocks Start() forever.
+	go func() {
+		for _, p := range initialPartitions {
+			if resume, ok := cursors[p.token]; ok {
+				p.resumeTimestamp = resume
+			} else {
+				p.resumeTimestamp = startTime
+			}
+			select {
+			case r.pending <- p:
+			case <-ctx.Done():
+				return
+			case <-r.stopCh:
+				return
+			}
 		}
-		r.pending <- p
-	}
+	}()
 
 	var wg sync.WaitGroup
 	for {
@@ -249,6 +260,8 @@ func (r *ChangeStreamReader) streamPartition(ctx context.Context, p *partitionSt
 			case r.pending <- child:
 				r.log.Debug("queued child partition", zap.String("token", shortToken(child.token)))
 			case <-ctx.Done():
+				return true, nil
+			case <-r.stopCh:
 				return true, nil
 			}
 		}

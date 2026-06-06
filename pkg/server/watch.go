@@ -42,7 +42,18 @@ func (w *WatchServer) Watch(stream etcdserverpb.Watch_WatchServer) error {
 	// Responses from per-watch goroutines are merged here.
 	respCh := make(chan *etcdserverpb.WatchResponse, 64)
 
-	// Send loop — runs in this goroutine.
+	// cancelledCh carries watch IDs cancelled by the store layer (sentinel path).
+	// Buffered to absorb bursts; senders use a non-blocking send so they never
+	// block regardless of how many concurrent watches a client creates.
+	// Entries not drained during the stream are cleaned up by the cancel-all loop.
+	cancelledCh := make(chan int64, 64)
+
+	// sendErrCh receives the first stream.Send error so the main loop can exit
+	// and propagate non-cancel failures to the caller.
+	sendErrCh := make(chan error, 1)
+	var sendErr error
+
+	// Send loop — runs in its own goroutine.
 	go func() {
 		for {
 			select {
@@ -53,57 +64,125 @@ func (w *WatchServer) Watch(stream etcdserverpb.Watch_WatchServer) error {
 					return
 				}
 				if err := stream.Send(resp); err != nil {
+					select {
+					case sendErrCh <- err:
+					default:
+					}
 					return
 				}
 			}
 		}
 	}()
 
-	// Receive loop.
+	// reqCh merges stream.Recv() results with store-side cancellations so the
+	// receive loop never misses a cancelled watch while blocked on Recv().
+	type recvResult struct {
+		req *etcdserverpb.WatchRequest
+		err error
+	}
+	reqCh := make(chan recvResult, 1)
+	go func() {
+		for {
+			req, err := stream.Recv()
+			select {
+			case reqCh <- recvResult{req, err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	drainCancelled := func() {
+		for {
+			select {
+			case id := <-cancelledCh:
+				if cancel, ok := watches[id]; ok {
+					cancel()
+					delete(watches, id)
+				}
+			default:
+				return
+			}
+		}
+	}
+
+	// Receive loop — selects across incoming requests AND store cancellations.
+loop:
 	for {
-		req, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			if status.Code(err) == codes.Canceled {
-				break
-			}
-			return err
-		}
-
-		switch v := req.RequestUnion.(type) {
-		case *etcdserverpb.WatchRequest_CreateRequest:
-			cr := v.CreateRequest
-			id := nextID
-			nextID++
-
-			key := string(cr.Key)
-			prefix := watchPrefix(key, string(cr.RangeEnd))
-			startRev := cr.StartRevision
-
-			watchCtx, cancel := contextWithCancel(ctx)
-			watches[id] = cancel
-
-			// Send initial confirmation.
-			respCh <- &etcdserverpb.WatchResponse{
-				Header:  header(0),
-				WatchId: id,
-				Created: true,
-			}
-
-			go w.watchLoop(watchCtx, id, prefix, startRev, respCh)
-
-		case *etcdserverpb.WatchRequest_CancelRequest:
-			id := v.CancelRequest.WatchId
+		select {
+		case <-ctx.Done():
+			break loop
+		case err := <-sendErrCh:
+			sendErr = err
+			break loop
+		case id := <-cancelledCh:
 			if cancel, ok := watches[id]; ok {
 				cancel()
 				delete(watches, id)
 			}
-			respCh <- &etcdserverpb.WatchResponse{
-				Header:   header(0),
-				WatchId:  id,
-				Canceled: true,
+		case rr := <-reqCh:
+			req, err := rr.req, rr.err
+			if err == io.EOF {
+				break loop
+			}
+			if err != nil {
+				if status.Code(err) == codes.Canceled {
+					break loop
+				}
+				return err
+			}
+
+			drainCancelled()
+
+			switch v := req.RequestUnion.(type) {
+			case *etcdserverpb.WatchRequest_CreateRequest:
+				cr := v.CreateRequest
+				id := nextID
+				nextID++
+
+				key := string(cr.Key)
+				prefix := watchPrefix(key, string(cr.RangeEnd))
+				startRev := cr.StartRevision
+
+				watchCtx, cancel := contextWithCancel(ctx)
+				watches[id] = cancel
+
+				select {
+				case respCh <- &etcdserverpb.WatchResponse{
+					Header:  header(0),
+					WatchId: id,
+					Created: true,
+				}:
+				case <-ctx.Done():
+					break loop
+				case err := <-sendErrCh:
+					sendErr = err
+					break loop
+				}
+
+				go w.watchLoop(watchCtx, id, prefix, startRev, respCh, cancelledCh)
+
+			case *etcdserverpb.WatchRequest_CancelRequest:
+				id := v.CancelRequest.WatchId
+				if cancel, ok := watches[id]; ok {
+					cancel()
+					delete(watches, id)
+				}
+				select {
+				case respCh <- &etcdserverpb.WatchResponse{
+					Header:   header(0),
+					WatchId:  id,
+					Canceled: true,
+				}:
+				case <-ctx.Done():
+					break loop
+				case err := <-sendErrCh:
+					sendErr = err
+					break loop
+				}
 			}
 		}
 	}
@@ -111,6 +190,9 @@ func (w *WatchServer) Watch(stream etcdserverpb.Watch_WatchServer) error {
 	// Cancel all open watches.
 	for _, cancel := range watches {
 		cancel()
+	}
+	if sendErr != nil && status.Code(sendErr) != codes.Canceled {
+		return sendErr
 	}
 	return nil
 }
@@ -122,6 +204,7 @@ func (w *WatchServer) watchLoop(
 	prefix string,
 	startRev int64,
 	respCh chan<- *etcdserverpb.WatchResponse,
+	cancelledCh chan<- int64,
 ) {
 	// Use a background-cancelled context.
 	goctx, ok := ctx.(interface {
@@ -148,8 +231,30 @@ func (w *WatchServer) watchLoop(
 		select {
 		case <-stdCtx.Done():
 			return
-		case events, ok := <-eventCh:
-			if !ok {
+		case events := <-eventCh:
+			// closedSentinel (empty non-nil slice) signals the subscription was
+			// torn down by the store layer (channel overflow, compaction, or
+			// other internal error). Notify the client and clean up the watches map.
+			if len(events) == 0 {
+				// Include CompactRevision so etcd clients know the minimum safe
+				// revision they can resume from after this cancellation.
+				compactRev, _ := w.store.CompactRevision(stdCtx)
+				select {
+				case respCh <- &etcdserverpb.WatchResponse{
+					Header:          header(0),
+					WatchId:         watchID,
+					Canceled:        true,
+					CompactRevision: compactRev,
+				}:
+				case <-stdCtx.Done():
+				}
+				// Non-blocking send — never blocks regardless of how many concurrent
+				// watches exist. Any unsent IDs are cleaned up by the cancel-all loop
+				// when the stream ends.
+				select {
+				case cancelledCh <- watchID:
+				default:
+				}
 				return
 			}
 			var pbEvents []*mvccpb.Event
@@ -161,16 +266,24 @@ func (w *WatchServer) watchLoop(
 					maxRev = ev.KV.Rev
 				}
 			}
-			respCh <- &etcdserverpb.WatchResponse{
+			select {
+			case respCh <- &etcdserverpb.WatchResponse{
 				Header:  header(maxRev),
 				WatchId: watchID,
 				Events:  pbEvents,
+			}:
+			case <-stdCtx.Done():
+				return
 			}
 		case <-progressTicker.C:
 			curRev, _ := w.store.CurrentRevision(stdCtx)
-			respCh <- &etcdserverpb.WatchResponse{
+			select {
+			case respCh <- &etcdserverpb.WatchResponse{
 				Header:  header(curRev),
 				WatchId: watchID,
+			}:
+			case <-stdCtx.Done():
+				return
 			}
 		}
 	}

@@ -38,6 +38,11 @@ import (
 	"github.com/n0rm4l-me/spanner-etcd/pkg/metrics"
 )
 
+// closedSentinel is sent on sub.ch when the subscription is being torn down.
+// It signals watchLoop to emit a Canceled WatchResponse before returning.
+// Using a sentinel avoids sending to a closed channel (which panics).
+var closedSentinel = []*Event{}
+
 const (
 	pollInterval      = time.Second
 	pollSlowInterval  = 30 * time.Second // heartbeat poll when CS is healthy
@@ -51,6 +56,7 @@ type subscriber struct {
 	prefix string
 	ch     chan []*Event
 	cancel context.CancelFunc
+	closed atomic.Bool // guards against sending to ch after closedSentinel
 }
 
 // Watcher orchestrates event delivery to Watch subscribers.
@@ -105,7 +111,9 @@ func (w *Watcher) notify(rev int64) {
 }
 
 // subscribe returns a channel that delivers events for prefix, starting after afterRev.
-// The caller should drain the channel and stop when it is closed.
+// The channel is never closed — teardown is signalled by sending closedSentinel
+// (an empty non-nil []*Event slice). Callers must select on both the channel and
+// their own context/done signal rather than using for-range semantics.
 func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) <-chan []*Event {
 	subCtx, cancel := context.WithCancel(ctx)
 	sub := &subscriber{
@@ -120,11 +128,30 @@ func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) 
 	metrics.ActiveWatches.Inc()
 
 	// Replay existing events from afterRev before switching to the live feed.
-	// Use bgCtx so the query isn't cancelled when the gRPC request context ends.
 	go func() {
 		defer func() {
+			// Mark closed BEFORE removeSub so dispatchEvents stops enqueueing
+			// new items immediately — no window between removal and closed flag.
+			sub.closed.Store(true)
 			w.removeSub(sub)
-			close(sub.ch)
+			// Drain ALL buffered event batches first so the sentinel is the very
+			// next item watchLoop receives — it must not be queued behind stale
+			// events that should no longer be delivered after cancellation.
+			for {
+				select {
+				case <-sub.ch:
+				default:
+					goto sendSentinel
+				}
+			}
+		sendSentinel:
+			// The channel was just drained and closed=true prevents new sends,
+			// so the sentinel should fit immediately. Use a short timeout as a
+			// safety net against any race rather than blocking indefinitely.
+			select {
+			case sub.ch <- closedSentinel:
+			case <-time.After(100 * time.Millisecond):
+			}
 		}()
 
 		// afterRev=0 means "live watch from now" — no replay needed.
@@ -134,16 +161,41 @@ func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) 
 			<-subCtx.Done()
 			return
 		}
-		_, events, err := w.store.After(w.store.bgCtx, prefix, afterRev-1, pollBatchSize)
-		if err != nil {
-			w.log.Warn("watch replay error", zap.String("prefix", prefix), zap.Error(err))
+
+		// Check compaction before starting replay. afterRev-1 can be 0 when
+		// afterRev=1 (epoch), which bypasses the afterRev>0 guard in After().
+		// Explicitly check the compaction horizon here to avoid silent empty replay.
+		if compactRev, cerr := w.store.compactRevision(subCtx); cerr != nil {
+			w.log.Warn("watch replay: failed to read compact revision, cancelling watch",
+				zap.String("prefix", prefix), zap.Error(cerr))
+			return
+		} else if compactRev > 1 && afterRev <= compactRev {
+			w.log.Warn("watch replay: startRevision already compacted",
+				zap.Int64("start_rev", afterRev), zap.Int64("compact_rev", compactRev))
 			return
 		}
-		if len(events) > 0 {
-			select {
-			case sub.ch <- events:
-			case <-subCtx.Done():
+
+		// Paginate replay until we have delivered all historical events.
+		// A single batch is limited to pollBatchSize — loop until a partial
+		// batch signals there are no more pages.
+		replayRev := afterRev - 1
+		for {
+			_, events, err := w.store.After(subCtx, prefix, replayRev, pollBatchSize)
+			if err != nil {
+				w.log.Warn("watch replay error", zap.String("prefix", prefix), zap.Error(err))
 				return
+			}
+			if len(events) > 0 {
+				select {
+				case sub.ch <- events:
+				case <-subCtx.Done():
+					return
+				}
+				replayRev = events[len(events)-1].KV.Rev
+			}
+			// Fewer than a full batch means we have caught up.
+			if int64(len(events)) < pollBatchSize {
+				break
 			}
 		}
 		<-subCtx.Done()
@@ -195,10 +247,16 @@ func (w *Watcher) dispatchEvents(events []*Event) {
 		if len(matching) == 0 {
 			continue
 		}
+		// Skip already-closed subscribers (closed.Store happens before sentinel send).
+		if sub.closed.Load() {
+			continue
+		}
 		select {
 		case sub.ch <- matching:
 		default:
-			// Channel full — drop subscription (etcd semantics: client reconnects).
+			// Channel full — cancel subscription (etcd semantics: client must reconnect).
+			// Do NOT close sub.ch here — the channel is never closed; the subscriber
+			// goroutine sends closedSentinel when it exits, preventing a closed-channel panic.
 			w.log.Warn("subscriber channel full, closing watch",
 				zap.String("prefix", sub.prefix))
 			metrics.WatchSubscriberDropsTotal.Inc()
@@ -243,6 +301,13 @@ func (w *Watcher) pollLoop(ctx context.Context) {
 func (w *Watcher) doPoll(ctx context.Context, lastRev int64) int64 {
 	curRev, events, err := w.store.After(ctx, "", lastRev, pollBatchSize)
 	if err != nil {
+		// ErrCompacted means lastRev was compacted away. After() already returns
+		// curRev even on error, so use it directly — no extra Spanner round-trip.
+		if err == ErrCompacted {
+			w.log.Warn("poll: revision compacted, advancing to current",
+				zap.Int64("old_rev", lastRev), zap.Int64("new_rev", curRev))
+			return curRev
+		}
 		w.log.Warn("poll error", zap.Error(err))
 		return lastRev
 	}
