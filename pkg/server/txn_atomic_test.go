@@ -9,6 +9,7 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
+
 // TestTxn_Atomic_ConcurrentCreate verifies that two concurrent
 // Txn{Compare(version=0), Then[Put]} calls on the same key cannot both
 // succeed — the loser must get Succeeded=false.
@@ -21,7 +22,6 @@ func TestTxn_Atomic_ConcurrentCreate(t *testing.T) {
 	const key = "/atomic/leader"
 	const iterations = 20
 	var wins int
-	var mu sync.Mutex
 
 	for i := 0; i < iterations; i++ {
 		if _, err := cli.Delete(ctx, key); err != nil {
@@ -63,7 +63,6 @@ func TestTxn_Atomic_ConcurrentCreate(t *testing.T) {
 			}
 		}
 
-		mu.Lock()
 		switch successCount {
 		case 1:
 			wins++
@@ -72,7 +71,6 @@ func TestTxn_Atomic_ConcurrentCreate(t *testing.T) {
 		case 2:
 			t.Errorf("iteration %d: both Txn calls succeeded — atomicity broken", i)
 		}
-		mu.Unlock()
 	}
 	t.Logf("ran %d iterations, %d clean races detected", iterations, wins)
 }
