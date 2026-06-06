@@ -91,10 +91,8 @@ func (lm *LeaseManager) Grant(ctx context.Context, ttl int64) (*Lease, error) {
 // The lease is removed from the in-memory map only after expireLeaseKeys
 // succeeds — if the key deletion fails transiently, the lease remains in
 // memory so scheduleExpiry can retry and the gcLoop can reload it on restart.
-func (lm *LeaseManager) Revoke(_ context.Context, id int64) error {
-	// Always uses lm.bgCtx — request context is intentionally ignored so expiry
-	// completes even when the gRPC request context is cancelled.
-	if err := lm.expireLeaseKeys(lm.bgCtx, id); err != nil {
+func (lm *LeaseManager) Revoke(ctx context.Context, id int64) error {
+	if err := lm.expireLeaseKeys(ctx, id); err != nil {
 		return err
 	}
 

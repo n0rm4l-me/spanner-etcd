@@ -145,12 +145,12 @@ func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) 
 				}
 			}
 		sendSentinel:
-			// Non-blocking: if dispatchEvents refilled the channel after draining,
-			// the sentinel may not fit. That's acceptable — watchLoop will exit
-			// via stdCtx.Done() when the stream ends anyway.
+			// The channel was just drained and closed=true prevents new sends,
+			// so the sentinel should fit immediately. Use a short timeout as a
+			// safety net against any race rather than blocking indefinitely.
 			select {
 			case sub.ch <- closedSentinel:
-			default:
+			case <-time.After(100 * time.Millisecond):
 			}
 		}()
 
