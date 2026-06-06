@@ -77,10 +77,10 @@ const (
 // StoreConfig holds optional tuning parameters for the Store.
 type StoreConfig struct {
 	// AutoCompactInterval controls how often the background compaction loop runs.
-	// 0 disables auto-compaction (rely on explicit Compact calls from kube-apiserver).
+	// 0 uses DefaultAutoCompactInterval. Use -1 to disable auto-compaction entirely.
 	AutoCompactInterval time.Duration
 	// AutoCompactAge controls how far behind current revision to compact.
-	// Keeps this much history for Watch replay. 0 = DefaultAutoCompactAge.
+	// Keeps this much history for Watch replay. 0 uses DefaultAutoCompactAge.
 	AutoCompactAge time.Duration
 }
 
@@ -89,6 +89,7 @@ type Store struct {
 	client    *spanner.Client
 	log       *zap.Logger
 	bgCtx     context.Context
+	bgCancel  context.CancelFunc
 	cfg       StoreConfig
 	watcher   *Watcher
 	leasesMgr *LeaseManager
@@ -100,29 +101,35 @@ func New(ctx context.Context, client *spanner.Client, log *zap.Logger) (*Store, 
 }
 
 // NewWithConfig creates a Store with explicit tuning parameters.
+// Pass AutoCompactInterval = -1 to disable background auto-compaction.
 func NewWithConfig(ctx context.Context, client *spanner.Client, log *zap.Logger, cfg StoreConfig) (*Store, error) {
+	// -1 sentinel = disabled; 0 = use default.
 	if cfg.AutoCompactInterval == 0 {
 		cfg.AutoCompactInterval = DefaultAutoCompactInterval
 	}
 	if cfg.AutoCompactAge == 0 {
 		cfg.AutoCompactAge = DefaultAutoCompactAge
 	}
+
+	bgCtx, bgCancel := context.WithCancel(context.Background())
 	s := &Store{
-		client: client,
-		log:    log,
-		bgCtx:  ctx,
-		cfg:    cfg,
+		client:   client,
+		log:      log,
+		bgCtx:    bgCtx,
+		bgCancel: bgCancel,
+		cfg:      cfg,
 	}
 	s.watcher = newWatcher(ctx, s, log)
-	s.leasesMgr = newLeaseManager(ctx, s, log)
+	s.leasesMgr = newLeaseManager(bgCtx, s, log)
 	if cfg.AutoCompactInterval > 0 {
-		go s.autoCompactLoop(ctx)
+		go s.autoCompactLoop(bgCtx)
 	}
 	return s, nil
 }
 
 // Close shuts down background goroutines.
 func (s *Store) Close() {
+	s.bgCancel()
 	s.watcher.close()
 	s.leasesMgr.close()
 }
@@ -507,8 +514,10 @@ func (s *Store) Compact(ctx context.Context, targetRev int64) (int64, error) {
 	}
 
 	go func() {
+		ctx, cancel := context.WithTimeout(s.bgCtx, 30*time.Minute)
+		defer cancel()
 		t0 := time.Now()
-		total := s.compactRows(s.bgCtx, targetRev)
+		total := s.compactRows(ctx, targetRev)
 		dur := time.Since(t0)
 		metrics.CompactedRowsTotal.WithLabelValues("manual").Add(float64(total))
 		metrics.CompactionDuration.WithLabelValues("manual").Observe(dur.Seconds())
@@ -680,11 +689,21 @@ func (s *Store) compactRows(ctx context.Context, targetRev int64) int {
 }
 
 // scanCompactBatch fetches one batch of row IDs eligible for compaction.
+// A row is eligible if:
+//   - it is a tombstone (deleted=true), OR
+//   - it is a stale historical revision — i.e. there exists a newer row for the
+//     same key (the current row is never deleted, only its older siblings are).
 func (s *Store) scanCompactBatch(ctx context.Context, targetTS time.Time) ([]spanner.Key, error) {
 	stmt := spanner.Statement{
-		SQL: `SELECT id FROM kv
-		      WHERE rev <= @target
-		        AND (deleted = true OR prev_revision IS NOT NULL)
+		SQL: `SELECT kv.id FROM kv
+		      WHERE kv.rev <= @target
+		        AND (
+		          kv.deleted = true
+		          OR EXISTS (
+		            SELECT 1 FROM kv AS newer
+		            WHERE newer.key = kv.key AND newer.rev > kv.rev
+		          )
+		        )
 		      LIMIT @batch`,
 		Params: map[string]interface{}{
 			"target": targetTS,

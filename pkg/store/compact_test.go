@@ -28,35 +28,36 @@ func TestCompact_LargeVolume(t *testing.T) {
 		rev = newRev
 	}
 
-	// Get revision just before the last write — compact everything before it.
 	curRev, err := s.CurrentRevision(ctx)
 	if err != nil {
 		t.Fatalf("current revision: %v", err)
 	}
+	// targetRev is the revision just before the last write — all prior rows are stale.
+	targetRev := rev - 1
 
-	t.Logf("compacting %d stale rows at targetRev=%d", n-1, curRev-1)
+	t.Logf("compacting %d stale rows at targetRev=%d (curRev=%d)", n-1, targetRev, curRev)
 	start := time.Now()
-	if _, err := s.Compact(ctx, curRev-1); err != nil {
+	if _, err := s.Compact(ctx, targetRev); err != nil {
 		t.Fatalf("compact: %v", err)
 	}
 
-	// Compact runs async — wait for it to finish.
+	// Compact runs async — poll until the historical revision is no longer readable.
 	deadline := time.Now().Add(30 * time.Second)
-	var lastCount int
+	var compacted bool
 	for time.Now().Before(deadline) {
 		time.Sleep(500 * time.Millisecond)
-		_, _, kvs, err := s.List(ctx, "/compact/large", "/compact/large", curRev-1, 0)
-		if err != nil {
-			continue
-		}
-		lastCount = len(kvs)
-		if lastCount == 0 {
-			t.Logf("all stale rows deleted in %s", time.Since(start).Round(time.Millisecond))
+		_, kv, _ := s.Get(ctx, "/compact/large", targetRev)
+		if kv == nil {
+			compacted = true
+			t.Logf("historical revision compacted in %s", time.Since(start).Round(time.Millisecond))
 			break
 		}
 	}
+	if !compacted {
+		t.Fatal("historical revision still readable after compaction deadline")
+	}
 
-	// Verify current value still readable after compaction.
+	// Current value must still be readable.
 	_, kv, err := s.Get(ctx, "/compact/large", 0)
 	if err != nil || kv == nil {
 		t.Fatalf("current value missing after compaction: err=%v kv=%v", err, kv)
@@ -74,15 +75,33 @@ func TestCompact_DoesNotDeleteCurrentRevision(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	rev1, _ := s.Create(ctx, "/compact/cur/a", []byte("v1"), 0)
-	rev2, _, _, _ := s.Update(ctx, "/compact/cur/a", []byte("v2"), rev1, 0)
-	rev3, _, _, _ := s.Update(ctx, "/compact/cur/a", []byte("v3"), rev2, 0)
+	rev1, err := s.Create(ctx, "/compact/cur/a", []byte("v1"), 0)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	rev2, _, _, err := s.Update(ctx, "/compact/cur/a", []byte("v2"), rev1, 0)
+	if err != nil {
+		t.Fatalf("update to v2: %v", err)
+	}
+	rev3, _, _, err := s.Update(ctx, "/compact/cur/a", []byte("v3"), rev2, 0)
+	if err != nil {
+		t.Fatalf("update to v3: %v", err)
+	}
 
-	// Compact up to including rev2 — rev3 (current) must survive.
+	// Compact up to rev2 — rev3 (current) must survive.
 	if _, err := s.Compact(ctx, rev2); err != nil {
 		t.Fatalf("compact: %v", err)
 	}
-	time.Sleep(2 * time.Second)
+
+	// Poll until rev1 is gone (confirms compaction ran), then check rev3 is still alive.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(300 * time.Millisecond)
+		_, kv, _ := s.Get(ctx, "/compact/cur/a", rev1)
+		if kv == nil {
+			break // rev1 compacted — now verify current
+		}
+	}
 
 	_, kv, err := s.Get(ctx, "/compact/cur/a", 0)
 	if err != nil || kv == nil {

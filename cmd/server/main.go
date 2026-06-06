@@ -188,8 +188,10 @@ func parseFlags() appConfig {
 		case strings.HasPrefix(arg, "--peer-urls="):
 			cfg.peerURLs = splitCSV(strings.TrimPrefix(arg, "--peer-urls="))
 		case strings.HasPrefix(arg, "--auto-compact-interval="):
-			d, err := time.ParseDuration(strings.TrimPrefix(arg, "--auto-compact-interval="))
-			if err == nil {
+			val := strings.TrimPrefix(arg, "--auto-compact-interval=")
+			if val == "0" || val == "off" || val == "disable" {
+				cfg.autoCompactInterval = -1 // sentinel: disabled
+			} else if d, err := time.ParseDuration(val); err == nil {
 				cfg.autoCompactInterval = d
 			}
 		case strings.HasPrefix(arg, "--auto-compact-age="):
