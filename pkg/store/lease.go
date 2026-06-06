@@ -217,7 +217,10 @@ func (lm *LeaseManager) scheduleExpiry(ctx context.Context, lease *Lease) {
 // re-reads the key and only writes a tombstone when lease_id still matches.
 // This closes the TOCTOU window between the initial scan and the delete.
 func (lm *LeaseManager) expireLeaseKeys(ctx context.Context, leaseID int64) error {
-	// Find all keys whose current row still belongs to this lease.
+	// Find all keys where the MAX(rev) row has lease_id=@lid and is not deleted.
+	// Note: the subquery filters MAX(rev) only among rows with lease_id=@lid,
+	// so a key reassigned to a different lease may still appear here.
+	// DeleteIfLease() re-checks the lease_id atomically and no-ops if mismatched.
 	stmt := spanner.Statement{
 		SQL: `SELECT key FROM kv
 		      INNER JOIN (

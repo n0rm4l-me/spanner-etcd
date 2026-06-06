@@ -135,20 +135,18 @@ func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) 
 			// new items immediately — no window between removal and closed flag.
 			sub.closed.Store(true)
 			w.removeSub(sub)
-			// Drain any already-buffered batches and deliver the sentinel.
-			// The sentinel MUST arrive so watchLoop emits Canceled=true.
-			// The channel is never closed — sentinel is the sole teardown signal.
+			// Drain ALL buffered event batches first so the sentinel is the very
+			// next item watchLoop receives — it must not be queued behind stale
+			// events that should no longer be delivered after cancellation.
 			for {
 				select {
-				case sub.ch <- closedSentinel:
-					return
+				case <-sub.ch:
 				default:
-					select {
-					case <-sub.ch:
-					default:
-					}
+					goto sendSentinel
 				}
 			}
+		sendSentinel:
+			sub.ch <- closedSentinel
 		}()
 
 		// afterRev=0 means "live watch from now" — no replay needed.
