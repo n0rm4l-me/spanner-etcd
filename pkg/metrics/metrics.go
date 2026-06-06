@@ -113,7 +113,7 @@ var (
 		Namespace: "spanner_etcd",
 		Name:      "compaction_duration_seconds",
 		Help:      "Time spent in each compaction run.",
-		Buckets:   prometheus.ExponentialBuckets(0.1, 2, 10), // 100ms → ~100s
+		Buckets:   prometheus.ExponentialBuckets(0.1, 2, 11), // 100ms → ~102s
 	}, []string{"trigger"})
 
 	// ── Spanner ───────────────────────────────────────────────────────────────

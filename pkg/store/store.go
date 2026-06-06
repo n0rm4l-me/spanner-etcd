@@ -110,8 +110,9 @@ func NewWithConfig(ctx context.Context, client *spanner.Client, log *zap.Logger,
 	if cfg.AutoCompactAge < 0 {
 		return nil, fmt.Errorf("AutoCompactAge must be >= 0, got %v", cfg.AutoCompactAge)
 	}
-	if cfg.AutoCompactInterval < -1 {
-		return nil, fmt.Errorf("AutoCompactInterval must be >= -1, got %v", cfg.AutoCompactInterval)
+	// Treat any negative interval as "disabled" (the -1 sentinel).
+	if cfg.AutoCompactInterval < 0 {
+		cfg.AutoCompactInterval = -1
 	}
 
 	// -1 sentinel = disabled; 0 = use default.
@@ -516,6 +517,18 @@ func (s *Store) After(ctx context.Context, prefix string, afterRev, limit int64)
 func (s *Store) Compact(ctx context.Context, targetRev int64) (int64, error) {
 	targetTS := revToTS(targetRev)
 	_, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		// CAS: only advance compact revision if targetTS is larger than existing.
+		// This prevents a race where auto-compact overwrites a larger manual target.
+		row, err := txn.ReadRow(ctx, "kv_rev", spanner.Key{schema.CompactRevRow}, []string{"rev"})
+		if err != nil && spanner.ErrCode(err) != codes.NotFound {
+			return err
+		}
+		if err == nil {
+			var existing time.Time
+			if scanErr := row.Column(0, &existing); scanErr == nil && !existing.Before(targetTS) {
+				return nil // already at or beyond targetRev
+			}
+		}
 		return txn.BufferWrite([]*spanner.Mutation{
 			spanner.InsertOrUpdateMap("kv_rev", map[string]interface{}{
 				"id":  schema.CompactRevRow,
@@ -649,7 +662,11 @@ func (s *Store) autoCompactLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			curRev, err := s.CurrentRevision(ctx)
-			if err != nil || curRev <= 1 {
+			if err != nil {
+				s.log.Warn("auto-compact: failed to read current revision", zap.Error(err))
+				continue
+			}
+			if curRev <= 1 {
 				continue
 			}
 			targetRev := tsToRev(revToTS(curRev).Add(-s.cfg.AutoCompactAge))
@@ -657,10 +674,24 @@ func (s *Store) autoCompactLoop(ctx context.Context) {
 				continue
 			}
 			// Record the compact revision in kv_rev before deleting rows so that
-			// CompactRevision() reflects what background compaction has done,
-			// matching the semantics of explicit Compact() calls.
+			// CompactRevision() reflects what background compaction has done.
+			// Use CAS inside the transaction: only advance kv_rev if the new target
+			// is larger than what is already stored — prevents auto-compact from
+			// overwriting a larger manual compact revision with a smaller value.
 			targetTS := revToTS(targetRev)
 			if _, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+				row, err := txn.ReadRow(ctx, "kv_rev", spanner.Key{schema.CompactRevRow}, []string{"rev"})
+				if err != nil && spanner.ErrCode(err) != codes.NotFound {
+					return err
+				}
+				if err == nil {
+					var existing time.Time
+					if scanErr := row.Column(0, &existing); scanErr == nil {
+						if !existing.Before(targetTS) {
+							return nil // existing compact rev is already >= target, skip
+						}
+					}
+				}
 				return txn.BufferWrite([]*spanner.Mutation{
 					spanner.InsertOrUpdateMap("kv_rev", map[string]interface{}{
 						"id":  schema.CompactRevRow,
