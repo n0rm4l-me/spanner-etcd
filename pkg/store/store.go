@@ -109,15 +109,16 @@ func NewWithConfig(ctx context.Context, client *spanner.Client, log *zap.Logger,
 	if cfg.AutoCompactAge < 0 {
 		return nil, fmt.Errorf("AutoCompactAge must be >= 0, got %v", cfg.AutoCompactAge)
 	}
-	// Any negative interval (including -1) disables auto-compaction.
-	// This avoids surprising startup failures for callers using unit-suffixed
-	// negative values (e.g. -1*time.Second) and matches the CLI convention
-	// where --auto-compact-interval=0 is also treated as disabled.
+	// Any negative interval disables auto-compaction (normalized to -1).
+	// This avoids surprising startup failures for callers that pass
+	// unit-suffixed negative values such as -1*time.Second.
+	// Note: the CLI maps "0/off/disable" to -1 before calling NewWithConfig;
+	// programmatic callers must pass -1 explicitly to disable.
 	if cfg.AutoCompactInterval < 0 {
 		cfg.AutoCompactInterval = -1
 	}
 
-	// -1 sentinel = disabled; 0 = use default.
+	// -1 = disabled; 0 = unset, use default.
 	if cfg.AutoCompactInterval == 0 {
 		cfg.AutoCompactInterval = DefaultAutoCompactInterval
 	}
