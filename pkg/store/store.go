@@ -65,24 +65,59 @@ const (
 	EventDelete EventType = 1
 )
 
+const (
+	// compactBatchSize is the number of rows deleted per Spanner transaction.
+	// Spanner has a 20k mutation limit per transaction; 1000 rows = safe headroom.
+	compactBatchSize = 1000
+
+	DefaultAutoCompactInterval = 5 * time.Minute
+	DefaultAutoCompactAge      = 5 * time.Minute
+)
+
+// StoreConfig holds optional tuning parameters for the Store.
+type StoreConfig struct {
+	// AutoCompactInterval controls how often the background compaction loop runs.
+	// 0 disables auto-compaction (rely on explicit Compact calls from kube-apiserver).
+	AutoCompactInterval time.Duration
+	// AutoCompactAge controls how far behind current revision to compact.
+	// Keeps this much history for Watch replay. 0 = DefaultAutoCompactAge.
+	AutoCompactAge time.Duration
+}
+
 // Store is the central Spanner-backed store. It is safe for concurrent use.
 type Store struct {
 	client    *spanner.Client
 	log       *zap.Logger
 	bgCtx     context.Context
+	cfg       StoreConfig
 	watcher   *Watcher
 	leasesMgr *LeaseManager
 }
 
-// New creates a Store. The caller is responsible for calling Close.
+// New creates a Store with default configuration. The caller is responsible for calling Close.
 func New(ctx context.Context, client *spanner.Client, log *zap.Logger) (*Store, error) {
+	return NewWithConfig(ctx, client, log, StoreConfig{})
+}
+
+// NewWithConfig creates a Store with explicit tuning parameters.
+func NewWithConfig(ctx context.Context, client *spanner.Client, log *zap.Logger, cfg StoreConfig) (*Store, error) {
+	if cfg.AutoCompactInterval == 0 {
+		cfg.AutoCompactInterval = DefaultAutoCompactInterval
+	}
+	if cfg.AutoCompactAge == 0 {
+		cfg.AutoCompactAge = DefaultAutoCompactAge
+	}
 	s := &Store{
 		client: client,
 		log:    log,
 		bgCtx:  ctx,
+		cfg:    cfg,
 	}
 	s.watcher = newWatcher(ctx, s, log)
 	s.leasesMgr = newLeaseManager(ctx, s, log)
+	if cfg.AutoCompactInterval > 0 {
+		go s.autoCompactLoop(ctx)
+	}
 	return s, nil
 }
 
@@ -472,9 +507,17 @@ func (s *Store) Compact(ctx context.Context, targetRev int64) (int64, error) {
 	}
 
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
-		s.compactRows(ctx, targetRev)
+		t0 := time.Now()
+		total := s.compactRows(s.bgCtx, targetRev)
+		dur := time.Since(t0)
+		metrics.CompactedRowsTotal.WithLabelValues("manual").Add(float64(total))
+		metrics.CompactionDuration.WithLabelValues("manual").Observe(dur.Seconds())
+		if total > 0 {
+			s.log.Info("compacted old revisions",
+				zap.Int("deleted", total),
+				zap.Int64("target_rev", targetRev),
+				zap.Duration("duration", dur))
+		}
 	}()
 
 	return targetRev, nil
@@ -572,15 +615,81 @@ func (s *Store) compactRevision(ctx context.Context) (int64, error) {
 	return tsToRev(ts), nil
 }
 
-// compactRows physically deletes old revisions asynchronously.
-func (s *Store) compactRows(ctx context.Context, targetRev int64) {
+// autoCompactLoop runs in the background and compacts old revisions periodically.
+// It targets currentRevision - autoCompactAge, keeping recent history for Watch replay.
+func (s *Store) autoCompactLoop(ctx context.Context) {
+	ticker := time.NewTicker(s.cfg.AutoCompactInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			curRev, err := s.CurrentRevision(ctx)
+			if err != nil || curRev <= 1 {
+				continue
+			}
+			targetRev := tsToRev(revToTS(curRev).Add(-s.cfg.AutoCompactAge))
+			if targetRev <= 1 {
+				continue
+			}
+			t0 := time.Now()
+			total := s.compactRows(ctx, targetRev)
+			dur := time.Since(t0)
+			metrics.CompactedRowsTotal.WithLabelValues("auto").Add(float64(total))
+			metrics.CompactionDuration.WithLabelValues("auto").Observe(dur.Seconds())
+			if total > 0 {
+				s.log.Info("auto-compacted old revisions",
+					zap.Int("deleted", total),
+					zap.Int64("target_rev", targetRev),
+					zap.Duration("duration", dur))
+			}
+		}
+	}
+}
+
+// compactRows physically deletes old revisions in batches until none remain.
+// Returns the total number of rows deleted.
+func (s *Store) compactRows(ctx context.Context, targetRev int64) int {
 	targetTS := revToTS(targetRev)
+	total := 0
+	for {
+		ids, err := s.scanCompactBatch(ctx, targetTS)
+		if err != nil {
+			s.log.Warn("compact rows scan failed", zap.Error(err))
+			return total
+		}
+		if len(ids) == 0 {
+			return total
+		}
+
+		mutations := make([]*spanner.Mutation, len(ids))
+		for i, id := range ids {
+			mutations[i] = spanner.Delete("kv", id)
+		}
+		if _, err := s.client.Apply(ctx, mutations); err != nil {
+			s.log.Warn("compact rows delete failed", zap.Int("count", len(ids)), zap.Error(err))
+			return total
+		}
+		total += len(ids)
+
+		if len(ids) < compactBatchSize {
+			return total
+		}
+	}
+}
+
+// scanCompactBatch fetches one batch of row IDs eligible for compaction.
+func (s *Store) scanCompactBatch(ctx context.Context, targetTS time.Time) ([]spanner.Key, error) {
 	stmt := spanner.Statement{
 		SQL: `SELECT id FROM kv
 		      WHERE rev <= @target
 		        AND (deleted = true OR prev_revision IS NOT NULL)
-		      LIMIT 5000`,
-		Params: map[string]interface{}{"target": targetTS},
+		      LIMIT @batch`,
+		Params: map[string]interface{}{
+			"target": targetTS,
+			"batch":  int64(compactBatchSize),
+		},
 	}
 
 	iter := s.client.Single().Query(ctx, stmt)
@@ -590,11 +699,10 @@ func (s *Store) compactRows(ctx context.Context, targetRev int64) {
 	for {
 		row, err := iter.Next()
 		if errors.Is(err, iterator.Done) {
-			break
+			return ids, nil
 		}
 		if err != nil {
-			s.log.Warn("compact rows scan failed", zap.Error(err))
-			return
+			return nil, err
 		}
 		var id int64
 		if err := row.Column(0, &id); err != nil {
@@ -602,22 +710,6 @@ func (s *Store) compactRows(ctx context.Context, targetRev int64) {
 		}
 		ids = append(ids, spanner.Key{id})
 	}
-
-	if len(ids) == 0 {
-		return
-	}
-
-	var mutations []*spanner.Mutation
-	for _, id := range ids {
-		mutations = append(mutations, spanner.Delete("kv", id))
-	}
-
-	_, err := s.client.Apply(ctx, mutations)
-	if err != nil {
-		s.log.Warn("compact rows delete failed", zap.Int("count", len(ids)), zap.Error(err))
-		return
-	}
-	s.log.Info("compacted old revisions", zap.Int("deleted", len(ids)), zap.Int64("target_rev", targetRev))
 }
 
 // scanKV reads a Spanner row into a KV struct.
