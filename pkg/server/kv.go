@@ -495,7 +495,9 @@ func (k *KVServer) executeOps(ctx context.Context, ops []*etcdserverpb.RequestOp
 			}
 			// Enforce exclusive RangeEnd: rangeToPrefix is an approximation,
 			// List may include keys >= RangeEnd.
-			if rEnd := string(v.RequestRange.RangeEnd); rEnd != "" && rEnd != "\x00" {
+			// Skip filtering for CountOnly (Kvs is empty, Count is already correct).
+			rr := v.RequestRange
+			if rEnd := string(rr.RangeEnd); rEnd != "" && rEnd != "\x00" && !rr.CountOnly {
 				filtered := resp.Kvs[:0]
 				for _, kv := range resp.Kvs {
 					if string(kv.Key) < rEnd {
