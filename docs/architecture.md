@@ -134,10 +134,15 @@ With 10,000+ watchers and 1,000 writes/sec, the synchronous `dispatchEvents` bec
 
 The emulator does not support the `READ_kv_changes` TVF. spanner-etcd falls back to 1-second polling automatically. Watch latency on the emulator is ~1s; on production Spanner it is ~10–50ms.
 
+### Txn with range ops is non-atomic
+
+Txn operations containing `RangeEnd`, `CountOnly`, `IgnoreValue`, or `IgnoreLease` fall back to a non-atomic execution path (compare and execute as separate operations). Kubernetes core operations (leader election, object CRUD) always use the atomic path. Operators and tooling using range ops in Txn work correctly but without atomicity guarantees.
+
 ### Not implemented
 
 - Auth RBAC (UserAdd/RoleAdd/GrantPermission) — not needed for standard Kubernetes
 - Defrag / Snapshot — not needed (Spanner manages storage automatically)
+- TLS in production setup — plaintext gRPC (TLS flags exist, not yet validated end-to-end)
 
 ## Why not kine?
 
