@@ -519,9 +519,13 @@ func (k *KVServer) executeOps(ctx context.Context, ops []*etcdserverpb.RequestOp
 					leaseID = cur.LeaseID
 				}
 				// CAS update using the revision from the same Get.
-				newRev, prev, _, err := k.store.Update(ctx, string(pr.Key), value, cur.Rev, leaseID)
+				newRev, prev, ok, err := k.store.Update(ctx, string(pr.Key), value, cur.Rev, leaseID)
 				if err != nil {
 					return nil, 0, toGRPCErr(err)
+				}
+				if !ok {
+					// Concurrent write changed the key between our Get and Update.
+					return nil, 0, status.Error(codes.FailedPrecondition, "revision mismatch: concurrent update during IgnoreValue/IgnoreLease")
 				}
 				presp := &etcdserverpb.PutResponse{Header: header(newRev)}
 				if pr.PrevKv && prev != nil {
@@ -569,7 +573,10 @@ func (k *KVServer) executeOps(ctx context.Context, ops []*etcdserverpb.RequestOp
 					}
 				}
 				if rev == 0 {
-					rev, _ = k.store.CurrentRevision(ctx)
+					rev, err = k.store.CurrentRevision(ctx)
+					if err != nil {
+						return nil, 0, toGRPCErr(err)
+					}
 				}
 				dresp := &etcdserverpb.DeleteRangeResponse{
 					Header:  header(rev),

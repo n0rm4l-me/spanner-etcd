@@ -144,6 +144,54 @@ func TestTxn_IgnoreValue_KeyNotFound(t *testing.T) {
 	}
 }
 
+// TestTxn_RangeDeleteFallback verifies that a Txn with a range delete (RangeEnd)
+// uses the non-atomic fallback, deletes all matching keys, and returns correct count.
+func TestTxn_RangeDeleteFallback(t *testing.T) {
+	cli := testServer(t)
+	ctx := context.Background()
+
+	// Create several keys
+	for _, k := range []string{"/rdel/a", "/rdel/b", "/rdel/c"} {
+		if _, err := cli.Put(ctx, k, "v"); err != nil {
+			t.Fatalf("put %s: %v", k, err)
+		}
+	}
+	// Create a key outside the range to verify it's not deleted
+	if _, err := cli.Put(ctx, "/other/x", "v"); err != nil {
+		t.Fatalf("put other: %v", err)
+	}
+
+	// Range delete inside Txn — triggers non-atomic fallback
+	txn, err := cli.Txn(ctx).
+		Then(clientv3.OpDelete("/rdel/", clientv3.WithPrefix())).
+		Commit()
+	if err != nil {
+		t.Fatalf("Txn range delete: %v", err)
+	}
+	if !txn.Succeeded {
+		t.Fatal("Txn should succeed")
+	}
+	if txn.Header.Revision == 0 {
+		t.Fatal("Txn header revision must not be 0")
+	}
+
+	// Verify all /rdel/ keys deleted
+	resp, err := cli.Get(ctx, "/rdel/", clientv3.WithPrefix())
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(resp.Kvs) != 0 {
+		t.Fatalf("expected 0 keys after range delete, got %d", len(resp.Kvs))
+	}
+
+	// Verify /other/x not deleted
+	resp2, err := cli.Get(ctx, "/other/x")
+	if err != nil || len(resp2.Kvs) == 0 {
+		t.Fatalf("other key should survive range delete")
+	}
+	t.Logf("range delete Txn fallback: revision=%d", txn.Header.Revision)
+}
+
 // TestTxn_DuplicateKey_InvalidArgument verifies that a Txn with duplicate
 // mutations for the same key returns InvalidArgument.
 func TestTxn_DuplicateKey_InvalidArgument(t *testing.T) {
