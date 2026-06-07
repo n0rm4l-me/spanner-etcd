@@ -474,7 +474,27 @@ func (k *KVServer) executeOps(ctx context.Context, ops []*etcdserverpb.RequestOp
 			})
 			lastRev = resp.Header.Revision
 		case *etcdserverpb.RequestOp_RequestPut:
-			resp, err := k.Put(ctx, v.RequestPut)
+			pr := v.RequestPut
+			// Handle IgnoreValue/IgnoreLease: read current value and substitute.
+			if pr.IgnoreValue || pr.IgnoreLease {
+				_, cur, err := k.store.Get(ctx, string(pr.Key), 0)
+				if err != nil {
+					return nil, 0, err
+				}
+				if cur == nil {
+					// etcd returns error when IgnoreValue/IgnoreLease applied to non-existent key.
+					return nil, 0, status.Errorf(codes.NotFound, "key not found for IgnoreValue/IgnoreLease put: %q", pr.Key)
+				}
+				merged := *pr
+				if pr.IgnoreValue {
+					merged.Value = cur.Value
+				}
+				if pr.IgnoreLease {
+					merged.Lease = cur.LeaseID
+				}
+				pr = &merged
+			}
+			resp, err := k.Put(ctx, pr)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -503,6 +523,21 @@ func (k *KVServer) executeOps(ctx context.Context, ops []*etcdserverpb.RequestOp
 			return nil, 0, err
 		}
 	}
+
+	// Normalize all sub-response headers to the same revision so clients
+	// see a single consistent Txn revision (matches atomic path behavior).
+	h := header(lastRev)
+	for _, resp := range responses {
+		switch v := resp.Response.(type) {
+		case *etcdserverpb.ResponseOp_ResponseRange:
+			v.ResponseRange.Header = h
+		case *etcdserverpb.ResponseOp_ResponsePut:
+			v.ResponsePut.Header = h
+		case *etcdserverpb.ResponseOp_ResponseDeleteRange:
+			v.ResponseDeleteRange.Header = h
+		}
+	}
+
 	return responses, lastRev, nil
 }
 
