@@ -29,21 +29,37 @@ func TestTxn_UnsupportedCompareTarget(t *testing.T) {
 	}
 }
 
-// TestTxn_RangeEndNotSupported verifies that a Txn with RangeEnd in a Get op
-// returns Unimplemented.
-func TestTxn_RangeEndNotSupported(t *testing.T) {
+// TestTxn_RangeEndFallback verifies that a Txn with RangeEnd falls back to
+// the non-atomic path and succeeds (not Unimplemented).
+func TestTxn_RangeEndFallback(t *testing.T) {
 	cli := testServer(t)
 	ctx := context.Background()
 
-	_, err := cli.Txn(ctx).
-		Then(clientv3.OpGet("/foo/", clientv3.WithPrefix())).
+	if _, err := cli.Put(ctx, "/fallback/a", "v1"); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if _, err := cli.Put(ctx, "/fallback/b", "v2"); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	// Range get inside Txn — should use non-atomic fallback, not return Unimplemented.
+	txn, err := cli.Txn(ctx).
+		Then(clientv3.OpGet("/fallback/", clientv3.WithPrefix())).
 		Commit()
-	if err == nil {
-		t.Fatal("expected error for range get in Txn, got nil")
+	if err != nil {
+		t.Fatalf("Txn with range get should succeed via non-atomic fallback, got: %v", err)
 	}
-	if status.Code(err) != codes.Unimplemented {
-		t.Fatalf("want Unimplemented, got %v", status.Code(err))
+	if !txn.Succeeded {
+		t.Fatal("Txn should succeed")
 	}
+	if len(txn.Responses) == 0 {
+		t.Fatal("expected responses")
+	}
+	kvs := txn.Responses[0].GetResponseRange().Kvs
+	if len(kvs) < 2 {
+		t.Fatalf("expected 2 keys, got %d", len(kvs))
+	}
+	t.Logf("range Txn fallback: got %d keys", len(kvs))
 }
 
 // TestTxn_ReadOnly_SnapshotRevision verifies that a read-only Txn (compare fails,
