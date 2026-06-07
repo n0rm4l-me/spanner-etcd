@@ -174,6 +174,17 @@ func TestTxn_RangeDeleteFallback(t *testing.T) {
 	if txn.Header.Revision == 0 {
 		t.Fatal("Txn header revision must not be 0")
 	}
+	// Verify DeleteRange response contains correct deleted count.
+	if len(txn.Responses) == 0 {
+		t.Fatal("expected responses")
+	}
+	dresp := txn.Responses[0].GetResponseDeleteRange()
+	if dresp == nil {
+		t.Fatal("expected DeleteRange response")
+	}
+	if dresp.Deleted != 3 {
+		t.Fatalf("expected 3 deleted, got %d", dresp.Deleted)
+	}
 
 	// Verify all /rdel/ keys deleted
 	resp, err := cli.Get(ctx, "/rdel/", clientv3.WithPrefix())
