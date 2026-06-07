@@ -384,6 +384,10 @@ func (k *KVServer) txnAtomic(ctx context.Context, r *etcdserverpb.TxnRequest) (*
 func (k *KVServer) txnNonAtomic(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error) {
 	succeeded, err := k.evaluateCompare(ctx, r.Compare)
 	if err != nil {
+		// Pass through gRPC status errors unchanged; only map store errors.
+		if _, ok := status.FromError(err); ok {
+			return nil, err
+		}
 		return nil, toGRPCErr(err)
 	}
 
@@ -394,6 +398,10 @@ func (k *KVServer) txnNonAtomic(ctx context.Context, r *etcdserverpb.TxnRequest)
 
 	responses, rev, err := k.executeOps(ctx, ops)
 	if err != nil {
+		// Range/Put/DeleteRange already return gRPC status errors — pass through.
+		if _, ok := status.FromError(err); ok {
+			return nil, err
+		}
 		return nil, toGRPCErr(err)
 	}
 
@@ -483,6 +491,8 @@ func (k *KVServer) executeOps(ctx context.Context, ops []*etcdserverpb.RequestOp
 				Response: &etcdserverpb.ResponseOp_ResponseDeleteRange{ResponseDeleteRange: resp},
 			})
 			lastRev = resp.Header.Revision
+		default:
+			return nil, 0, status.Error(codes.InvalidArgument, "unsupported Txn op type in non-atomic path")
 		}
 	}
 
