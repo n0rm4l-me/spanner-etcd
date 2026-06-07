@@ -62,7 +62,7 @@ etcdctl put /hello world && etcdctl get /hello
 
 ## Documentation
 
-| | |
+| Doc | Contents |
 |---|---|
 | [Architecture](docs/architecture.md) | Design decisions, Spanner schema, etcd API coverage, known limitations |
 | [Deployment](docs/deployment.md) | GKE/Helm, kubeadm, TLS, migration, monitoring |
@@ -85,22 +85,6 @@ etcdctl put /hello world && etcdctl get /hello
 | 24h soak test (Kubernetes v1.33) | 🔄 In progress |
 | TLS / mTLS in production | ⏳ Planned |
 | Multi-replica HA validation | ⏳ Planned |
-
-## Roadmap
-
-- [x] PENDING_COMMIT_TIMESTAMP revision — 15× write throughput vs integer counter
-- [x] Spanner Change Streams — ~10–50ms Watch latency on production Spanner
-- [x] Atomic Txn — compare+ops in a single Spanner ReadWriteTransaction
-- [x] Hybrid Txn routing — atomic for core ops, compatible fallback for range ops
-- [x] Background auto-compaction with configurable interval and metrics
-- [x] Production audit — goroutine leaks, data races, protocol correctness
-- [x] Helm chart with WIF, PDB, HPA, graceful shutdown (preStop + GracefulStop)
-- [x] Kubernetes v1.33 control plane — tested with kubeadm
-- [x] Google Cloud Monitoring integration (logs + Prometheus metrics)
-- [ ] Kubernetes v1.33 24h soak test
-- [ ] TLS / mTLS in production deployment
-- [ ] Multi-replica HA validation
-- [ ] Auth RBAC
 
 ## License
 
