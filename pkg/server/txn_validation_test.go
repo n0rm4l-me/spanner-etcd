@@ -106,8 +106,8 @@ func TestTxn_IgnoreValue(t *testing.T) {
 		t.Fatalf("put: %v", err)
 	}
 
-	// IgnoreValue=true with a range condition triggers non-atomic fallback.
-	// The value should remain "original", only lease is updated.
+	// IgnoreValue=true triggers non-atomic fallback (IgnoreValue is in the fallback list).
+	// The value should remain "original" regardless of what is passed.
 	_, err := cli.Txn(ctx).
 		Then(clientv3.OpPut("/ignore/k", "ignored-value",
 			clientv3.WithIgnoreValue(),

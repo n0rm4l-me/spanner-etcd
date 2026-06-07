@@ -383,6 +383,29 @@ func (k *KVServer) txnAtomic(ctx context.Context, r *etcdserverpb.TxnRequest) (*
 // CountOnly, IgnoreValue, etc.). Callers must not rely on atomicity of compare+ops
 // — this is a best-effort compatibility path, not a correctness guarantee.
 func (k *KVServer) txnNonAtomic(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error) {
+	// Apply same duplicate-key validation as txnAtomic for consistent API contract.
+	for _, ops := range [][]*etcdserverpb.RequestOp{r.Success, r.Failure} {
+		seen := make(map[string]struct{}, len(ops))
+		for _, op := range ops {
+			var key string
+			switch v := op.Request.(type) {
+			case *etcdserverpb.RequestOp_RequestPut:
+				key = string(v.RequestPut.Key)
+			case *etcdserverpb.RequestOp_RequestDeleteRange:
+				if len(v.RequestDeleteRange.RangeEnd) == 0 {
+					key = string(v.RequestDeleteRange.Key)
+				}
+			}
+			if key != "" {
+				if _, dup := seen[key]; dup {
+					return nil, status.Errorf(codes.InvalidArgument,
+						"duplicate mutation for key %q in single Txn branch", key)
+				}
+				seen[key] = struct{}{}
+			}
+		}
+	}
+
 	succeeded, err := k.evaluateCompare(ctx, r.Compare)
 	if err != nil {
 		// Pass through gRPC status errors unchanged; only map store errors.
@@ -503,7 +526,47 @@ func (k *KVServer) executeOps(ctx context.Context, ops []*etcdserverpb.RequestOp
 			})
 			lastRev = resp.Header.Revision
 		case *etcdserverpb.RequestOp_RequestDeleteRange:
-			resp, err := k.DeleteRange(ctx, v.RequestDeleteRange)
+			// Use fail-fast delete for Txn context: propagate first error rather than
+			// continuing (DeleteRange.continue-on-error is for bare RPC, not Txn).
+			dr := v.RequestDeleteRange
+			if len(dr.RangeEnd) > 0 {
+				// Range delete: iterate and fail on first error.
+				prefix := rangeToPrefix(string(dr.Key), string(dr.RangeEnd))
+				_, _, kvs, err := k.store.List(ctx, prefix, string(dr.Key), 0, 0)
+				if err != nil {
+					return nil, 0, toGRPCErr(err)
+				}
+				var deleted int64
+				var prevKvs []*mvccpb.KeyValue
+				var rev int64
+				for _, kv := range kvs {
+					r, prev, ok, err := k.store.Delete(ctx, kv.Key, 0)
+					if err != nil {
+						return nil, 0, toGRPCErr(err)
+					}
+					if ok {
+						deleted++
+						rev = r
+						if dr.PrevKv && prev != nil {
+							prevKvs = append(prevKvs, toProtoKV(prev))
+						}
+					}
+				}
+				if rev == 0 {
+					rev, _ = k.store.CurrentRevision(ctx)
+				}
+				dresp := &etcdserverpb.DeleteRangeResponse{
+					Header:  header(rev),
+					Deleted: deleted,
+					PrevKvs: prevKvs,
+				}
+				responses = append(responses, &etcdserverpb.ResponseOp{
+					Response: &etcdserverpb.ResponseOp_ResponseDeleteRange{ResponseDeleteRange: dresp},
+				})
+				lastRev = rev
+				continue
+			}
+			resp, err := k.DeleteRange(ctx, dr)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -521,20 +584,6 @@ func (k *KVServer) executeOps(ctx context.Context, ops []*etcdserverpb.RequestOp
 		lastRev, err = k.store.CurrentRevision(ctx)
 		if err != nil {
 			return nil, 0, err
-		}
-	}
-
-	// Normalize all sub-response headers to the same revision so clients
-	// see a single consistent Txn revision (matches atomic path behavior).
-	h := header(lastRev)
-	for _, resp := range responses {
-		switch v := resp.Response.(type) {
-		case *etcdserverpb.ResponseOp_ResponseRange:
-			v.ResponseRange.Header = h
-		case *etcdserverpb.ResponseOp_ResponsePut:
-			v.ResponsePut.Header = h
-		case *etcdserverpb.ResponseOp_ResponseDeleteRange:
-			v.ResponseDeleteRange.Header = h
 		}
 	}
 
