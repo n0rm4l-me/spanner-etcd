@@ -227,6 +227,97 @@ func TestTxn_RangeDeleteFallback(t *testing.T) {
 	t.Logf("range delete Txn fallback: revision=%d deleted=%d", txn.Header.Revision, dresp.Deleted)
 }
 
+// TestTxn_IgnoreLease verifies that IgnoreLease=true preserves the existing lease.
+func TestTxn_IgnoreLease(t *testing.T) {
+	cli := testServer(t)
+	ctx := context.Background()
+
+	// Grant a lease
+	lease, err := cli.Grant(ctx, 30)
+	if err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+
+	// Put key with lease
+	if _, err := cli.Put(ctx, "/ignorelease/k", "v1", clientv3.WithLease(lease.ID)); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	// IgnoreLease=true — should preserve original lease
+	_, err = cli.Txn(ctx).
+		Then(clientv3.OpPut("/ignorelease/k", "v2", clientv3.WithIgnoreLease())).
+		Commit()
+	if err != nil {
+		t.Fatalf("IgnoreLease Txn: %v", err)
+	}
+
+	resp, err := cli.Get(ctx, "/ignorelease/k")
+	if err != nil || len(resp.Kvs) == 0 {
+		t.Fatalf("get: %v", err)
+	}
+	if resp.Kvs[0].Lease != int64(lease.ID) {
+		t.Fatalf("IgnoreLease should preserve lease %d, got %d", lease.ID, resp.Kvs[0].Lease)
+	}
+	if string(resp.Kvs[0].Value) != "v2" {
+		t.Fatalf("value should be updated to v2, got %q", resp.Kvs[0].Value)
+	}
+}
+
+// TestTxn_NonAtomic_ElseBranch verifies that the non-atomic fallback
+// correctly executes the Else branch when compare fails.
+func TestTxn_NonAtomic_ElseBranch(t *testing.T) {
+	cli := testServer(t)
+	ctx := context.Background()
+
+	if _, err := cli.Put(ctx, "/nonatom/k", "exists"); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	// Compare fails (key exists) → Else branch with range get (triggers fallback)
+	txn, err := cli.Txn(ctx).
+		If(clientv3.Compare(clientv3.Version("/nonatom/k"), "=", 0)).
+		Then(clientv3.OpPut("/nonatom/k", "from-then")).
+		Else(clientv3.OpGet("/nonatom/", clientv3.WithPrefix())).
+		Commit()
+	if err != nil {
+		t.Fatalf("txn: %v", err)
+	}
+	if txn.Succeeded {
+		t.Fatal("compare should fail — key exists")
+	}
+	if len(txn.Responses) == 0 {
+		t.Fatal("Else branch should return responses")
+	}
+	kvs := txn.Responses[0].GetResponseRange().Kvs
+	if len(kvs) == 0 {
+		t.Fatal("Else range get should return keys")
+	}
+}
+
+// TestTxn_NonAtomic_DuplicateKey verifies duplicate key validation in non-atomic path.
+func TestTxn_NonAtomic_DuplicateKey(t *testing.T) {
+	cli := testServer(t)
+	ctx := context.Background()
+
+	if _, err := cli.Put(ctx, "/dupnonatomic/k", "v"); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	// IgnoreValue triggers non-atomic path; duplicate key should still fail.
+	_, err := cli.Txn(ctx).
+		Then(
+			clientv3.OpPut("/dupnonatomic/k", "v1", clientv3.WithIgnoreValue()),
+			clientv3.OpPut("/dupnonatomic/k", "v2", clientv3.WithIgnoreValue()),
+		).
+		Commit()
+	if err == nil {
+		t.Fatal("expected InvalidArgument for duplicate key in non-atomic Txn")
+	}
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("want InvalidArgument, got %v", status.Code(err))
+	}
+}
+
 // TestTxn_DuplicateKey_InvalidArgument verifies that a Txn with duplicate
 // mutations for the same key returns InvalidArgument.
 func TestTxn_DuplicateKey_InvalidArgument(t *testing.T) {
