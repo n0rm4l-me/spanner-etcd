@@ -171,8 +171,52 @@ func (k *KVServer) DeleteRange(ctx context.Context, r *etcdserverpb.DeleteRangeR
 }
 
 // Txn processes an etcd transaction — the primary operation used by Kubernetes.
-// All compare reads and op writes execute inside a single Spanner RWT — atomic.
+//
+// Routing strategy for maximum compatibility:
+//   - If all ops are simple single-key Put/Delete/Get → AtomicTxn (single Spanner RWT, fully atomic)
+//   - If any op has RangeEnd/CountOnly/IgnoreValue/etc → non-atomic fallback via evaluateCompare+executeOps
+//     (logs a warning; preserves compatibility with operators and tooling that use complex Txn ops)
 func (k *KVServer) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error) {
+	// Check if all ops can be handled atomically.
+	if !k.txnNeedsNonAtomicFallback(r) {
+		return k.txnAtomic(ctx, r)
+	}
+	// Fallback: non-atomic path for complex ops (range scan/delete, CountOnly, IgnoreValue, etc.)
+	k.log.Warn("Txn contains complex ops — using non-atomic fallback for compatibility",
+		zap.Int("compare", len(r.Compare)),
+		zap.Int("success_ops", len(r.Success)),
+		zap.Int("failure_ops", len(r.Failure)),
+	)
+	return k.txnNonAtomic(ctx, r)
+}
+
+// txnNeedsNonAtomicFallback returns true when the Txn contains ops that cannot
+// be expressed inside a single Spanner ReadWriteTransaction (range ops, etc.).
+func (k *KVServer) txnNeedsNonAtomicFallback(r *etcdserverpb.TxnRequest) bool {
+	for _, ops := range [][]*etcdserverpb.RequestOp{r.Success, r.Failure} {
+		for _, op := range ops {
+			switch v := op.Request.(type) {
+			case *etcdserverpb.RequestOp_RequestRange:
+				rr := v.RequestRange
+				if len(rr.RangeEnd) > 0 || rr.Revision != 0 || rr.CountOnly || rr.KeysOnly || rr.Limit != 0 {
+					return true
+				}
+			case *etcdserverpb.RequestOp_RequestPut:
+				if v.RequestPut.IgnoreValue || v.RequestPut.IgnoreLease {
+					return true
+				}
+			case *etcdserverpb.RequestOp_RequestDeleteRange:
+				if len(v.RequestDeleteRange.RangeEnd) > 0 {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// txnAtomic executes compare+ops in a single Spanner ReadWriteTransaction.
+func (k *KVServer) txnAtomic(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error) {
 	compares := make([]store.TxnCompare, 0, len(r.Compare))
 	for _, c := range r.Compare {
 		c := c
@@ -222,22 +266,9 @@ func (k *KVServer) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdse
 		for _, op := range ops {
 			switch v := op.Request.(type) {
 			case *etcdserverpb.RequestOp_RequestRange:
-				rr := v.RequestRange
-				if len(rr.RangeEnd) > 0 {
-					return nil, status.Error(codes.Unimplemented, "Txn range scan not supported in atomic mode")
-				}
-				if rr.Revision != 0 {
-					return nil, status.Error(codes.Unimplemented, "Txn historical read not supported in atomic mode")
-				}
-				if rr.CountOnly || rr.KeysOnly || rr.Limit != 0 {
-					return nil, status.Error(codes.Unimplemented, "Txn CountOnly/KeysOnly/Limit not supported in atomic mode")
-				}
-				result = append(result, store.TxnOp{Type: store.TxnOpGet, Key: string(rr.Key)})
+				result = append(result, store.TxnOp{Type: store.TxnOpGet, Key: string(v.RequestRange.Key)})
 			case *etcdserverpb.RequestOp_RequestPut:
 				pr := v.RequestPut
-				if pr.IgnoreValue || pr.IgnoreLease {
-					return nil, status.Error(codes.Unimplemented, "Txn IgnoreValue/IgnoreLease not supported in atomic mode")
-				}
 				result = append(result, store.TxnOp{
 					Type:    store.TxnOpPut,
 					Key:     string(pr.Key),
@@ -245,11 +276,7 @@ func (k *KVServer) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdse
 					LeaseID: pr.Lease,
 				})
 			case *etcdserverpb.RequestOp_RequestDeleteRange:
-				dr := v.RequestDeleteRange
-				if len(dr.RangeEnd) > 0 {
-					return nil, status.Error(codes.Unimplemented, "Txn range delete not supported in atomic mode")
-				}
-				result = append(result, store.TxnOp{Type: store.TxnOpDelete, Key: string(dr.Key)})
+				result = append(result, store.TxnOp{Type: store.TxnOpDelete, Key: string(v.RequestDeleteRange.Key)})
 			default:
 				return nil, status.Error(codes.InvalidArgument, "unsupported Txn op type")
 			}
@@ -266,8 +293,7 @@ func (k *KVServer) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdse
 		return nil, err
 	}
 
-	// Detect duplicate keys in each branch and return InvalidArgument early
-	// so clients get a meaningful error rather than codes.Internal from the store.
+	// Detect duplicate keys in each branch.
 	for _, ops := range [][]store.TxnOp{successOps, failureOps} {
 		seen := make(map[string]struct{}, len(ops))
 		for _, op := range ops {
@@ -350,25 +376,74 @@ func (k *KVServer) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdse
 	}, nil
 }
 
-// Compact records the compaction revision.
-func (k *KVServer) Compact(ctx context.Context, r *etcdserverpb.CompactionRequest) (*etcdserverpb.CompactionResponse, error) {
-	rev, err := k.store.Compact(ctx, r.Revision)
+// txnNonAtomic handles Txns with complex ops (range scan/delete, CountOnly, etc.)
+// that cannot be expressed inside a single Spanner ReadWriteTransaction.
+// Compare evaluation and op execution are separate — a TOCTOU window exists.
+// This path is used only when the Txn contains ops that require it (RangeEnd,
+// CountOnly, IgnoreValue, etc.). Callers must not rely on atomicity of compare+ops
+// — this is a best-effort compatibility path, not a correctness guarantee.
+func (k *KVServer) txnNonAtomic(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error) {
+	// Apply same duplicate-key validation as txnAtomic for consistent API contract.
+	for _, ops := range [][]*etcdserverpb.RequestOp{r.Success, r.Failure} {
+		seen := make(map[string]struct{}, len(ops))
+		for _, op := range ops {
+			var key string
+			switch v := op.Request.(type) {
+			case *etcdserverpb.RequestOp_RequestPut:
+				key = string(v.RequestPut.Key)
+			case *etcdserverpb.RequestOp_RequestDeleteRange:
+				if len(v.RequestDeleteRange.RangeEnd) == 0 {
+					key = string(v.RequestDeleteRange.Key)
+				}
+			}
+			if key != "" {
+				if _, dup := seen[key]; dup {
+					return nil, status.Errorf(codes.InvalidArgument,
+						"duplicate mutation for key %q in single Txn branch", key)
+				}
+				seen[key] = struct{}{}
+			}
+		}
+	}
+
+	succeeded, err := k.evaluateCompare(ctx, r.Compare)
 	if err != nil {
+		// Pass through gRPC status errors unchanged; only map store errors.
+		if _, ok := status.FromError(err); ok {
+			return nil, err
+		}
 		return nil, toGRPCErr(err)
 	}
-	return &etcdserverpb.CompactionResponse{Header: header(rev)}, nil
+
+	ops := r.Success
+	if !succeeded {
+		ops = r.Failure
+	}
+
+	responses, rev, err := k.executeOps(ctx, ops)
+	if err != nil {
+		// Range/Put/DeleteRange already return gRPC status errors — pass through.
+		if _, ok := status.FromError(err); ok {
+			return nil, err
+		}
+		return nil, toGRPCErr(err)
+	}
+
+	return &etcdserverpb.TxnResponse{
+		Header:    header(rev),
+		Succeeded: succeeded,
+		Responses: responses,
+	}, nil
 }
 
-// ─── Txn helpers ─────────────────────────────────────────────────────────────
-
+// evaluateCompare evaluates Txn compare conditions via independent store.Get calls.
+// Used only by txnNonAtomic — not atomic with the subsequent executeOps.
 func (k *KVServer) evaluateCompare(ctx context.Context, compares []*etcdserverpb.Compare) (bool, error) {
 	for _, c := range compares {
-		key := string(c.Key)
-		_, kv, err := k.store.Get(ctx, key, 0)
+		_, kv, err := k.store.Get(ctx, string(c.Key), 0)
 		if err != nil {
 			return false, err
 		}
-
 		var result bool
 		switch c.Target {
 		case etcdserverpb.Compare_VERSION:
@@ -405,6 +480,8 @@ func (k *KVServer) evaluateCompare(ctx context.Context, compares []*etcdserverpb
 	return true, nil
 }
 
+// executeOps executes Txn ops sequentially — supports full range/count/etc ops.
+// Used only by txnNonAtomic. Each op is a separate store call (not atomic).
 func (k *KVServer) executeOps(ctx context.Context, ops []*etcdserverpb.RequestOp) ([]*etcdserverpb.ResponseOp, int64, error) {
 	var responses []*etcdserverpb.ResponseOp
 	var lastRev int64
@@ -416,13 +493,65 @@ func (k *KVServer) executeOps(ctx context.Context, ops []*etcdserverpb.RequestOp
 			if err != nil {
 				return nil, 0, err
 			}
+			// Enforce exclusive RangeEnd: rangeToPrefix is an approximation,
+			// List may include keys >= RangeEnd.
+			// Skip filtering for CountOnly (Kvs is empty, Count is already correct).
+			rr := v.RequestRange
+			if rEnd := string(rr.RangeEnd); rEnd != "" && rEnd != "\x00" && !rr.CountOnly {
+				filtered := resp.Kvs[:0]
+				for _, kv := range resp.Kvs {
+					if string(kv.Key) < rEnd {
+						filtered = append(filtered, kv)
+					}
+				}
+				resp.Kvs = filtered
+				resp.Count = int64(len(filtered))
+			}
 			responses = append(responses, &etcdserverpb.ResponseOp{
 				Response: &etcdserverpb.ResponseOp_ResponseRange{ResponseRange: resp},
 			})
 			lastRev = resp.Header.Revision
-
 		case *etcdserverpb.RequestOp_RequestPut:
-			resp, err := k.Put(ctx, v.RequestPut)
+			pr := v.RequestPut
+			// Handle IgnoreValue/IgnoreLease: read current value and substitute.
+			if pr.IgnoreValue || pr.IgnoreLease {
+				// Use a single CAS update to avoid TOCTOU: read current KV and
+				// update atomically using its revision so no concurrent write is clobbered.
+				_, cur, err := k.store.Get(ctx, string(pr.Key), 0)
+				if err != nil {
+					return nil, 0, err
+				}
+				if cur == nil {
+					return nil, 0, status.Error(codes.NotFound, "key not found")
+				}
+				value := pr.Value
+				leaseID := pr.Lease
+				if pr.IgnoreValue {
+					value = cur.Value
+				}
+				if pr.IgnoreLease {
+					leaseID = cur.LeaseID
+				}
+				// CAS update using the revision from the same Get.
+				newRev, prev, ok, err := k.store.Update(ctx, string(pr.Key), value, cur.Rev, leaseID)
+				if err != nil {
+					return nil, 0, toGRPCErr(err)
+				}
+				if !ok {
+					// Concurrent write changed the key between our Get and Update.
+					return nil, 0, status.Error(codes.FailedPrecondition, "revision mismatch: concurrent update during IgnoreValue/IgnoreLease")
+				}
+				presp := &etcdserverpb.PutResponse{Header: header(newRev)}
+				if pr.PrevKv && prev != nil {
+					presp.PrevKv = toProtoKV(prev)
+				}
+				responses = append(responses, &etcdserverpb.ResponseOp{
+					Response: &etcdserverpb.ResponseOp_ResponsePut{ResponsePut: presp},
+				})
+				lastRev = newRev
+				continue
+			}
+			resp, err := k.Put(ctx, pr)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -430,24 +559,66 @@ func (k *KVServer) executeOps(ctx context.Context, ops []*etcdserverpb.RequestOp
 				Response: &etcdserverpb.ResponseOp_ResponsePut{ResponsePut: resp},
 			})
 			lastRev = resp.Header.Revision
-
 		case *etcdserverpb.RequestOp_RequestDeleteRange:
-			r := v.RequestDeleteRange
-			rev, prev, ok, err := k.store.Delete(ctx, string(r.Key), 0)
+			// Use fail-fast delete for Txn context: propagate first error rather than
+			// continuing (DeleteRange.continue-on-error is for bare RPC, not Txn).
+			dr := v.RequestDeleteRange
+			if len(dr.RangeEnd) > 0 {
+				// Range delete: iterate and fail on first error.
+				prefix := rangeToPrefix(string(dr.Key), string(dr.RangeEnd))
+				_, _, kvs, err := k.store.List(ctx, prefix, string(dr.Key), 0, 0)
+				if err != nil {
+					return nil, 0, toGRPCErr(err)
+				}
+				var deleted int64
+				var prevKvs []*mvccpb.KeyValue
+				var rev int64
+				rangeEnd := string(dr.RangeEnd)
+				for _, kv := range kvs {
+					// Enforce exclusive RangeEnd: rangeToPrefix is an approximation
+					// and List may include keys >= RangeEnd.
+					if rangeEnd != "\x00" && rangeEnd != "" && kv.Key >= rangeEnd {
+						break // List is ordered by key, no need to continue
+					}
+					r, prev, ok, err := k.store.Delete(ctx, kv.Key, 0)
+					if err != nil {
+						return nil, 0, toGRPCErr(err)
+					}
+					if ok {
+						deleted++
+						rev = r
+						if dr.PrevKv && prev != nil {
+							prevKvs = append(prevKvs, toProtoKV(prev))
+						}
+					}
+				}
+				if rev == 0 {
+					rev, err = k.store.CurrentRevision(ctx)
+					if err != nil {
+						return nil, 0, toGRPCErr(err)
+					}
+				}
+				dresp := &etcdserverpb.DeleteRangeResponse{
+					Header:  header(rev),
+					Deleted: deleted,
+					PrevKvs: prevKvs,
+				}
+				responses = append(responses, &etcdserverpb.ResponseOp{
+					Response: &etcdserverpb.ResponseOp_ResponseDeleteRange{ResponseDeleteRange: dresp},
+				})
+				lastRev = rev
+				continue
+			}
+			resp, err := k.DeleteRange(ctx, dr)
 			if err != nil {
 				return nil, 0, err
 			}
-			dresp := &etcdserverpb.DeleteRangeResponse{
-				Header:  header(rev),
-				Deleted: boolToInt(ok),
-			}
-			if r.PrevKv && prev != nil {
-				dresp.PrevKvs = []*mvccpb.KeyValue{toProtoKV(prev)}
-			}
 			responses = append(responses, &etcdserverpb.ResponseOp{
-				Response: &etcdserverpb.ResponseOp_ResponseDeleteRange{ResponseDeleteRange: dresp},
+				Response: &etcdserverpb.ResponseOp_ResponseDeleteRange{ResponseDeleteRange: resp},
 			})
-			lastRev = rev
+			lastRev = resp.Header.Revision
+		default:
+			return nil, 0, status.Error(codes.InvalidArgument, "unsupported Txn op type in non-atomic path")
 		}
 	}
 
@@ -458,8 +629,19 @@ func (k *KVServer) executeOps(ctx context.Context, ops []*etcdserverpb.RequestOp
 			return nil, 0, err
 		}
 	}
+
 	return responses, lastRev, nil
 }
+
+// Compact records the compaction revision.
+func (k *KVServer) Compact(ctx context.Context, r *etcdserverpb.CompactionRequest) (*etcdserverpb.CompactionResponse, error) {
+	rev, err := k.store.Compact(ctx, r.Revision)
+	if err != nil {
+		return nil, toGRPCErr(err)
+	}
+	return &etcdserverpb.CompactionResponse{Header: header(rev)}, nil
+}
+
 
 // ─── proto helpers ────────────────────────────────────────────────────────────
 

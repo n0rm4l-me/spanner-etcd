@@ -34,3 +34,4 @@ coverage.html
 # macOS
 .DS_Store
 TESTING.local.md
+TEST_PLAN.local.md
