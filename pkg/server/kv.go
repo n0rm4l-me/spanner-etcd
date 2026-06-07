@@ -501,6 +501,8 @@ func (k *KVServer) executeOps(ctx context.Context, ops []*etcdserverpb.RequestOp
 			pr := v.RequestPut
 			// Handle IgnoreValue/IgnoreLease: read current value and substitute.
 			if pr.IgnoreValue || pr.IgnoreLease {
+				// Use a single CAS update to avoid TOCTOU: read current KV and
+				// update atomically using its revision so no concurrent write is clobbered.
 				_, cur, err := k.store.Get(ctx, string(pr.Key), 0)
 				if err != nil {
 					return nil, 0, err
@@ -508,14 +510,28 @@ func (k *KVServer) executeOps(ctx context.Context, ops []*etcdserverpb.RequestOp
 				if cur == nil {
 					return nil, 0, status.Error(codes.NotFound, "key not found")
 				}
-				merged := *pr
+				value := pr.Value
+				leaseID := pr.Lease
 				if pr.IgnoreValue {
-					merged.Value = cur.Value
+					value = cur.Value
 				}
 				if pr.IgnoreLease {
-					merged.Lease = cur.LeaseID
+					leaseID = cur.LeaseID
 				}
-				pr = &merged
+				// CAS update using the revision from the same Get.
+				newRev, prev, _, err := k.store.Update(ctx, string(pr.Key), value, cur.Rev, leaseID)
+				if err != nil {
+					return nil, 0, toGRPCErr(err)
+				}
+				presp := &etcdserverpb.PutResponse{Header: header(newRev)}
+				if pr.PrevKv && prev != nil {
+					presp.PrevKv = toProtoKV(prev)
+				}
+				responses = append(responses, &etcdserverpb.ResponseOp{
+					Response: &etcdserverpb.ResponseOp_ResponsePut{ResponsePut: presp},
+				})
+				lastRev = newRev
+				continue
 			}
 			resp, err := k.Put(ctx, pr)
 			if err != nil {
