@@ -44,12 +44,12 @@ go run -race ./cmd/server/ \
 
 ### Test coverage
 
-62 integration tests against the Spanner emulator.
+78 integration tests against the Spanner emulator.
 
 | Package | Tests | What's covered |
 |---------|-------|----------------|
 | `pkg/store` | 37 | Create/Get/Update/Delete/List/Count/After/Compact/Watch/Lease/Lease+Watch/AutoCompact/ErrCompacted |
-| `pkg/server` | 22 + 3 auth | Full gRPC stack, Txn multi-op, Watch cancel/fanout/concurrent/replay-pagination, graceful shutdown, auth token expiry / re-auth, LeaseTimeToLive remaining TTL |
+| `pkg/server` | 38 + 3 auth | Full gRPC stack, Txn atomic/non-atomic/concurrent, Watch cancel/fanout/replay-pagination, graceful shutdown, auth token expiry, LeaseTimeToLive, IgnoreValue/IgnoreLease, range delete boundary |
 
 ## CI
 
@@ -62,7 +62,8 @@ GitHub Actions runs on every push to `main` and every PR:
 
 | Target | Description |
 |--------|-------------|
-| `make build` | Build local binary |
+| `make build` | Build local binary (host OS/arch) |
+| `make build-linux` | Build `spanner-etcd-linux-amd64` for VM/server deployment |
 | `make vendor` | `go mod tidy && go mod vendor` |
 | `make docker` | Build linux/amd64 Docker image (runs vendor first) |
 | `make push` | Push image to registry |

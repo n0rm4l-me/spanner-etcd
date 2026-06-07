@@ -2,7 +2,7 @@
 
 [![test](https://github.com/n0rm4l-me/spanner-etcd/actions/workflows/test.yml/badge.svg)](https://github.com/n0rm4l-me/spanner-etcd/actions/workflows/test.yml)
 
-A **drop-in etcd replacement** backed by **Google Cloud Spanner** — tested with real Kubernetes v1.31 (kubeadm) and production application workloads.
+A **drop-in etcd replacement** backed by **Google Cloud Spanner** — tested with Kubernetes v1.33 and production application workloads.
 
 Implements the complete etcd v3 KV/Watch/Lease/Auth API. Swap out etcd for spanner-etcd and get unlimited horizontal scale, native multi-region replication, and 99.999% SLA — with zero etcd cluster management.
 
@@ -58,12 +58,18 @@ etcdctl put /hello world && etcdctl get /hello
 
 - [x] PENDING_COMMIT_TIMESTAMP revision (no serialization bottleneck, 15× write speedup)
 - [x] Spanner Change Streams for Watch (~10–50ms latency on production Spanner)
+- [x] Atomic Txn — compare+ops in a single Spanner ReadWriteTransaction
+- [x] Hybrid Txn routing — atomic for simple ops, non-atomic fallback for range/complex ops
 - [x] Simple username/password authentication with auto-reauth
-- [x] Prometheus metrics + GKE PodMonitoring
-- [x] Helm chart with WIF, PDB, HPA, graceful shutdown (preStop + GracefulStop)
-- [x] Kubernetes v1.31 (kubeadm) — full control plane tested
-- [x] Production validation: 22 microservices, 45 Watch streams
-- [x] 62 integration tests (emulator)
+- [x] Prometheus metrics + GKE PodMonitoring + Google Cloud Monitoring integration
+- [x] Background auto-compaction with configurable interval
+- [x] Helm chart with WIF, PDB, HPA, graceful shutdown
+- [x] Kubernetes v1.33 (kubeadm) — full control plane tested
+- [x] Production audit — goroutine leaks, data races, protocol correctness fixed
+- [x] 78 integration tests (emulator)
+- [ ] Kubernetes v1.33 24h soak test — in progress
+- [ ] TLS / mTLS in production deployment
+- [ ] Multi-replica HA validation
 - [ ] Auth RBAC (UserAdd/RoleGrantPermission)
 - [ ] Change Streams support on Spanner emulator
 
