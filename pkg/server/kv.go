@@ -493,6 +493,18 @@ func (k *KVServer) executeOps(ctx context.Context, ops []*etcdserverpb.RequestOp
 			if err != nil {
 				return nil, 0, err
 			}
+			// Enforce exclusive RangeEnd: rangeToPrefix is an approximation,
+			// List may include keys >= RangeEnd.
+			if rEnd := string(v.RequestRange.RangeEnd); rEnd != "" && rEnd != "\x00" {
+				filtered := resp.Kvs[:0]
+				for _, kv := range resp.Kvs {
+					if string(kv.Key) < rEnd {
+						filtered = append(filtered, kv)
+					}
+				}
+				resp.Kvs = filtered
+				resp.Count = int64(len(filtered))
+			}
 			responses = append(responses, &etcdserverpb.ResponseOp{
 				Response: &etcdserverpb.ResponseOp_ResponseRange{ResponseRange: resp},
 			})
@@ -559,7 +571,13 @@ func (k *KVServer) executeOps(ctx context.Context, ops []*etcdserverpb.RequestOp
 				var deleted int64
 				var prevKvs []*mvccpb.KeyValue
 				var rev int64
+				rangeEnd := string(dr.RangeEnd)
 				for _, kv := range kvs {
+					// Enforce exclusive RangeEnd: rangeToPrefix is an approximation
+					// and List may include keys >= RangeEnd.
+					if rangeEnd != "\x00" && rangeEnd != "" && kv.Key >= rangeEnd {
+						break // List is ordered by key, no need to continue
+					}
 					r, prev, ok, err := k.store.Delete(ctx, kv.Key, 0)
 					if err != nil {
 						return nil, 0, toGRPCErr(err)

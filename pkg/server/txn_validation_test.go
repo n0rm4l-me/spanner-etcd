@@ -41,6 +41,10 @@ func TestTxn_RangeEndFallback(t *testing.T) {
 	if _, err := cli.Put(ctx, "/fallback/b", "v2"); err != nil {
 		t.Fatalf("put: %v", err)
 	}
+	// Boundary key at RangeEnd — WithPrefix("/fallback/") → RangeEnd = "/fallback0"
+	if _, err := cli.Put(ctx, "/fallback0", "boundary"); err != nil {
+		t.Fatalf("put boundary: %v", err)
+	}
 
 	// Range get inside Txn — should use non-atomic fallback, not return Unimplemented.
 	txn, err := cli.Txn(ctx).
@@ -58,6 +62,12 @@ func TestTxn_RangeEndFallback(t *testing.T) {
 	kvs := txn.Responses[0].GetResponseRange().Kvs
 	if len(kvs) < 2 {
 		t.Fatalf("expected 2 keys, got %d", len(kvs))
+	}
+	// Boundary key /fallback0 must NOT appear in prefix scan results (exclusive RangeEnd)
+	for _, kv := range kvs {
+		if string(kv.Key) == "/fallback0" {
+			t.Fatal("boundary key /fallback0 at RangeEnd must not be included in prefix scan")
+		}
 	}
 	t.Logf("range Txn fallback: got %d keys", len(kvs))
 }
@@ -156,6 +166,11 @@ func TestTxn_RangeDeleteFallback(t *testing.T) {
 			t.Fatalf("put %s: %v", k, err)
 		}
 	}
+	// Create boundary key at RangeEnd (should NOT be deleted — exclusive upper bound)
+	// WithPrefix("/rdel/") computes RangeEnd = "/rdel0" (last byte incremented)
+	if _, err := cli.Put(ctx, "/rdel0", "boundary"); err != nil {
+		t.Fatalf("put boundary: %v", err)
+	}
 	// Create a key outside the range to verify it's not deleted
 	if _, err := cli.Put(ctx, "/other/x", "v"); err != nil {
 		t.Fatalf("put other: %v", err)
@@ -186,13 +201,22 @@ func TestTxn_RangeDeleteFallback(t *testing.T) {
 		t.Fatalf("expected 3 deleted, got %d", dresp.Deleted)
 	}
 
-	// Verify all /rdel/ keys deleted
-	resp, err := cli.Get(ctx, "/rdel/", clientv3.WithPrefix())
-	if err != nil {
-		t.Fatalf("get: %v", err)
+	// Verify all /rdel/ keys deleted (check individually, not prefix scan
+	// which would use the same rangeToPrefix approximation)
+	for _, key := range []string{"/rdel/a", "/rdel/b", "/rdel/c"} {
+		r, err := cli.Get(ctx, key)
+		if err != nil {
+			t.Fatalf("get %s: %v", key, err)
+		}
+		if len(r.Kvs) != 0 {
+			t.Fatalf("expected key %s to be deleted", key)
+		}
 	}
-	if len(resp.Kvs) != 0 {
-		t.Fatalf("expected 0 keys after range delete, got %d", len(resp.Kvs))
+
+	// Verify boundary key /rdel0 was NOT deleted (RangeEnd is exclusive)
+	resp3, err := cli.Get(ctx, "/rdel0")
+	if err != nil || len(resp3.Kvs) == 0 {
+		t.Fatal("boundary key /rdel0 at RangeEnd must survive (exclusive upper bound)")
 	}
 
 	// Verify /other/x not deleted
@@ -200,7 +224,7 @@ func TestTxn_RangeDeleteFallback(t *testing.T) {
 	if err != nil || len(resp2.Kvs) == 0 {
 		t.Fatalf("other key should survive range delete")
 	}
-	t.Logf("range delete Txn fallback: revision=%d", txn.Header.Revision)
+	t.Logf("range delete Txn fallback: revision=%d deleted=%d", txn.Header.Revision, dresp.Deleted)
 }
 
 // TestTxn_DuplicateKey_InvalidArgument verifies that a Txn with duplicate
