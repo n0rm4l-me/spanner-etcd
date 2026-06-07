@@ -96,6 +96,54 @@ func TestTxn_ReadOnly_SnapshotRevision(t *testing.T) {
 	t.Logf("write_rev=%d txn_rev=%d", knownRev, txn.Header.Revision)
 }
 
+// TestTxn_IgnoreValue verifies that IgnoreValue=true preserves the existing
+// value when updating a key via the non-atomic Txn fallback path.
+func TestTxn_IgnoreValue(t *testing.T) {
+	cli := testServer(t)
+	ctx := context.Background()
+
+	if _, err := cli.Put(ctx, "/ignore/k", "original"); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	// IgnoreValue=true with a range condition triggers non-atomic fallback.
+	// The value should remain "original", only lease is updated.
+	_, err := cli.Txn(ctx).
+		Then(clientv3.OpPut("/ignore/k", "ignored-value",
+			clientv3.WithIgnoreValue(),
+			clientv3.WithPrevKV())).
+		Commit()
+	if err != nil {
+		t.Fatalf("IgnoreValue Txn: %v", err)
+	}
+
+	resp, err := cli.Get(ctx, "/ignore/k")
+	if err != nil || len(resp.Kvs) == 0 {
+		t.Fatalf("get: err=%v", err)
+	}
+	if string(resp.Kvs[0].Value) != "original" {
+		t.Fatalf("IgnoreValue should preserve original value, got %q", resp.Kvs[0].Value)
+	}
+}
+
+// TestTxn_IgnoreValue_KeyNotFound verifies that IgnoreValue on a non-existent
+// key returns NotFound.
+func TestTxn_IgnoreValue_KeyNotFound(t *testing.T) {
+	cli := testServer(t)
+	ctx := context.Background()
+
+	_, err := cli.Txn(ctx).
+		Then(clientv3.OpPut("/ignore/nonexistent", "val",
+			clientv3.WithIgnoreValue())).
+		Commit()
+	if err == nil {
+		t.Fatal("expected NotFound for IgnoreValue on missing key, got nil")
+	}
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("want NotFound, got %v", status.Code(err))
+	}
+}
+
 // TestTxn_DuplicateKey_InvalidArgument verifies that a Txn with duplicate
 // mutations for the same key returns InvalidArgument.
 func TestTxn_DuplicateKey_InvalidArgument(t *testing.T) {

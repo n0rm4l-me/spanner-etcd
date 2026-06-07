@@ -377,10 +377,11 @@ func (k *KVServer) txnAtomic(ctx context.Context, r *etcdserverpb.TxnRequest) (*
 }
 
 // txnNonAtomic handles Txns with complex ops (range scan/delete, CountOnly, etc.)
-// that cannot be executed inside a single Spanner ReadWriteTransaction.
-// Compare evaluation and op execution happen as separate operations — there is a
-// TOCTOU window between them. This is acceptable for ops that Kubernetes core
-// does not use for optimistic locking (e.g. range reads by operators).
+// that cannot be expressed inside a single Spanner ReadWriteTransaction.
+// Compare evaluation and op execution are separate — a TOCTOU window exists.
+// This path is used only when the Txn contains ops that require it (RangeEnd,
+// CountOnly, IgnoreValue, etc.). Callers must not rely on atomicity of compare+ops
+// — this is a best-effort compatibility path, not a correctness guarantee.
 func (k *KVServer) txnNonAtomic(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error) {
 	succeeded, err := k.evaluateCompare(ctx, r.Compare)
 	if err != nil {
@@ -482,8 +483,7 @@ func (k *KVServer) executeOps(ctx context.Context, ops []*etcdserverpb.RequestOp
 					return nil, 0, err
 				}
 				if cur == nil {
-					// etcd returns error when IgnoreValue/IgnoreLease applied to non-existent key.
-					return nil, 0, status.Errorf(codes.NotFound, "key not found for IgnoreValue/IgnoreLease put: %q", pr.Key)
+					return nil, 0, status.Error(codes.NotFound, "key not found")
 				}
 				merged := *pr
 				if pr.IgnoreValue {
