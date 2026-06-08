@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS kv_cs_cursors (
 ) PRIMARY KEY (replica_id, partition_token);
 
 -- Covering index: serves Get/List reads without a back-join to the base table.
+-- STORING value/old_value (BYTES(MAX)) doubles write amplification for large values.
+-- For workloads with values >1MB, remove value/old_value from STORING.
 CREATE INDEX IF NOT EXISTS kv_key_rev ON kv (key, rev DESC)
     STORING (value, old_value, lease_id, deleted, created, create_revision, prev_revision);
 
