@@ -54,7 +54,7 @@ spanner-etcd \
 
 ### 4. As Kubernetes etcd backend (kubeadm)
 
-Tested with **Kubernetes v1.31.14 (kubeadm)** — full control plane, CoreDNS, Flannel CNI, Deployments, pods — all working.
+Tested with **Kubernetes v1.33.12 (kubeadm)** — full control plane, CoreDNS, Flannel CNI, Deployments, pods — all working. 24h soak test passed with zero errors.
 
 ```yaml
 # kubeadm-config.yaml

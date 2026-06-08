@@ -78,11 +78,19 @@ CREATE TABLE kv (
 ) PRIMARY KEY (id);
 
 -- kv_rev stores only the compact revision (not the current revision).
--- Current revision = MAX(rev) FROM kv — no lock needed.
+-- Current revision = SELECT rev FROM kv ORDER BY rev DESC LIMIT 1
 CREATE TABLE kv_rev (
   id  INT64     NOT NULL,
   rev TIMESTAMP NOT NULL
 ) PRIMARY KEY (id);
+
+-- Covering index: enables index-only reads for Get/List when the optimizer chooses it.
+-- STORING value/old_value doubles write amplification — see docs/performance.md.
+CREATE INDEX kv_key_rev ON kv (key, rev DESC)
+  STORING (value, old_value, lease_id, deleted, created, create_revision, prev_revision);
+
+-- Descending revision index for O(1) CurrentRevision() lookup.
+CREATE INDEX kv_rev_desc ON kv (rev DESC);
 ```
 
 ## Design Decisions
