@@ -203,7 +203,7 @@ func (s *Store) Get(ctx context.Context, key string, revision int64) (currentRev
 	capTS := revToTS(revCap(revision, currentRev))
 	stmt := spanner.Statement{
 		SQL: `SELECT rev, key, value, old_value, lease_id, deleted, created, create_revision, prev_revision
-		      FROM kv@{FORCE_INDEX=kv_key_rev}
+		      FROM kv
 		      WHERE key = @key AND rev <= @cap
 		      ORDER BY key, rev DESC
 		      LIMIT 1`,
@@ -245,10 +245,10 @@ func (s *Store) List(ctx context.Context, prefix, startKey string, limit, revisi
 	stmt := spanner.Statement{
 		SQL: `SELECT kv.rev, kv.key, kv.value, kv.old_value, kv.lease_id,
 		             kv.deleted, kv.created, kv.create_revision, kv.prev_revision
-		      FROM kv@{FORCE_INDEX=kv_key_rev} AS kv
+		      FROM kv
 		      INNER JOIN (
 		        SELECT key, MAX(rev) AS max_rev
-		        FROM kv@{FORCE_INDEX=kv_key_rev}
+		        FROM kv
 		        WHERE key LIKE @prefix AND key >= @start_key
 		          AND rev <= @cap
 		        GROUP BY key

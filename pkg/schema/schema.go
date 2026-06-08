@@ -105,6 +105,10 @@ var statements = []string{
 }
 
 // Ensure creates or updates the schema.
+// Note: CREATE INDEX IF NOT EXISTS does not update an existing index definition.
+// Upgrading an existing database requires manually dropping and recreating
+// kv_key_rev (to add STORING) and dropping the obsolete kv_rev_idx if present.
+// See ddl/schema.sql for details.
 func Ensure(ctx context.Context, adminClient *database.DatabaseAdminClient, dbPath string, log *zap.Logger) error {
 	log.Info("ensuring schema", zap.String("database", dbPath))
 
