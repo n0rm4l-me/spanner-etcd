@@ -4,6 +4,8 @@
 --
 -- NOTE: CREATE INDEX IF NOT EXISTS does NOT update an existing index definition.
 -- To rebuild indexes on an existing database, DROP and recreate them manually.
+-- If upgrading from an older schema, also drop the obsolete kv_rev_idx:
+--   DROP INDEX kv_rev_idx;
 
 CREATE SEQUENCE IF NOT EXISTS kv_seq OPTIONS (
     sequence_kind = 'bit_reversed_positive'
