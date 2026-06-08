@@ -41,6 +41,28 @@ Covering index on `kv(key, rev DESC)` eliminates back-joins on read paths.
 | GET ×32 | 1,391 | 0.7ms |
 | GET ×64 | **1,504** | 0.7ms |
 
+## Spanner Processing Units — Scaling Comparison
+
+Same VM, same database (non-empty, ~40K rows), same benchmark binary. Only Spanner PU changed.
+
+| Operation | 100 PU | 1000 PU | 2000 PU |
+|-----------|-------:|--------:|--------:|
+| Create ×1 | 85 | 83 | 83 |
+| Create ×4 parallel | **134** | **257** | **258** |
+| Update ×1 | 84 | 81 | 85 |
+| Get ×1 | 105 | 100 | 103 |
+| Get ×4 parallel | 475 | 443 | 462 |
+| List 100 keys | 12 | 16 | 14 |
+| Mixed ×4 (70% read) | **332** | **400** | **414** |
+| Watch latency | **33ms** | 116ms | 133ms |
+
+**Key observations:**
+
+- **Single-key ops** are nearly identical across all PU tiers — latency is dominated by network round-trip, not Spanner compute
+- **Parallel writes** scale with PU: Create ×4 drops from 257 to 134 ops/sec at 100 PU — the bottleneck shifts to Spanner CPU under concurrent write load
+- **Watch latency** is surprisingly best at 100 PU (33ms) — Change Stream delivery is faster when the instance is lightly loaded
+- **100 PU is sufficient** for small Kubernetes clusters (< 100 nodes) with moderate write rates; upgrade to 1000 PU for larger clusters or sustained parallel workloads
+
 ## Kubernetes v1.33 — 24h Soak Test
 
 **Environment:** Kubernetes v1.33.12 (kubeadm, single-node), GCP `e2-standard-4`, production Spanner `regional-asia-northeast1` (1000 PU).
