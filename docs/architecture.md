@@ -150,7 +150,7 @@ Txn operations containing `RangeEnd`, `CountOnly`, `IgnoreValue`, or `IgnoreLeas
 
 - Auth RBAC (UserAdd/RoleAdd/GrantPermission) — not needed for standard Kubernetes
 - Defrag / Snapshot — not needed (Spanner manages storage automatically)
-- TLS in production setup — plaintext gRPC (TLS flags exist, not yet validated end-to-end)
+- TLS / mTLS — validated (see [Deployment](deployment.md))
 
 ## Why not kine?
 

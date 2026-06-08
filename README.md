@@ -83,8 +83,8 @@ etcdctl put /hello world && etcdctl get /hello
 | 78 integration tests | ✅ Passing |
 | Kubernetes v1.33.12 (kubeadm) | ✅ Validated |
 | 24h soak test (Kubernetes v1.33) | ✅ Complete |
-| TLS / mTLS in production | ⏳ Planned |
-| Multi-replica HA validation | ⏳ Planned |
+| TLS / mTLS | ✅ Validated |
+| Multi-replica HA | ✅ Validated |
 
 ## License
 

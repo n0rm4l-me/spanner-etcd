@@ -1,0 +1,120 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - uses: actions/setup-go@v5.4.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build binaries
+        run: make build-linux
+
+      - name: log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: set up docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: build and push docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}:latest
+
+      - name: create github release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: false
+          body: |
+            ## spanner-etcd v0.1.0
+
+            First public release. Replace etcd with Google Cloud Spanner. Drop-in, no client changes.
+
+            ```
+            --etcd-servers=http://spanner-etcd:2379
+            ```
+
+            That's it.
+
+            ---
+
+            ### Why
+
+            Standard etcd serializes every write through a shared revision counter. Under load it becomes a bottleneck. spanner-etcd uses `PENDING_COMMIT_TIMESTAMP()` — each transaction commits independently, no lock, no counter. At ×32 concurrency that's **15× higher write throughput**.
+
+            Watch events come from Spanner Change Streams. All replicas are stateless — scale horizontally, lose nothing.
+
+            ---
+
+            ### Performance
+
+            Production Spanner, `asia-northeast1`, 1000 PU, same-region VM.
+
+            | Operation | ops/sec |
+            |-----------|--------:|
+            | Create ×1 | 83 |
+            | Create ×4 parallel | 257 |
+            | Get ×1 | 100 |
+            | Get ×4 parallel | 443 |
+            | Mixed ×4 (70% reads / 20% writes) | 400 |
+            | Watch latency | ~116ms |
+
+            Full numbers: [docs/performance.md](docs/performance.md)
+
+            ---
+
+            ### Validated
+
+            - **Kubernetes v1.33.12** (kubeadm, external etcd) — 24h soak test, zero crashes, zero data loss, 57 Watch streams stable throughout
+            - **22 production Java/Kotlin microservices** (Vert.x + jetcd) on GKE — auth token expiry, pod kill, Watch migration, all clean
+
+            ---
+
+            ### Getting started
+
+            ```bash
+            # Docker
+            docker run --rm \
+              -e SPANNER_DATABASE=projects/P/instances/I/databases/D \
+              -p 2379:2379 \
+              ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+
+            # Or download the binary below and run directly
+            ./spanner-etcd-linux-amd64 \
+              --spanner-database=projects/P/instances/I/databases/D
+            ```
+
+            Docs: [Architecture](docs/architecture.md) · [Deployment](docs/deployment.md) · [Configuration](docs/configuration.md)
+
+            ---
+
+            ### Known limitations
+
+            - Auth RBAC (UserAdd/RoleAdd/GrantPermission) not implemented — not needed for standard Kubernetes
+            - Watch latency ~100–150ms — inherent to Spanner Change Streams, not suitable for sub-10ms use cases
+          files: |
+            spanner-etcd-linux-amd64
+            spanner-etcd-migrate-linux-amd64
