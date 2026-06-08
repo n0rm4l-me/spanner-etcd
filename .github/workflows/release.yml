@@ -24,6 +24,9 @@ jobs:
       - name: build binaries
         run: make build-linux
 
+      - name: vendor dependencies
+        run: make vendor
+
       - name: log in to ghcr.io
         uses: docker/login-action@v3
         with:
