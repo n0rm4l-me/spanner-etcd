@@ -1,0 +1,66 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - uses: actions/setup-go@v5.4.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build binaries
+        run: make build-linux
+
+      - name: log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: set up docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: build and push docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}:latest
+
+      - name: extract changelog
+        id: changelog
+        run: |
+          VERSION="${{ github.ref_name }}"
+          # Extract section from CHANGELOG.md between current and next version header
+          BODY=$(awk "/^## ${VERSION}/{found=1; next} found && /^## v[0-9]/{exit} found{print}" CHANGELOG.md)
+          if [ -z "$BODY" ]; then
+            BODY="See [CHANGELOG.md](CHANGELOG.md) for details."
+          fi
+          echo "body<<EOF" >> $GITHUB_OUTPUT
+          echo "$BODY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: create github release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.changelog.outputs.body }}
+          files: |
+            spanner-etcd-linux-amd64
+            spanner-etcd-migrate-linux-amd64
