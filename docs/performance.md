@@ -1,8 +1,10 @@
 # Performance
 
-Benchmarked on GCP `e2-standard-4` (4 vCPU, 16GB, `asia-northeast1-a`) with production Spanner (`regional-asia-northeast1`, 1000 PU) in the same region — not the emulator.
+All benchmarks run on GCP `e2-standard-4` (4 vCPU, 16GB, `asia-northeast1-a`) against production Spanner (`regional-asia-northeast1`, 1000 PU) in the same region — not the emulator.
 
 ## Write Throughput — PENDING_COMMIT_TIMESTAMP
+
+Benchmarked with the old integer-counter baseline vs PENDING_COMMIT_TIMESTAMP:
 
 | Clients | ops/sec | Avg latency |
 |---------|---------|-------------|
@@ -12,7 +14,23 @@ Benchmarked on GCP `e2-standard-4` (4 vCPU, 16GB, `asia-northeast1-a`) with prod
 
 **vs. integer counter (same hardware):** ×1: 3.6× faster · ×8: 6.5× faster · ×32: **15× faster**
 
-## Read Throughput
+## Full Benchmark Suite — Production Spanner (asia-northeast1, 1000 PU)
+
+Benchmarked against a clean database. Results are averaged over 3 runs.
+
+| Operation | ops/sec | Avg latency | Notes |
+|-----------|---------|-------------|-------|
+| Create ×1 | **82** | 12.1ms | Single-key PUT |
+| Create ×4 (parallel) | **264** | 3.8ms | PCT eliminates write serialization |
+| Update ×1 | **79** | 12.7ms | CAS update |
+| Get ×1 | **71** | 14.1ms | Single-key GET |
+| Get ×4 (parallel) | **282** | 3.5ms | |
+| List 100 keys | **16** | 61ms | Prefix scan, 100 results |
+
+> Performance is dominated by Spanner round-trip latency (~12ms). For best results,
+> run spanner-etcd in the same GCP region as your Spanner instance.
+
+## Read Throughput (high concurrency)
 
 | Clients | ops/sec | Avg latency |
 |---------|---------|-------------|
@@ -20,7 +38,35 @@ Benchmarked on GCP `e2-standard-4` (4 vCPU, 16GB, `asia-northeast1-a`) with prod
 | GET ×32 | 1,391 | 0.7ms |
 | GET ×64 | **1,504** | 0.7ms |
 
-## Kubernetes Workload — kubeadm v1.31 (100 pods, initial validation)
+## Kubernetes v1.33 — 24h Soak Test
+
+**Environment:** Kubernetes v1.33.12 (kubeadm, single-node), GCP `e2-standard-4`, production Spanner `regional-asia-northeast1` (1000 PU).
+
+**Duration:** 24 hours continuous
+
+**Load profile:**
+- Rolling deployment scaled 1–10 replicas every 2 minutes
+- ConfigMap churn every 3 minutes (create + bulk delete)
+- cert-manager operator running concurrently
+- 57 active Watch streams throughout
+
+**Results:**
+
+| Metric | Value |
+|--------|-------|
+| Critical errors (panic / unimplemented) | **0** |
+| spanner-etcd uptime | **28h** (survived full test + data collection) |
+| Change Stream active | **100%** of test duration |
+| Active Watch streams | **57** stable |
+| Total Txn operations | **185,952** |
+| Total KV/Range operations | **237,312** |
+| Auto-compaction | **140,924 rows** cleaned |
+| Avg Txn latency | **~18.6ms** |
+| Kubernetes node status | **Ready** throughout |
+
+**Conclusion:** Zero crashes, zero data loss, zero unimplemented errors over 24 hours with a production Kubernetes v1.33 control plane.
+
+## Kubernetes Workload — kubeadm v1.31 (initial validation)
 
 | Metric | Value |
 |--------|-------|
@@ -28,7 +74,7 @@ Benchmarked on GCP `e2-standard-4` (4 vCPU, 16GB, `asia-northeast1-a`) with prod
 | 100 pods Ready | 44s |
 | KV/Range avg latency | ~22ms |
 
-## Production Validation
+## Production Validation — GKE
 
 Tested with **22 production Java/Kotlin microservices** (Vert.x + jetcd) on GKE:
 
@@ -37,15 +83,3 @@ Tested with **22 production Java/Kotlin microservices** (Vert.x + jetcd) on GKE:
 - Auth token expiry (30s TTL) → auto-reauth with zero errors
 - Pod kill → 45 Watch streams migrated to surviving replica in ~10s, zero errors
 - Watch event delivery confirmed: jetcd received PUT events within ~1s (poll mode)
-
-## Kubernetes v1.33 Soak Test
-
-24-hour soak test on Kubernetes v1.33.12 (kubeadm, single-node, GCP `e2-standard-4`) — in progress.
-
-Load profile:
-- Rolling deployment with 1–10 replicas scaled every 2 minutes
-- ConfigMap churn every 3 minutes (create + bulk delete)
-- cert-manager operator running concurrently
-- 57+ active Watch streams throughout
-
-Results will be published after completion.

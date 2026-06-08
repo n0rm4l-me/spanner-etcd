@@ -66,8 +66,15 @@ func setupStore(b *testing.B) (*store.Store, error) {
 		return nil, fmt.Errorf("spanner client: %w", err)
 	}
 
-	if err := schema.SeedRevCounter(ctx, client); err != nil {
-		return nil, fmt.Errorf("seed rev: %w", err)
+	// Retry SeedRevCounter — first request to production Spanner may timeout
+	// on cold start or after a long idle period.
+	for i := 0; i < 5; i++ {
+		if err := schema.SeedRevCounter(ctx, client); err == nil {
+			break
+		} else if i == 4 {
+			return nil, fmt.Errorf("seed rev: %w", err)
+		}
+		time.Sleep(time.Duration(i+1) * 2 * time.Second)
 	}
 
 	log := zap.NewNop()
@@ -75,6 +82,22 @@ func setupStore(b *testing.B) (*store.Store, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Warmup: fire concurrent reads to pre-populate the Spanner session pool
+	// before benchmarks start. Without this, the first few ops are slow as
+	// sessions are lazily created.
+	b.Log("Warming up Spanner session pool...")
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.CurrentRevision(ctx) //nolint:errcheck
+		}()
+	}
+	wg.Wait()
+	time.Sleep(2 * time.Second)
+	b.Log("Warmup done")
 	return s, nil
 }
 
