@@ -79,12 +79,9 @@ var statements = []string{
 		granted_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp = true)
 	) PRIMARY KEY (lease_id)`,
 
-	// kv_key_rev: primary read path for Get/List — covers the full row so Spanner
-	// can serve reads without a back-join to the base table.
 	`CREATE INDEX IF NOT EXISTS kv_key_rev ON kv (key, rev DESC)
 	   STORING (value, old_value, lease_id, deleted, created, create_revision, prev_revision)`,
 
-	// kv_rev_desc: lets CurrentRevision() use LIMIT 1 instead of a full-table MAX() scan.
 	`CREATE INDEX IF NOT EXISTS kv_rev_desc  ON kv (rev DESC)`,
 	`CREATE INDEX IF NOT EXISTS kv_lease_idx ON kv (lease_id) STORING (key, rev)`,
 

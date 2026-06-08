@@ -201,7 +201,6 @@ func (s *Store) Get(ctx context.Context, key string, revision int64) (currentRev
 	}
 
 	capTS := revToTS(revCap(revision, currentRev))
-	// kv_key_rev STORING covers all columns — no back-join to base table.
 	stmt := spanner.Statement{
 		SQL: `SELECT rev, key, value, old_value, lease_id, deleted, created, create_revision, prev_revision
 		      FROM kv@{FORCE_INDEX=kv_key_rev}
@@ -243,8 +242,6 @@ func (s *Store) List(ctx context.Context, prefix, startKey string, limit, revisi
 	}
 	capTS := revToTS(revCap(revision, currentRev))
 
-	// kv_key_rev STORING covers all columns — subquery and outer scan both hit
-	// the index only, no back-join to the base table.
 	stmt := spanner.Statement{
 		SQL: `SELECT kv.rev, kv.key, kv.value, kv.old_value, kv.lease_id,
 		             kv.deleted, kv.created, kv.create_revision, kv.prev_revision
