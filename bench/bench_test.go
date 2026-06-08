@@ -351,15 +351,17 @@ func BenchmarkWatch_Latency(b *testing.B) {
 	defer cancel()
 
 	curRev, _ := s.CurrentRevision(ctx)
-	ch := s.Watch(ctx, "/bench/watch/", curRev)
-	time.Sleep(200 * time.Millisecond) // let watch register
+	prefix := fmt.Sprintf("/bench/watch/%d/", time.Now().UnixNano())
+	ch := s.Watch(ctx, prefix, curRev)
+	// Wait for Change Stream to initialize — cold start can take 3–5s on production Spanner.
+	time.Sleep(5 * time.Second)
 
 	var totalLatency time.Duration
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
 		t0 := time.Now()
-		key := fmt.Sprintf("/bench/watch/%d", i)
+		key := fmt.Sprintf("%s%d", prefix, i)
 		s.Create(ctx, key, []byte("v"), 0)
 
 		select {
