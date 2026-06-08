@@ -34,5 +34,8 @@ coverage.html
 
 # macOS
 .DS_Store
+
+# Local drafts
+blogpost-draft.md
 TESTING.local.md
 TEST_PLAN.local.md

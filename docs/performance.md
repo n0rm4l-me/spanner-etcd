@@ -63,6 +63,31 @@ Same VM, same database (non-empty, ~40K rows), same benchmark binary. Only Spann
 - **Watch latency** is surprisingly best at 100 PU (33ms) — Change Stream delivery is faster when the instance is lightly loaded
 - **100 PU is sufficient** for small Kubernetes clusters (< 100 nodes) with moderate write rates; upgrade to 1000 PU for larger clusters or sustained parallel workloads
 
+## Multi-Region (asia1) vs Regional
+
+`asia1` config: Tokyo (×2 read-write) + Osaka (×2 read-write) + Seoul (witness). Spanner leader resides in Tokyo (`asia-northeast1`).
+
+Benchmarked from two VMs — one in Tokyo (`asia-northeast1-a`), one in Osaka (`asia-northeast2-a`) — against the same `asia1` instance (1000 PU).
+
+| Operation | Regional Tokyo | asia1 from Tokyo | asia1 from Osaka |
+|-----------|---------------:|-----------------:|-----------------:|
+| Create ×1 | 83 | 53 | **30** |
+| Create ×4 parallel | 257 | 203 | **121** |
+| Update ×1 | 81 | 53 | **37** |
+| Get ×1 | 100 | 109 | **40** |
+| Get ×4 parallel | 443 | 497 | **167** |
+| List 100 keys | 16 | 50 | **20** |
+| Mixed ×4 (70% read) | 400 | 294 | **158** |
+| Watch latency | 116ms | **35ms** | 62ms |
+
+**Key observations:**
+
+- **Writes cost ~35% more from Tokyo** — every write must replicate synchronously to Osaka before committing
+- **Osaka writes are 2-3× slower than Tokyo** — each write travels Tokyo→Osaka→Tokyo (cross-region round-trip to the leader)
+- **Reads from Tokyo are faster in multi-region** — strong reads served locally by the Tokyo replica without cross-region traffic
+- **Watch latency is best from Tokyo on asia1 (35ms)** — likely because Change Stream partitions align with the leader region
+- **Rule of thumb:** deploy spanner-etcd replicas in the same region as the Spanner leader for best write performance. Use multi-region Spanner only if you need RPO=0 across a regional failure — you pay ~35% write latency penalty for it.
+
 ## Kubernetes v1.33 — 24h Soak Test
 
 **Environment:** Kubernetes v1.33.12 (kubeadm, single-node), GCP `e2-standard-4`, production Spanner `regional-asia-northeast1` (1000 PU).
@@ -91,13 +116,13 @@ Same VM, same database (non-empty, ~40K rows), same benchmark binary. Only Spann
 
 **Conclusion:** Zero crashes, zero data loss, zero unimplemented errors over 24 hours with a production Kubernetes v1.33 control plane.
 
-## Kubernetes Workload — kubeadm v1.31 (initial validation)
+## Kubernetes Workload — kubeadm v1.33.12
 
 | Metric | Value |
 |--------|-------|
 | 50 Deployments created (parallel) | 3.75s |
 | 100 pods Ready | 44s |
-| KV/Range avg latency | ~22ms |
+| KV/Range avg latency | ~18.6ms |
 
 ## Production Validation — GKE
 
