@@ -1,6 +1,9 @@
 -- spanner-etcd DDL schema
 -- Apply with: gcloud spanner databases ddl update DATABASE \
 --   --instance=INSTANCE --project=PROJECT --ddl-file=ddl/schema.sql
+--
+-- NOTE: CREATE INDEX IF NOT EXISTS does NOT update an existing index definition.
+-- To rebuild indexes on an existing database, DROP and recreate them manually.
 
 CREATE SEQUENCE IF NOT EXISTS kv_seq OPTIONS (
     sequence_kind = 'bit_reversed_positive'
@@ -39,8 +42,12 @@ CREATE TABLE IF NOT EXISTS kv_cs_cursors (
     updated_at       TIMESTAMP   NOT NULL OPTIONS (allow_commit_timestamp = true)
 ) PRIMARY KEY (replica_id, partition_token);
 
-CREATE INDEX IF NOT EXISTS kv_key_rev   ON kv (key, rev DESC);
-CREATE INDEX IF NOT EXISTS kv_rev_idx   ON kv (rev);
+-- Covering index: serves Get/List reads without a back-join to the base table.
+CREATE INDEX IF NOT EXISTS kv_key_rev ON kv (key, rev DESC)
+    STORING (value, old_value, lease_id, deleted, created, create_revision, prev_revision);
+
+-- Descending revision index: lets CurrentRevision() seek O(1) instead of full scan.
+CREATE INDEX IF NOT EXISTS kv_rev_desc  ON kv (rev DESC);
 CREATE INDEX IF NOT EXISTS kv_lease_idx ON kv (lease_id) STORING (key, rev);
 
 CREATE CHANGE STREAM IF NOT EXISTS kv_changes

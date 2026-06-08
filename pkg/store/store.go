@@ -158,10 +158,11 @@ func (s *Store) Leases() *LeaseManager {
 }
 
 // CurrentRevision returns the latest global revision as int64 (UnixNano).
-// Uses kv_rev_desc index (rev DESC) + LIMIT 1 — O(1) index seek, not a full scan.
+// With kv_rev_desc present Spanner uses an O(1) index seek; without it falls
+// back to a full scan — correct either way, no FORCE_INDEX dependency.
 func (s *Store) CurrentRevision(ctx context.Context) (int64, error) {
 	iter := s.client.Single().Query(ctx, spanner.Statement{
-		SQL: `SELECT rev FROM kv@{FORCE_INDEX=kv_rev_desc} ORDER BY rev DESC LIMIT 1`,
+		SQL: `SELECT rev FROM kv ORDER BY rev DESC LIMIT 1`,
 	})
 	defer iter.Stop()
 	row, err := iter.Next()
