@@ -2,6 +2,7 @@
 /spanner-etcd
 /spanner-etcd-migrate
 /spanner-etcd-linux-amd64
+/bench-linux-amd64
 /spanner-etcd-migrate-linux-amd64
 /migrate
 /cmd/server/spanner-etcd

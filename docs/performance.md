@@ -17,15 +17,17 @@ Benchmarked with the old integer-counter baseline vs PENDING_COMMIT_TIMESTAMP:
 ## Full Benchmark Suite — Production Spanner (asia-northeast1, 1000 PU)
 
 Benchmarked against a clean database. Results are averaged over 3 runs.
+Covering index on `kv(key, rev DESC)` eliminates back-joins on read paths.
 
 | Operation | ops/sec | Avg latency | Notes |
 |-----------|---------|-------------|-------|
-| Create ×1 | **82** | 12.1ms | Single-key PUT |
-| Create ×4 (parallel) | **264** | 3.8ms | PCT eliminates write serialization |
-| Update ×1 | **79** | 12.7ms | CAS update |
-| Get ×1 | **71** | 14.1ms | Single-key GET |
-| Get ×4 (parallel) | **282** | 3.5ms | |
-| List 100 keys | **16** | 61ms | Prefix scan, 100 results |
+| Create ×1 | **83** | 12.0ms | Single-key PUT |
+| Create ×4 (parallel) | **257** | 3.9ms | PCT eliminates write serialization |
+| Update ×1 | **81** | 12.3ms | CAS update |
+| Get ×1 | **100** | 10.0ms | Single-key GET |
+| Get ×4 (parallel) | **443** | 2.3ms | |
+| List 100 keys | **16** | 63ms | Prefix scan, 100 results |
+| Mixed ×4 (70% read / 20% write / 10% update) | **400** | 2.5ms | Kubernetes-like workload |
 
 > Performance is dominated by Spanner round-trip latency (~12ms). For best results,
 > run spanner-etcd in the same GCP region as your Spanner instance.
@@ -34,7 +36,8 @@ Benchmarked against a clean database. Results are averaged over 3 runs.
 
 | Clients | ops/sec | Avg latency |
 |---------|---------|-------------|
-| GET ×1 | 71 | 14.0ms |
+| GET ×1 | 100 | 10.0ms |
+| GET ×4 | 443 | 2.3ms |
 | GET ×32 | 1,391 | 0.7ms |
 | GET ×64 | **1,504** | 0.7ms |
 

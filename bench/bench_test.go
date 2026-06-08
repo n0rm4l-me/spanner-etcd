@@ -72,6 +72,7 @@ func setupStore(b *testing.B) (*store.Store, error) {
 		if err := schema.SeedRevCounter(ctx, client); err == nil {
 			break
 		} else if i == 4 {
+			client.Close()
 			return nil, fmt.Errorf("seed rev: %w", err)
 		}
 		time.Sleep(time.Duration(i+1) * 2 * time.Second)
@@ -80,6 +81,7 @@ func setupStore(b *testing.B) (*store.Store, error) {
 	log := zap.NewNop()
 	s, err := store.New(ctx, client, log)
 	if err != nil {
+		client.Close()
 		return nil, err
 	}
 

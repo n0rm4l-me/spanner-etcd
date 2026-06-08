@@ -79,8 +79,14 @@ var statements = []string{
 		granted_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp = true)
 	) PRIMARY KEY (lease_id)`,
 
-	`CREATE INDEX IF NOT EXISTS kv_key_rev   ON kv (key, rev DESC)`,
-	`CREATE INDEX IF NOT EXISTS kv_rev_idx   ON kv (rev)`,
+	// STORING includes value/old_value (BYTES(MAX)) so Spanner can serve Get/List
+	// reads from the index without a back-join when the optimizer chooses this index.
+	// Trade-off: doubles write amplification for large values. For workloads with
+	// values >1MB consider removing value/old_value from STORING.
+	`CREATE INDEX IF NOT EXISTS kv_key_rev ON kv (key, rev DESC)
+	   STORING (value, old_value, lease_id, deleted, created, create_revision, prev_revision)`,
+
+	`CREATE INDEX IF NOT EXISTS kv_rev_desc  ON kv (rev DESC)`,
 	`CREATE INDEX IF NOT EXISTS kv_lease_idx ON kv (lease_id) STORING (key, rev)`,
 
 	`CREATE CHANGE STREAM IF NOT EXISTS kv_changes
@@ -99,6 +105,10 @@ var statements = []string{
 }
 
 // Ensure creates or updates the schema.
+// Note: CREATE INDEX IF NOT EXISTS does not update an existing index definition.
+// Upgrading an existing database requires manually dropping and recreating
+// kv_key_rev (to add STORING) and dropping the obsolete kv_rev_idx if present.
+// See ddl/schema.sql for details.
 func Ensure(ctx context.Context, adminClient *database.DatabaseAdminClient, dbPath string, log *zap.Logger) error {
 	log.Info("ensuring schema", zap.String("database", dbPath))
 

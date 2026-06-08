@@ -1,6 +1,11 @@
 -- spanner-etcd DDL schema
 -- Apply with: gcloud spanner databases ddl update DATABASE \
 --   --instance=INSTANCE --project=PROJECT --ddl-file=ddl/schema.sql
+--
+-- NOTE: CREATE INDEX IF NOT EXISTS does NOT update an existing index definition.
+-- To rebuild indexes on an existing database, DROP and recreate them manually.
+-- If upgrading from an older schema, also drop the obsolete kv_rev_idx:
+--   DROP INDEX kv_rev_idx;
 
 CREATE SEQUENCE IF NOT EXISTS kv_seq OPTIONS (
     sequence_kind = 'bit_reversed_positive'
@@ -39,8 +44,15 @@ CREATE TABLE IF NOT EXISTS kv_cs_cursors (
     updated_at       TIMESTAMP   NOT NULL OPTIONS (allow_commit_timestamp = true)
 ) PRIMARY KEY (replica_id, partition_token);
 
-CREATE INDEX IF NOT EXISTS kv_key_rev   ON kv (key, rev DESC);
-CREATE INDEX IF NOT EXISTS kv_rev_idx   ON kv (rev);
+-- Covering index: enables index-only reads for Get/List when the optimizer chooses it,
+-- avoiding a back-join to the base table.
+-- STORING value/old_value (BYTES(MAX)) doubles write amplification for large values.
+-- For workloads with values >1MB, remove value/old_value from STORING.
+CREATE INDEX IF NOT EXISTS kv_key_rev ON kv (key, rev DESC)
+    STORING (value, old_value, lease_id, deleted, created, create_revision, prev_revision);
+
+-- Descending revision index: lets CurrentRevision() seek O(1) instead of full scan.
+CREATE INDEX IF NOT EXISTS kv_rev_desc  ON kv (rev DESC);
 CREATE INDEX IF NOT EXISTS kv_lease_idx ON kv (lease_id) STORING (key, rev);
 
 CREATE CHANGE STREAM IF NOT EXISTS kv_changes

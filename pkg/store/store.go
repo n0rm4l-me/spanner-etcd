@@ -158,25 +158,25 @@ func (s *Store) Leases() *LeaseManager {
 }
 
 // CurrentRevision returns the latest global revision as int64 (UnixNano).
-// With PCT, current revision = MAX(rev) FROM kv — no lock, no contention.
+// With kv_rev_desc present Spanner uses an O(1) index seek; without it falls
+// back to a full scan — correct either way, no FORCE_INDEX dependency.
 func (s *Store) CurrentRevision(ctx context.Context) (int64, error) {
-	iter := s.client.Single().Query(ctx, spanner.Statement{SQL: `SELECT MAX(rev) FROM kv`})
+	iter := s.client.Single().Query(ctx, spanner.Statement{
+		SQL: `SELECT rev FROM kv ORDER BY rev DESC LIMIT 1`,
+	})
 	defer iter.Stop()
 	row, err := iter.Next()
 	if errors.Is(err, iterator.Done) {
-		return 1, nil
+		return 1, nil // empty table
 	}
 	if err != nil {
 		return 0, fmt.Errorf("current revision: %w", err)
 	}
-	var ts spanner.NullTime
+	var ts time.Time
 	if err := row.Column(0, &ts); err != nil {
 		return 0, err
 	}
-	if !ts.Valid {
-		return 1, nil // empty table
-	}
-	rev := tsToRev(ts.Time)
+	rev := tsToRev(ts)
 	if rev <= 1 {
 		return 1, nil
 	}
@@ -204,11 +204,9 @@ func (s *Store) Get(ctx context.Context, key string, revision int64) (currentRev
 	stmt := spanner.Statement{
 		SQL: `SELECT rev, key, value, old_value, lease_id, deleted, created, create_revision, prev_revision
 		      FROM kv
-		      WHERE key = @key
-		        AND rev = (
-		          SELECT MAX(rev) FROM kv
-		          WHERE key = @key AND rev <= @cap
-		        )`,
+		      WHERE key = @key AND rev <= @cap
+		      ORDER BY key, rev DESC
+		      LIMIT 1`,
 		Params: map[string]interface{}{
 			"key": key,
 			"cap": capTS,
