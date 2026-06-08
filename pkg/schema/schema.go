@@ -79,10 +79,10 @@ var statements = []string{
 		granted_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp = true)
 	) PRIMARY KEY (lease_id)`,
 
-	// STORING includes value/old_value (BYTES(MAX)) to eliminate back-joins on reads.
+	// STORING includes value/old_value (BYTES(MAX)) so Spanner can serve Get/List
+	// reads from the index without a back-join when the optimizer chooses this index.
 	// Trade-off: doubles write amplification for large values. For workloads with
-	// values >1MB consider removing value/old_value from STORING and accepting the
-	// back-join cost on those columns.
+	// values >1MB consider removing value/old_value from STORING.
 	`CREATE INDEX IF NOT EXISTS kv_key_rev ON kv (key, rev DESC)
 	   STORING (value, old_value, lease_id, deleted, created, create_revision, prev_revision)`,
 
