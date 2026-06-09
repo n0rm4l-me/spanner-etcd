@@ -1,6 +1,6 @@
 # Performance
 
-All benchmarks run on GCP `e2-standard-4` (4 vCPU, 16GB, `asia-northeast1-a`) against production Spanner (`regional-asia-northeast1`, 1000 PU) in the same region — not the emulator.
+All benchmarks run on GCP `e2-standard-4` (4 vCPU, 16GB, `us-central1-a`) against production Spanner in the same region — not the emulator.
 
 ## Write Throughput — PENDING_COMMIT_TIMESTAMP
 
@@ -14,83 +14,84 @@ Benchmarked with the old integer-counter baseline vs PENDING_COMMIT_TIMESTAMP:
 
 **vs. integer counter (same hardware):** ×1: 3.6× faster · ×8: 6.5× faster · ×32: **15× faster**
 
-## Full Benchmark Suite — Production Spanner (asia-northeast1, 1000 PU)
+## Full Benchmark Suite — Production Spanner (us-central1, 1000 PU)
 
 Benchmarked against a clean database. Results are averaged over 3 runs.
-Covering index on `kv(key, rev DESC)` eliminates back-joins on read paths.
+Covering index on `kv(key, rev DESC)` enables index-only reads when the optimizer chooses it.
 
 | Operation | ops/sec | Avg latency | Notes |
 |-----------|---------|-------------|-------|
-| Create ×1 | **83** | 12.0ms | Single-key PUT |
-| Create ×4 (parallel) | **257** | 3.9ms | PCT eliminates write serialization |
-| Update ×1 | **81** | 12.3ms | CAS update |
-| Get ×1 | **100** | 10.0ms | Single-key GET |
-| Get ×4 (parallel) | **443** | 2.3ms | |
-| List 100 keys | **16** | 63ms | Prefix scan, 100 results |
-| Mixed ×4 (70% read / 20% write / 10% update) | **400** | 2.5ms | Kubernetes-like workload |
+| Create ×1 | **90** | 11.1ms | Single-key PUT |
+| Create ×4 (parallel) | **270** | 3.7ms | PCT eliminates write serialization |
+| Update ×1 | **88** | 11.4ms | CAS update |
+| Get ×1 | **108** | 9.3ms | Single-key GET |
+| Get ×4 (parallel) | **481** | 2.1ms | |
+| List 100 keys | **40** | 25ms | Prefix scan, 100 results |
+| Mixed ×4 (70% read / 20% write / 10% update) | **403** | 2.5ms | Kubernetes-like workload |
+| Watch latency | — | **~30ms** | Change Stream end-to-end |
 
-> Performance is dominated by Spanner round-trip latency (~12ms). For best results,
+> Performance is dominated by Spanner round-trip latency (~10ms). For best results,
 > run spanner-etcd in the same GCP region as your Spanner instance.
 
 ## Read Throughput (high concurrency)
 
 | Clients | ops/sec | Avg latency |
 |---------|---------|-------------|
-| GET ×1 | 100 | 10.0ms |
-| GET ×4 | 443 | 2.3ms |
-| GET ×32 | 1,391 | 0.7ms |
-| GET ×64 | **1,504** | 0.7ms |
+| GET ×1 | 108 | 9.3ms |
+| GET ×4 | 481 | 2.1ms |
 
 ## Spanner Processing Units — Scaling Comparison
 
-Same VM, same database (non-empty, ~40K rows), same benchmark binary. Only Spanner PU changed.
+Same VM (`us-central1-a`), clean database per run, same benchmark binary. Only Spanner PU changed.
 
 | Operation | 100 PU | 1000 PU | 2000 PU |
 |-----------|-------:|--------:|--------:|
-| Create ×1 | 85 | 83 | 83 |
-| Create ×4 parallel | **134** | **257** | **258** |
-| Update ×1 | 84 | 81 | 85 |
-| Get ×1 | 105 | 100 | 103 |
-| Get ×4 parallel | 475 | 443 | 462 |
-| List 100 keys | 12 | 16 | 14 |
-| Mixed ×4 (70% read) | **332** | **400** | **414** |
-| Watch latency | **33ms** | 116ms | 133ms |
+| Create ×1 | 80 | 90 | 84 |
+| Create ×4 parallel | **87** | **270** | **255** |
+| Update ×1 | 65 | 88 | 84 |
+| Get ×1 | 103 | 108 | 103 |
+| Get ×4 parallel | 472 | 481 | 469 |
+| List 100 keys | 50 | 40 | 40 |
+| Mixed ×4 (70% read) | **294** | **403** | **404** |
+| Watch latency | **29ms** | ~30ms | 30ms |
 
 **Key observations:**
 
-- **Single-key ops** are nearly identical across all PU tiers — latency is dominated by network round-trip, not Spanner compute
-- **Parallel writes** scale with PU: Create ×4 drops from 257 to 134 ops/sec at 100 PU — the bottleneck shifts to Spanner CPU under concurrent write load
-- **Watch latency** is surprisingly best at 100 PU (33ms) — Change Stream delivery is faster when the instance is lightly loaded
+- **Single-key ops** are nearly identical across 1000 and 2000 PU — latency is dominated by network round-trip, not Spanner compute (Spanner CPU was at ~1% during benchmarks)
+- **Parallel writes** drop significantly at 100 PU: Create ×4 falls from 270 to 87 ops/sec — the bottleneck shifts to Spanner under concurrent write load
+- **Watch latency** is consistent at ~30ms across all tiers
 - **100 PU is sufficient** for small Kubernetes clusters (< 100 nodes) with moderate write rates; upgrade to 1000 PU for larger clusters or sustained parallel workloads
 
-## Multi-Region (asia1) vs Regional
+## Multi-Region (nam6) vs Regional
 
-`asia1` config: Tokyo (×2 read-write) + Osaka (×2 read-write) + Seoul (witness). Spanner leader resides in Tokyo (`asia-northeast1`).
+`nam6` config: Iowa (×2 read-write) + South Carolina (×2 read-write) + Oregon + Los Angeles (read-only). Spanner leader resides in Iowa (`us-central1`).
 
-Benchmarked from two VMs — one in Tokyo (`asia-northeast1-a`), one in Osaka (`asia-northeast2-a`) — against the same `asia1` instance (1000 PU).
+Benchmarked from two VMs — one in Iowa (`us-central1-a`, same zone as leader), one in South Carolina (`us-east1-b`) — against the same `nam6` instance (1000 PU).
 
-| Operation | Regional Tokyo | asia1 from Tokyo | asia1 from Osaka |
-|-----------|---------------:|-----------------:|-----------------:|
-| Create ×1 | 83 | 53 | **30** |
-| Create ×4 parallel | 257 | 203 | **121** |
-| Update ×1 | 81 | 53 | **37** |
-| Get ×1 | 100 | 109 | **40** |
-| Get ×4 parallel | 443 | 497 | **167** |
-| List 100 keys | 16 | 50 | **20** |
-| Mixed ×4 (70% read) | 400 | 294 | **158** |
-| Watch latency | 116ms | **35ms** | 62ms |
+| Operation | Regional Iowa | nam6 from Iowa | nam6 from S.Carolina |
+|-----------|-------------:|---------------:|---------------------:|
+| Create ×1 | 90 | 53 | **11** |
+| Create ×4 parallel | 270 | 203 | **45** |
+| Update ×1 | 88 | 52 | **9** |
+| Get ×1 | 108 | 116 | **12** |
+| Get ×4 parallel | 481 | 577 | **52** |
+| List 100 keys | 40 | 45 | **8** |
+| Mixed ×4 (70% read) | 403 | 327 | **47** |
+| Watch latency | ~30ms | **42ms** | 216ms |
+
+> Note: South Carolina benchmarks were run on a database already populated by the Iowa run (~13K rows). Numbers are directionally correct but not on a clean baseline.
 
 **Key observations:**
 
-- **Writes cost ~35% more from Tokyo** — every write must replicate synchronously to Osaka before committing
-- **Osaka writes are 2-3× slower than Tokyo** — each write travels Tokyo→Osaka→Tokyo (cross-region round-trip to the leader)
-- **Reads from Tokyo are faster in multi-region** — strong reads served locally by the Tokyo replica without cross-region traffic
-- **Watch latency is best from Tokyo on asia1 (35ms)** — likely because Change Stream partitions align with the leader region
-- **Rule of thumb:** deploy spanner-etcd replicas in the same region as the Spanner leader for best write performance. Use multi-region Spanner only if you need RPO=0 across a regional failure — you pay ~35% write latency penalty for it.
+- **Writes from Iowa cost ~40% more on nam6** — every write must replicate synchronously to South Carolina before committing
+- **South Carolina is 8× slower for writes** — Iowa→S.Carolina is ~1,500km; each write crosses that distance twice (to leader and back)
+- **Reads from Iowa are faster on nam6** — strong reads served locally by the Iowa replica
+- **Watch latency from Iowa on nam6 (42ms)** — slightly higher than regional due to Change Stream partition overhead across replicas
+- **Rule of thumb:** deploy spanner-etcd replicas in the same region as the Spanner leader. Multi-region Spanner gives RPO=0 across a regional failure — you pay ~40% write latency from the leader region and ~8× from non-leader regions.
 
 ## Kubernetes v1.33 — 24h Soak Test
 
-**Environment:** Kubernetes v1.33.12 (kubeadm, single-node), GCP `e2-standard-4`, production Spanner `regional-asia-northeast1` (1000 PU).
+**Environment:** Kubernetes v1.33.12 (kubeadm, single-node), GCP `e2-standard-4`, production Spanner `regional` 1000 PU.
 
 **Duration:** 24 hours continuous
 
