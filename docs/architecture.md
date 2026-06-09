@@ -37,21 +37,6 @@ Kubernetes API Server (or any etcd client)
 
 Multiple `spanner-etcd` replicas can run concurrently — all state lives in Spanner. No consensus, no leader election between replicas.
 
-```mermaid
-graph TD
-    Client["etcd client\n(Kubernetes API Server)"]
-    LB["LoadBalancer :2379"]
-    SE1["spanner-etcd-1"]
-    SE2["spanner-etcd-2"]
-    SP[("Google Cloud Spanner")]
-
-    Client --> LB
-    LB --> SE1
-    LB --> SE2
-    SE1 --> SP
-    SE2 --> SP
-```
-
 ## Implemented etcd v3 API
 
 | Service | Method | Status | Notes |
