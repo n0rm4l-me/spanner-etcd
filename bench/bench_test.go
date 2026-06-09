@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/spanner"
+	sppb "cloud.google.com/go/spanner/apiv1/spannerpb"
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
 	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	instance "cloud.google.com/go/spanner/admin/instance/apiv1"
@@ -61,7 +62,20 @@ func setupStore(b *testing.B) (*store.Store, error) {
 		dbPath = setupEmulatorDB(b, ctx)
 	}
 
-	client, err := spanner.NewClient(ctx, dbPath)
+	spannerCfg := spanner.ClientConfig{}
+	if loc := strings.TrimSpace(os.Getenv("SPANNER_READ_LOCATION")); loc != "" {
+		spannerCfg.DirectedReadOptions = &sppb.DirectedReadOptions{
+			Replicas: &sppb.DirectedReadOptions_IncludeReplicas_{
+				IncludeReplicas: &sppb.DirectedReadOptions_IncludeReplicas{
+					ReplicaSelections: []*sppb.DirectedReadOptions_ReplicaSelection{
+						{Location: loc},
+					},
+				},
+			},
+		}
+		b.Logf("Directed reads enabled: %s", loc)
+	}
+	client, err := spanner.NewClientWithConfig(ctx, dbPath, spannerCfg)
 	if err != nil {
 		return nil, fmt.Errorf("spanner client: %w", err)
 	}
