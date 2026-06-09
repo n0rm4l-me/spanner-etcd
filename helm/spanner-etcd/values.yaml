@@ -65,6 +65,12 @@ metricsAddr: "0.0.0.0:2381"
 # Log level: debug | info | warn | error
 logLevel: info
 
+# Directed reads — route read operations to a Spanner replica in the specified
+# GCP region instead of the leader. Use with multi-region Spanner instances to
+# reduce read latency from non-leader regions. Writes always go to the leader.
+# Example: "us-east1" for a replica in South Carolina when the leader is in Iowa.
+spannerReadLocation: ""
+
 # Authentication — simple username/password, no RBAC.
 # Format: "user1:pass1,user2:pass2"
 # Can be passed directly or from an existing Secret.

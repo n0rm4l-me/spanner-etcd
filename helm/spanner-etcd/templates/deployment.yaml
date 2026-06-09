@@ -52,6 +52,9 @@ spec:
             {{- if .Values.auth.tokenTTL }}
             - --auth-token-ttl={{ .Values.auth.tokenTTL }}
             {{- end }}
+            {{- if .Values.spannerReadLocation }}
+            - --spanner-read-location={{ .Values.spannerReadLocation }}
+            {{- end }}
             {{- if .Values.tls.existingSecret }}
             - --tls-cert=/tls/tls.crt
             - --tls-key=/tls/tls.key
