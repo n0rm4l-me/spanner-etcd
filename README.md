@@ -27,7 +27,7 @@ Implements the complete etcd v3 KV/Watch/Lease/Auth gRPC API. Deploy spanner-etc
 | Durability | Single-region by default | 99.999% SLA |
 | Operations | Cluster management, backups | Fully managed by Google |
 | Write throughput (×32) | baseline | **15× faster** (PENDING_COMMIT_TIMESTAMP) |
-| Watch latency | ~1ms (local) | **10–50ms** (Change Streams) |
+| Watch latency | ~1ms (local) | **~30ms** (Change Streams) |
 
 ## Why
 
