@@ -150,12 +150,22 @@ sequenceDiagram
 
 All replicas are stateless — all state lives in Spanner.
 
-```
-                    LoadBalancer :2379
-                   /              \
-          spanner-etcd-1    spanner-etcd-2
-                   \              /
-                Google Cloud Spanner
+```mermaid
+graph TD
+    Client["etcd client\n(Kubernetes API Server)"]
+    LB["LoadBalancer :2379"]
+    SE1["spanner-etcd-1"]
+    SE2["spanner-etcd-2"]
+    SE3["spanner-etcd-N"]
+    SP[("Google Cloud Spanner")]
+
+    Client --> LB
+    LB --> SE1
+    LB --> SE2
+    LB --> SE3
+    SE1 --> SP
+    SE2 --> SP
+    SE3 --> SP
 ```
 
 On pod restart, Watch clients reconnect automatically via the etcd client retry logic. With `preStop: sleep 15s`, Kubernetes removes the pod from Service endpoints before SIGTERM — Watch streams migrate to surviving replicas with zero errors.
