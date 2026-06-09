@@ -9,7 +9,7 @@
 
 ### Performance
 
-Benchmarks on `us-central1`, `e2-standard-4`, production Spanner:
+Benchmarks on `us-central1`, `e2-standard-4`, production Spanner (1000 PU):
 
 | Operation | ops/sec |
 |-----------|--------:|
