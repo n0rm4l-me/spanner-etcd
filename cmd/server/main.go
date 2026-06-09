@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/spanner"
+	sppb "cloud.google.com/go/spanner/apiv1/spannerpb"
 	spanneradmin "cloud.google.com/go/spanner/admin/database/apiv1"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -69,22 +70,34 @@ func run(ctx context.Context, cfg appConfig, log *zap.Logger) error {
 	}
 
 	// ── Spanner client ────────────────────────────────────────────────────────
-	spannerClient, err := spanner.NewClientWithConfig(ctx, cfg.spannerDatabase,
-		spanner.ClientConfig{
-			NumChannels: cfg.spannerChannels,
-			SessionPoolConfig: spanner.SessionPoolConfig{
-				MinOpened:          cfg.spannerMinSessions,
-				MaxOpened:          cfg.spannerMaxSessions,
-				WriteSessions:      0.5,
-				HealthCheckWorkers: 10,
-			},
-			// DisableNativeMetrics suppresses the "monitoring.timeSeries.create
-			// denied" noise from Spanner's built-in client-side metrics.
-			// Enable with --spanner-native-metrics if roles/monitoring.metricWriter
-			// is granted (useful for Spanner client dashboards in Cloud Monitoring).
-			DisableNativeMetrics: !cfg.spannerNativeMetrics,
+	spannerCfg := spanner.ClientConfig{
+		NumChannels: cfg.spannerChannels,
+		SessionPoolConfig: spanner.SessionPoolConfig{
+			MinOpened:          cfg.spannerMinSessions,
+			MaxOpened:          cfg.spannerMaxSessions,
+			WriteSessions:      0.5,
+			HealthCheckWorkers: 10,
 		},
-	)
+		// DisableNativeMetrics suppresses the "monitoring.timeSeries.create
+		// denied" noise from Spanner's built-in client-side metrics.
+		// Enable with --spanner-native-metrics if roles/monitoring.metricWriter
+		// is granted (useful for Spanner client dashboards in Cloud Monitoring).
+		DisableNativeMetrics: !cfg.spannerNativeMetrics,
+	}
+	if cfg.spannerReadLocation != "" {
+		spannerCfg.DirectedReadOptions = &sppb.DirectedReadOptions{
+			Replicas: &sppb.DirectedReadOptions_IncludeReplicas_{
+				IncludeReplicas: &sppb.DirectedReadOptions_IncludeReplicas{
+					ReplicaSelections: []*sppb.DirectedReadOptions_ReplicaSelection{
+						{Location: cfg.spannerReadLocation},
+					},
+					AutoFailoverDisabled: false,
+				},
+			},
+		}
+		log.Info("directed reads enabled", zap.String("location", cfg.spannerReadLocation))
+	}
+	spannerClient, err := spanner.NewClientWithConfig(ctx, cfg.spannerDatabase, spannerCfg)
 	if err != nil {
 		return fmt.Errorf("create spanner client: %w", err)
 	}
@@ -132,6 +145,7 @@ type appConfig struct {
 	spannerMinSessions   uint64
 	spannerMaxSessions   uint64
 	spannerNativeMetrics bool
+	spannerReadLocation  string // e.g. "us-east1" for directed reads
 	tlsCert              string
 	tlsKey               string
 	tlsCA                string
@@ -168,6 +182,8 @@ func parseFlags() appConfig {
 			cfg.metricsAddr = strings.TrimPrefix(arg, "--metrics-addr=")
 		case arg == "--spanner-native-metrics":
 			cfg.spannerNativeMetrics = true
+		case strings.HasPrefix(arg, "--spanner-read-location="):
+			cfg.spannerReadLocation = strings.TrimPrefix(arg, "--spanner-read-location=")
 		case strings.HasPrefix(arg, "--spanner-database="):
 			cfg.spannerDatabase = strings.TrimPrefix(arg, "--spanner-database=")
 		case strings.HasPrefix(arg, "--tls-cert="):

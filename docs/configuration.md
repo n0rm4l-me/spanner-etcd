@@ -16,6 +16,7 @@
 | `--auto-compact-age` | — | `5m` | Keep this much history for Watch replay |
 | `--log-level` | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `--spanner-native-metrics` | — | `false` | Enable Spanner client-side metrics (requires `roles/monitoring.metricWriter`) |
+| `--spanner-read-location` | — | — | GCP region for directed reads (e.g. `us-east1`). Use with multi-region Spanner to serve reads from the local replica instead of the leader. Writes always go to the leader regardless. |
 
 ## Workload Identity Federation (WIF)
 
