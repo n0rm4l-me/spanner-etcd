@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.2.0 — 2026-06-09
+
+### New
+
+- **Directed reads** (`--spanner-read-location`) — route read operations to a Spanner replica in the specified GCP region. Use with multi-region Spanner instances to reduce read latency from non-leader regions. Writes always go to the leader.
+- **Helm**: `spannerReadLocation` value exposes directed reads configuration.
+
+### Performance
+
+Benchmarks on `us-central1`, `e2-standard-4`, production Spanner:
+
+| Operation | ops/sec |
+|-----------|--------:|
+| Create ×1 | 90 |
+| Create ×4 parallel | 270 |
+| Get ×1 | 108 |
+| Get ×4 parallel | 481 |
+| Mixed ×4 (70% reads) | 403 |
+| Watch latency | ~30ms |
+
+See [docs/performance.md](docs/performance.md) for full PU scaling and multi-region breakdown.
+
+---
+
 ## v0.1.0 — 2026-06-08
 
 First public release.
