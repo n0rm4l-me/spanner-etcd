@@ -3,24 +3,22 @@
 ## Overview
 
 ```mermaid
-graph TD
-    Client["Kubernetes API Server\n(or any etcd client)\netcd v3 gRPC / optional TLS"]
+graph LR
+    Client["Kubernetes API Server\netcd v3 gRPC / TLS"]
 
     subgraph SE["spanner-etcd"]
-        GW["KVServer · WatchServer\nLeaseServer · AuthServer\nClusterServer · MaintenanceServer"]
-        ST["SpannerStore\n─────────────────\nWrite: INSERT rev=PCT()\n→ no lock, no counter\n\nWatch: Change Stream\n~30ms · poll fallback 1s\n\nLease: TTL goroutine"]
+        direction TB
+        GW["KVServer · WatchServer · LeaseServer\nAuthServer · ClusterServer · Maintenance"]
+        ST["SpannerStore\nWrite: rev=PCT() · Watch: CS ~30ms · Lease: TTL"]
         GW --> ST
     end
 
     subgraph SP["Google Cloud Spanner"]
-        T1["kv — append-only KV log"]
-        T2["kv_rev — compact revision"]
-        T3["kv_lease — TTL leases"]
-        T4["kv_cs_cursors — resume points"]
-        T5["kv_changes — Change Stream"]
+        direction TB
+        T1["kv · kv_rev · kv_lease\nkv_cs_cursors · kv_changes"]
     end
 
-    Client --> GW
+    Client -->|"gRPC"| GW
     ST -->|"Spanner gRPC"| SP
 ```
 
