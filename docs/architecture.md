@@ -8,14 +8,14 @@ graph LR
 
     subgraph SE["spanner-etcd"]
         direction TB
-        GW["KVServer · WatchServer · LeaseServer\nAuthServer · ClusterServer · Maintenance"]
-        ST["SpannerStore\nWrite: rev=PCT() · Watch: CS ~30ms · Lease: TTL"]
+        GW["KVServer\nWatchServer\nLeaseServer\nAuthServer\nClusterServer\nMaintenanceServer"]
+        ST["SpannerStore\nWrite: rev=PCT()\nWatch: Change Stream ~30ms\nLease: TTL goroutine"]
         GW --> ST
     end
 
     subgraph SP["Google Cloud Spanner"]
         direction TB
-        T1["kv · kv_rev · kv_lease\nkv_cs_cursors · kv_changes"]
+        T1["kv\nkv_rev\nkv_lease\nkv_cs_cursors\nkv_changes"]
     end
 
     Client -->|"gRPC"| GW
