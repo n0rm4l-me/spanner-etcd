@@ -68,7 +68,7 @@ Same VM (`us-central1-a`), clean database per run, same benchmark binary. Only S
 
 ```mermaid
 graph LR
-    subgraph Iowa["☆ Iowa — Spanner leader"]
+    subgraph Iowa["★ Iowa — Spanner leader"]
         SE_IA["spanner-etcd"]
         SP_IA[("Spanner\nread-write")]
     end
@@ -77,12 +77,9 @@ graph LR
         SP_SC[("Spanner\nread-write")]
     end
 
-    SE_IA -->|"write ~11ms ✅"| SP_IA
-    SP_IA <-->|"replicate ~40ms"| SP_SC
-    SE_SC -->|"write: →Iowa→SC ~80ms ❌"| SP_IA
-
-    style Iowa fill:#d4edda
-    style Carolina fill:#fff3cd
+    SE_IA -->|"write ~11ms"| SP_IA
+    SP_IA <-->|"sync replicate ~40ms"| SP_SC
+    SE_SC -->|"write round-trip ~80ms"| SP_IA
 ```
 
 Benchmarked from two VMs — one in Iowa (`us-central1-a`, same zone as leader), one in South Carolina (`us-east1-b`) — against the same `nam6` instance (1000 PU).
