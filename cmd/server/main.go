@@ -91,7 +91,6 @@ func run(ctx context.Context, cfg appConfig, log *zap.Logger) error {
 					ReplicaSelections: []*sppb.DirectedReadOptions_ReplicaSelection{
 						{Location: cfg.spannerReadLocation},
 					},
-					AutoFailoverDisabled: false,
 				},
 			},
 		}
