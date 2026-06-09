@@ -131,6 +131,19 @@ Spanner supports multi-region instances out of the box — no code changes neede
 
 RPO=0 for all multi-region configs — synchronous replication, zero data loss if a region fails.
 
+### Directed Reads
+
+In a multi-region setup, reads from non-leader regions travel to the leader and back by default. Use `--spanner-read-location` to serve reads from the local replica instead:
+
+```bash
+# Replica in South Carolina reading from local replica (Iowa is the leader)
+spanner-etcd \
+  --spanner-database=projects/P/instances/I/databases/D \
+  --spanner-read-location=us-east1
+```
+
+Writes always go to the leader regardless of this flag. Set the location to the GCP region where this replica runs.
+
 ### Processing Units
 
 | Cluster size | Recommended PUs |

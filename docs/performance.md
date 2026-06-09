@@ -84,26 +84,27 @@ graph LR
 
 Benchmarked from two VMs — one in Iowa (`us-central1-a`, same zone as leader), one in South Carolina (`us-east1-b`) — against the same `nam6` instance (1000 PU).
 
-| Operation | Regional Iowa | nam6 from Iowa | nam6 from S.Carolina |
-|-----------|-------------:|---------------:|---------------------:|
-| Create ×1 | 90 | 53 | **11** |
-| Create ×4 parallel | 270 | 203 | **45** |
-| Update ×1 | 88 | 52 | **9** |
-| Get ×1 | 108 | 116 | **12** |
-| Get ×4 parallel | 481 | 577 | **52** |
-| List 100 keys | 40 | 45 | **8** |
-| Mixed ×4 (70% read) | 403 | 327 | **47** |
-| Watch latency | ~30ms | **42ms** | 216ms |
+| Operation | Regional Iowa | nam6 Iowa | nam6 S.Carolina | nam6 S.Carolina + DR |
+|-----------|-------------:|----------:|----------------:|---------------------:|
+| Create ×1 | 90 | 53 | 11 | 11 |
+| Create ×4 parallel | 270 | 203 | 45 | 45 |
+| Update ×1 | 88 | 52 | 12 | 9 |
+| Get ×1 | 108 | 116 | 14 | **16** |
+| Get ×4 parallel | 481 | 577 | 60 | **64** |
+| List 100 keys | 40 | 45 | 9 | **10** |
+| Mixed ×4 (70% read) | 403 | 327 | 49 | **53** |
+| Watch latency | ~30ms | 42ms | 131ms | 196ms |
 
-> Note: South Carolina benchmarks were run on a database already populated by the Iowa run (~13K rows). Numbers are directionally correct but not on a clean baseline.
+> DR = `--spanner-read-location=us-east1` (directed reads to local replica).
+> South Carolina benchmarks run on a non-empty database (~13K rows from Iowa run) — directionally correct.
 
 **Key observations:**
 
 - **Writes from Iowa cost ~40% more on nam6** — every write must replicate synchronously to South Carolina before committing
-- **South Carolina is 8× slower for writes** — Iowa→S.Carolina is ~1,500km; each write crosses that distance twice (to leader and back)
-- **Reads from Iowa are faster on nam6** — strong reads served locally by the Iowa replica
-- **Watch latency from Iowa on nam6 (42ms)** — slightly higher than regional due to Change Stream partition overhead across replicas
-- **Rule of thumb:** deploy spanner-etcd replicas in the same region as the Spanner leader. Multi-region Spanner gives RPO=0 across a regional failure — you pay ~40% write latency from the leader region and ~8× from non-leader regions.
+- **South Carolina writes are 8× slower** — Iowa→S.Carolina is ~1,500km; each write crosses that distance twice
+- **Directed reads improve reads 7-14%** — reads served from local South Carolina replica instead of Iowa
+- **Directed reads don't help writes or Watch** — writes always go to leader; Change Stream cursors follow the same path
+- **Rule of thumb:** deploy spanner-etcd in the same region as the Spanner leader. Use `--spanner-read-location` in multi-region setups to reduce read latency from non-leader replicas.
 
 ## Kubernetes v1.33 — 24h Soak Test
 
