@@ -13,9 +13,9 @@ Replace etcd with Google Cloud Spanner. Drop-in, no client changes.
 ### Highlights
 
 - **`PENDING_COMMIT_TIMESTAMP` revision** — no shared counter, no write lock. 15× higher write throughput at ×32 concurrency vs integer counter baseline
-- **Spanner Change Streams** for Watch — ~116ms end-to-end event delivery
+- **Spanner Change Streams** for Watch — ~30ms end-to-end event delivery
 - **Atomic Txn** — compare+ops in a single Spanner ReadWriteTransaction
-- **Covering index** on `kv(key, rev DESC)` — Get +40%, mixed workload +161% vs non-indexed baseline
+- **Covering index** on `kv(key, rev DESC)` — Get +52%, mixed workload +169% vs non-indexed baseline
 - **Stateless replicas** — all state in Spanner, scale out by adding pods
 
 ### Validated
@@ -27,18 +27,18 @@ Replace etcd with Google Cloud Spanner. Drop-in, no client changes.
 
 ### Performance
 
-Production Spanner, `asia-northeast1`, 1000 PU, same-region VM:
+Production Spanner, `us-central1`, 1000 PU, same-region VM:
 
 | Operation | ops/sec |
 |-----------|--------:|
-| Create ×1 | 83 |
-| Create ×4 parallel | 257 |
-| Get ×1 | 100 |
-| Get ×4 parallel | 443 |
-| Mixed ×4 (70% reads) | 400 |
-| Watch latency | ~116ms |
+| Create ×1 | 90 |
+| Create ×4 parallel | 270 |
+| Get ×1 | 108 |
+| Get ×4 parallel | 481 |
+| Mixed ×4 (70% reads) | 403 |
+| Watch latency | ~30ms |
 
 ### Known limitations
 
 - Auth RBAC (UserAdd/RoleAdd/GrantPermission) not implemented — not needed for standard Kubernetes
-- Watch latency ~100–150ms — inherent to Spanner Change Streams, not suitable for sub-10ms use cases
+- Watch latency ~30ms — inherent to Spanner Change Streams, not suitable for sub-10ms use cases
