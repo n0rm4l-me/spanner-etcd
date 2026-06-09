@@ -2,37 +2,39 @@
 
 ## Overview
 
-```
-Kubernetes API Server (or any etcd client)
-         │  etcd v3 gRPC (optional TLS / mTLS)
-         ▼
-    spanner-etcd
-    ┌───────────────────────────────────────┐
-    │  KVServer     WatchServer             │
-    │  LeaseServer  AuthServer              │
-    │  ClusterServer  MaintenanceServer     │
-    │           │                           │
-    │      SpannerStore                     │
-    │   ┌───────────────────────────────┐   │
-    │   │  Write: INSERT kv             │   │
-    │   │  rev = PENDING_COMMIT_TS()    │   │
-    │   │  → no lock, no counter        │   │
-    │   │                               │   │
-    │   │  Watch: Change Stream reader  │   │
-    │   │  (10–50ms) with poll fallback │   │
-    │   │  (1s) for emulator            │   │
-    │   │                               │   │
-    │   │  Lease: TTL goroutine         │   │
-    │   └───────────────────────────────┘   │
-    └──────────────┬────────────────────────┘
-                   │  Spanner gRPC
-                   ▼
-         Google Cloud Spanner
-         ├── kv              (append-only KV log)
-         ├── kv_rev          (compact revision only)
-         ├── kv_lease        (TTL leases)
-         ├── kv_cs_cursors   (Change Stream resume points)
-         └── kv_changes      (Change Stream)
+```mermaid
+graph LR
+    Client["Kubernetes API Server\netcd v3 gRPC / TLS"]
+
+    subgraph SE["spanner-etcd"]
+        direction TB
+        subgraph API["gRPC Servers"]
+            direction LR
+            KV["KVServer"]
+            WA["WatchServer"]
+            LE["LeaseServer"]
+            AU["AuthServer"]
+        end
+        subgraph STORE["SpannerStore"]
+            direction LR
+            WR["Write\nrev=PCT()"]
+            WC["Watch\nCS ~30ms"]
+            LT["Lease\nTTL"]
+        end
+        API --> STORE
+    end
+
+    subgraph SP["Google Cloud Spanner"]
+        direction LR
+        T1["kv"] 
+        T2["kv_rev"]
+        T3["kv_lease"]
+        T4["kv_cs_cursors"]
+        T5["kv_changes"]
+    end
+
+    Client -->|"gRPC"| API
+    STORE -->|"Spanner gRPC"| SP
 ```
 
 Multiple `spanner-etcd` replicas can run concurrently — all state lives in Spanner. No consensus, no leader election between replicas.
@@ -97,6 +99,34 @@ CREATE INDEX kv_rev_desc ON kv (rev DESC);
 
 **`PENDING_COMMIT_TIMESTAMP()` as revision**: Every write sets `rev = PENDING_COMMIT_TIMESTAMP()` — Spanner's TrueTime-based commit timestamp. No shared counter row, no lock. Each transaction is fully independent. etcd clients receive `rev` as `int64` (UnixNano), which is a valid etcd `ModRevision`. This eliminates the serialization bottleneck of integer counters and provides **15× higher write throughput** at ×32 concurrency.
 
+```mermaid
+sequenceDiagram
+    participant W1 as Writer 1
+    participant W2 as Writer 2
+    participant W3 as Writer 3
+    participant DB as Spanner
+
+    Note over W1,DB: ❌ Integer counter — serialized
+    W1->>DB: lock + increment rev
+    W2-->>DB: waiting...
+    W3-->>DB: waiting...
+    DB-->>W1: rev=42, done
+    W2->>DB: lock + increment rev
+    DB-->>W2: rev=43, done
+
+    Note over W1,DB: ✅ PENDING_COMMIT_TIMESTAMP — parallel
+    par W1
+        W1->>DB: INSERT rev=PCT()
+        DB-->>W1: committed
+    and W2
+        W2->>DB: INSERT rev=PCT()
+        DB-->>W2: committed
+    and W3
+        W3->>DB: INSERT rev=PCT()
+        DB-->>W3: committed
+    end
+```
+
 **`id` vs `rev`**: Physical PK (`id`) uses `bit_reversed_positive` to distribute writes across Spanner splits and avoid hotspots.
 
 **Append-only log**: Like etcd, rows in `kv` are never updated — each write appends a new row. Compaction physically deletes old rows asynchronously.
@@ -107,12 +137,22 @@ CREATE INDEX kv_rev_desc ON kv (rev DESC);
 
 All replicas are stateless — all state lives in Spanner.
 
-```
-                    LoadBalancer :2379
-                   /              \
-          spanner-etcd-1    spanner-etcd-2
-                   \              /
-                Google Cloud Spanner
+```mermaid
+graph TD
+    Client["etcd client\n(Kubernetes API Server)"]
+    LB["LoadBalancer :2379"]
+    SE1["spanner-etcd-1"]
+    SE2["spanner-etcd-2"]
+    SE3["spanner-etcd-N"]
+    SP[("Google Cloud Spanner")]
+
+    Client --> LB
+    LB --> SE1
+    LB --> SE2
+    LB --> SE3
+    SE1 --> SP
+    SE2 --> SP
+    SE3 --> SP
 ```
 
 On pod restart, Watch clients reconnect automatically via the etcd client retry logic. With `preStop: sleep 15s`, Kubernetes removes the pod from Service endpoints before SIGTERM — Watch streams migrate to surviving replicas with zero errors.
