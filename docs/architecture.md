@@ -2,37 +2,26 @@
 
 ## Overview
 
-```
-Kubernetes API Server (or any etcd client)
-         │  etcd v3 gRPC (optional TLS / mTLS)
-         ▼
-    spanner-etcd
-    ┌───────────────────────────────────────┐
-    │  KVServer     WatchServer             │
-    │  LeaseServer  AuthServer              │
-    │  ClusterServer  MaintenanceServer     │
-    │           │                           │
-    │      SpannerStore                     │
-    │   ┌───────────────────────────────┐   │
-    │   │  Write: INSERT kv             │   │
-    │   │  rev = PENDING_COMMIT_TS()    │   │
-    │   │  → no lock, no counter        │   │
-    │   │                               │   │
-    │   │  Watch: Change Stream reader  │   │
-    │   │  (10–50ms) with poll fallback │   │
-    │   │  (1s) for emulator            │   │
-    │   │                               │   │
-    │   │  Lease: TTL goroutine         │   │
-    │   └───────────────────────────────┘   │
-    └──────────────┬────────────────────────┘
-                   │  Spanner gRPC
-                   ▼
-         Google Cloud Spanner
-         ├── kv              (append-only KV log)
-         ├── kv_rev          (compact revision only)
-         ├── kv_lease        (TTL leases)
-         ├── kv_cs_cursors   (Change Stream resume points)
-         └── kv_changes      (Change Stream)
+```mermaid
+graph TD
+    Client["Kubernetes API Server\n(or any etcd client)\netcd v3 gRPC / optional TLS"]
+
+    subgraph SE["spanner-etcd"]
+        GW["KVServer · WatchServer\nLeaseServer · AuthServer\nClusterServer · MaintenanceServer"]
+        ST["SpannerStore\n─────────────────\nWrite: INSERT rev=PCT()\n→ no lock, no counter\n\nWatch: Change Stream\n~30ms · poll fallback 1s\n\nLease: TTL goroutine"]
+        GW --> ST
+    end
+
+    subgraph SP["Google Cloud Spanner"]
+        T1["kv — append-only KV log"]
+        T2["kv_rev — compact revision"]
+        T3["kv_lease — TTL leases"]
+        T4["kv_cs_cursors — resume points"]
+        T5["kv_changes — Change Stream"]
+    end
+
+    Client --> GW
+    ST -->|"Spanner gRPC"| SP
 ```
 
 Multiple `spanner-etcd` replicas can run concurrently — all state lives in Spanner. No consensus, no leader election between replicas.
