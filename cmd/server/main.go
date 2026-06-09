@@ -182,7 +182,12 @@ func parseFlags() appConfig {
 		case arg == "--spanner-native-metrics":
 			cfg.spannerNativeMetrics = true
 		case strings.HasPrefix(arg, "--spanner-read-location="):
-			cfg.spannerReadLocation = strings.TrimPrefix(arg, "--spanner-read-location=")
+			val := strings.TrimSpace(strings.TrimPrefix(arg, "--spanner-read-location="))
+			if val == "" {
+				fmt.Fprintln(os.Stderr, "error: --spanner-read-location requires a non-empty GCP region (e.g. us-east1)")
+				os.Exit(1)
+			}
+			cfg.spannerReadLocation = val
 		case strings.HasPrefix(arg, "--spanner-database="):
 			cfg.spannerDatabase = strings.TrimPrefix(arg, "--spanner-database=")
 		case strings.HasPrefix(arg, "--tls-cert="):
