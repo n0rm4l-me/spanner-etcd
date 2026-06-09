@@ -8,18 +8,33 @@ graph LR
 
     subgraph SE["spanner-etcd"]
         direction TB
-        GW["KVServer\nWatchServer\nLeaseServer\nAuthServer\nClusterServer\nMaintenanceServer"]
-        ST["SpannerStore\nWrite: rev=PCT()\nWatch: Change Stream ~30ms\nLease: TTL goroutine"]
-        GW --> ST
+        subgraph API["gRPC Servers"]
+            direction LR
+            KV["KVServer"]
+            WA["WatchServer"]
+            LE["LeaseServer"]
+            AU["AuthServer"]
+        end
+        subgraph STORE["SpannerStore"]
+            direction LR
+            WR["Write\nrev=PCT()"]
+            WC["Watch\nCS ~30ms"]
+            LT["Lease\nTTL"]
+        end
+        API --> STORE
     end
 
     subgraph SP["Google Cloud Spanner"]
-        direction TB
-        T1["kv\nkv_rev\nkv_lease\nkv_cs_cursors\nkv_changes"]
+        direction LR
+        T1["kv"] 
+        T2["kv_rev"]
+        T3["kv_lease"]
+        T4["kv_cs_cursors"]
+        T5["kv_changes"]
     end
 
-    Client -->|"gRPC"| GW
-    ST -->|"Spanner gRPC"| SP
+    Client -->|"gRPC"| API
+    STORE -->|"Spanner gRPC"| SP
 ```
 
 Multiple `spanner-etcd` replicas can run concurrently — all state lives in Spanner. No consensus, no leader election between replicas.
