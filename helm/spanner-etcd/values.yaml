@@ -3,7 +3,7 @@
 replicaCount: 3
 
 image:
-  repository: asia-docker.pkg.dev/onepoint-paas-tardis-4492/docker-paas-tardis-asia-1/spanner-etcd
+  repository: ghcr.io/n0rm4l-me/spanner-etcd
   pullPolicy: IfNotPresent
   tag: ""  # defaults to Chart.appVersion
 
