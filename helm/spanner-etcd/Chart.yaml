@@ -3,7 +3,7 @@ name: spanner-etcd
 description: etcd v3 API server backed by Google Cloud Spanner
 type: application
 version: 0.2.0
-appVersion: "0.2.0"
+appVersion: "v0.2.0"
 keywords:
   - etcd
   - spanner
