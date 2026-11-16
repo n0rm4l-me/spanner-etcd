@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"os"
 	"strings"
@@ -75,7 +76,10 @@ func newTestDB(t *testing.T) string {
 		}
 		ensureInstance(t, ctx)
 	}
-	dbName := fmt.Sprintf("test-%d", time.Now().UnixNano())
+	// Unique across tests AND across concurrently running test processes: the
+	// clock has only microsecond resolution on macOS, so a timestamp alone can
+	// collide. Spanner database IDs are limited to 30 characters.
+	dbName := fmt.Sprintf("test-%d-%04x", time.Now().UnixMilli(), rand.Intn(1<<16))
 	dbPath := fmt.Sprintf("%s/databases/%s", parent, dbName)
 
 	adminClient, err := database.NewDatabaseAdminClient(ctx)
