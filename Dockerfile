@@ -1,6 +1,6 @@
 # The build stage always runs on the machine doing the build and cross-compiles for
 # the requested platform, so a multi-platform build needs no emulation (QEMU).
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS builder
 
 # Set by buildx/podman from --platform; the defaults keep a plain `docker build` working.
 ARG TARGETOS=linux
