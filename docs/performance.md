@@ -124,7 +124,7 @@ Benchmarked from two VMs — one in Iowa (`us-central1-a`, same zone as leader),
 |--------|-------|
 | Critical errors (panic / unimplemented) | **0** |
 | spanner-etcd uptime | **28h** (survived full test + data collection) |
-| Change Stream active | **100%** of test duration |
+| Change Stream active | **100%** of test duration (see note below) |
 | Active Watch streams | **57** stable |
 | Total Txn operations | **185,952** |
 | Total KV/Range operations | **237,312** |
@@ -133,6 +133,10 @@ Benchmarked from two VMs — one in Iowa (`us-central1-a`, same zone as leader),
 | Kubernetes node status | **Ready** throughout |
 
 **Conclusion:** Zero crashes, zero data loss, zero unimplemented errors over 24 hours with a production Kubernetes v1.33 control plane.
+
+> **Note on "Change Stream active".** In the version tested, that gauge was set by a timer ten seconds after startup, not by delivered records, and the Change Stream reader followed only one of the stream's initial partitions, so in practice no events arrived through the Change Stream and watches were served by the poll path (consistent with the "poll mode" observation under Production Validation below). The soak results above are valid for what they measure (stability, errors, data integrity), but they say nothing about Change Stream delivery. Both problems were fixed after v0.2.0; see the CHANGELOG.
+
+> **Note on Watch latency numbers.** `BenchmarkWatch_Latency` and the "~30ms" figures in this document write and watch through the *same* replica, so they measure the local path (a local write wakes the watcher directly), not the Change Stream. For an event from a write made through *another* replica, measured against a real instance after the fix (laptop over the WAN to `asia-northeast1`, 5 events per run, write call to event at the subscriber, including the write itself), the result depends on the mode the Change Stream is in, which varies from run to run on the same instance: in its fast mode (hint about 15 ms after commit) min 85 ms, median 102 ms, max 207 ms; in its slow mode (hint one 2 s heartbeat after commit) the 1 s poll timer takes over: min 0.66 s, median 0.69 s, max 1.48 s. Before the fix such an event waited up to 30 s. Only 5 events per run were measured, so treat these as orders of magnitude, not percentiles.
 
 ## Kubernetes Workload — kubeadm v1.33.12
 

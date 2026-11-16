@@ -27,7 +27,7 @@ Implements the complete etcd v3 KV/Watch/Lease/Auth gRPC API. Deploy spanner-etc
 | Durability | Single-region by default | 99.999% SLA |
 | Operations | Cluster management, backups | Fully managed by Google |
 | Write throughput (×32) | baseline | **15× faster** (PENDING_COMMIT_TIMESTAMP) |
-| Watch latency | ~1ms (local) | **~30ms** (Change Streams) |
+| Watch latency | ~1ms (local) | **tens of ms to ~1s** (~30ms same replica, up to ~1s via another replica; see [performance](docs/performance.md)) |
 
 ## Why
 
@@ -36,7 +36,7 @@ Standard etcd is a single-region, single-cluster system. Under sustained load it
 spanner-etcd is an open implementation of the same idea:
 
 - **PENDING_COMMIT_TIMESTAMP** as revision — no shared counter, no write lock, each transaction is fully independent
-- **Spanner Change Streams** for Watch — push-based delivery at ~10–50ms latency
+- **Ordered, exactly-once Watch**: events come from one ordered read of the log; Change Streams wake it early and a 1s timer bounds the latency
 - **Atomic Txn** — compare+ops in a single Spanner ReadWriteTransaction
 - **Stateless replicas** — all state in Spanner, scale out by adding pods
 
@@ -80,7 +80,7 @@ etcdctl put /hello world && etcdctl get /hello
 | Background auto-compaction | ✅ Complete |
 | Prometheus metrics + GKE PodMonitoring | ✅ Complete |
 | Helm chart (WIF, PDB, HPA) | ✅ Complete |
-| 100 integration tests | ✅ Passing |
+| 104 integration tests | ✅ Passing |
 | Kubernetes v1.33.12 (kubeadm) | ✅ Validated |
 | 24h soak test (Kubernetes v1.33) | ✅ Complete |
 | TLS / mTLS | ✅ Validated |

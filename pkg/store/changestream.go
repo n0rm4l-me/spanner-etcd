@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/spanner"
@@ -62,11 +63,23 @@ type ChangeStreamReader struct {
 	dispatch  DispatchFunc
 	log       *zap.Logger
 
+	// activity, if set, receives the time (UnixNano) of every record read from
+	// the stream, heartbeats included. The Watcher uses it to tell whether the
+	// stream is delivering right now.
+	activity *atomic.Int64
+
 	mu      sync.Mutex
 	active  map[string]*partitionState
 	pending chan *partitionState
 	stopCh  chan struct{}
 	stopped chan struct{}
+}
+
+// touch records that the stream just delivered a record.
+func (r *ChangeStreamReader) touch() {
+	if r.activity != nil {
+		r.activity.Store(time.Now().UnixNano())
+	}
 }
 
 // NewChangeStreamReader creates a reader. Call Start to begin streaming.
@@ -240,6 +253,7 @@ func (r *ChangeStreamReader) streamPartition(ctx context.Context, p *partitionSt
 		if err != nil {
 			return false, fmt.Errorf("next: %w", err)
 		}
+		r.touch()
 
 		// Decode via GenericColumnValue to handle evolving schema without breakage.
 		var gcv spanner.GenericColumnValue
@@ -298,6 +312,8 @@ func (r *ChangeStreamReader) decodeRecord(gcv *spanner.GenericColumnValue) (
 		// Each element is a STRUCT with 3 fields: data_change_record, heartbeat_record, child_partitions_record.
 		structVal := outerVal.GetListValue()
 		if structVal == nil || len(structVal.Values) < 3 {
+			r.log.Debug("change record element skipped: not a 3-field list",
+				zap.String("kind", fmt.Sprintf("%T", outerVal.GetKind())))
 			continue
 		}
 
@@ -343,6 +359,11 @@ func (r *ChangeStreamReader) decodeRecord(gcv *spanner.GenericColumnValue) (
 func (r *ChangeStreamReader) decodeDataChangeRecord(v *structpb.Value) ([]*Event, time.Time) {
 	fields := v.GetListValue()
 	if fields == nil || len(fields.Values) < 8 {
+		n := 0
+		if fields != nil {
+			n = len(fields.Values)
+		}
+		r.log.Debug("data change record has an unexpected shape", zap.Int("fields", n))
 		return nil, time.Time{}
 	}
 
@@ -356,6 +377,7 @@ func (r *ChangeStreamReader) decodeDataChangeRecord(v *structpb.Value) ([]*Event
 
 	// Field 4: table_name
 	tableName := fields.Values[4].GetStringValue()
+	r.log.Debug("data change record", zap.String("table", tableName), zap.String("commit_ts", commitTSStr))
 	if tableName != "kv" {
 		return nil, commitTS
 	}
@@ -385,6 +407,11 @@ func (r *ChangeStreamReader) decodeDataChangeRecord(v *structpb.Value) ([]*Event
 
 		kv := extractKV(newVals, oldVals, commitTS)
 		if kv == nil {
+			// Log the shape, never the contents: values may be sensitive.
+			r.log.Debug("change stream mod could not be turned into a KV",
+				zap.Int("mod_fields", len(modFields.Values)),
+				zap.Int("new_values_len", len(newValStr)), zap.Bool("new_values_parsed", newVals != nil),
+				zap.Int("old_values_len", len(oldValStr)), zap.Bool("old_values_parsed", oldVals != nil))
 			continue
 		}
 
@@ -442,23 +469,38 @@ func (r *ChangeStreamReader) decodeChildPartitions(v *structpb.Value) []*partiti
 	return result
 }
 
-// queryInitialPartitions runs the NULL-token discovery query.
+// queryInitialPartitions runs the NULL-token discovery query and returns every
+// initial partition of the stream.
+//
+// A stream normally has several initial partitions, and each one arrives as its
+// own record. Writes land in whichever partition owns the key, so a reader that
+// follows only some of them silently misses events. This query used to stop
+// after the first record that held child partitions (it was open-ended, so it
+// never finished on its own), which left all but one partition unread: against
+// a real instance a write could go to the second partition and no event was
+// ever produced. The query is now bounded by an end timestamp so it finishes by
+// itself, and every record is consumed.
 func (r *ChangeStreamReader) queryInitialPartitions(ctx context.Context, startTime time.Time) ([]*partitionState, error) {
+	qctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
 	stmt := spanner.Statement{
 		SQL: `SELECT ChangeRecord
 		      FROM READ_kv_changes(
-		        @start_time, NULL, NULL, @heartbeat_millis
+		        @start_time, @end_time, NULL, @heartbeat_millis
 		      )`,
 		Params: map[string]interface{}{
-			"start_time":      startTime,
+			"start_time":       startTime,
+			"end_time":         time.Now().UTC(),
 			"heartbeat_millis": int64(1000),
 		},
 	}
 
-	iter := r.client.Single().Query(ctx, stmt)
+	iter := r.client.Single().Query(qctx, stmt)
 	defer iter.Stop()
 
 	var partitions []*partitionState
+	seen := make(map[string]struct{})
 
 	for {
 		row, err := iter.Next()
@@ -466,6 +508,12 @@ func (r *ChangeStreamReader) queryInitialPartitions(ctx context.Context, startTi
 			break
 		}
 		if err != nil {
+			// Having found partitions, running out of time is not fatal.
+			if len(partitions) > 0 && errors.Is(qctx.Err(), context.DeadlineExceeded) {
+				r.log.Warn("initial partition query timed out, using the partitions found so far",
+					zap.Int("count", len(partitions)))
+				break
+			}
 			return nil, fmt.Errorf("initial partition query: %w", err)
 		}
 
@@ -475,10 +523,13 @@ func (r *ChangeStreamReader) queryInitialPartitions(ctx context.Context, startTi
 			continue
 		}
 
-		done, _, _, children := r.decodeRecord(&gcv)
-		partitions = append(partitions, children...)
-		if done {
-			break
+		_, _, _, children := r.decodeRecord(&gcv)
+		for _, c := range children {
+			if _, dup := seen[c.token]; dup {
+				continue
+			}
+			seen[c.token] = struct{}{}
+			partitions = append(partitions, c)
 		}
 	}
 
