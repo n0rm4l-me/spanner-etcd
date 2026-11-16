@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased
+## v0.3.0 - 2026-11-16
+
+The first release since v0.2.0. It fixes data-loss and correctness bugs found in a systematic review, makes Watch and leases work correctly with more than one replica, and clears 24 vulnerabilities that the code actually reached. Read the upgrade notes below before rolling out, in particular the one about the schema.
+
+### Highlights
+
+- **No more silent loss.** A bare `Put` no longer reports success for a write that did not happen; `DeleteRange` on a prefix no longer deletes keys outside it; writes that name a dead lease are rejected, as in etcd, instead of creating keys that never expire.
+- **Leases work with several replicas.** Their state lives in Spanner, so a keepalive can be served by any replica and survives restarts. This needs a new column, `kv_lease.expires_at`: see the schema note below.
+- **Watch delivers each event once, in order, and the Change Stream now works.** Events from other replicas arrive in well under a second instead of up to 30 seconds.
+- **Exact ranges, correct paging.** Prefix and range reads, deletes and watches cover exactly the right keys; `More` is set, so the Kubernetes API server's paged lists are complete; sort options work.
+- **The table no longer grows without bound.** Compaction removes deleted keys completely, and one replica compacts per round.
+- **Security and hardening.** Go 1.26.11 and updated dependencies remove 24 reachable vulnerabilities, one of them a remote panic in the gRPC server. The server refuses to start on an unknown flag or half a TLS configuration. The image is built correctly for arm64.
 
 ### Upgrade notes (leases)
 
