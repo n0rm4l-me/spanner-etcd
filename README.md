@@ -1,7 +1,7 @@
 # spanner-etcd
 
 [![test](https://github.com/n0rm4l-me/spanner-etcd/actions/workflows/test.yml/badge.svg)](https://github.com/n0rm4l-me/spanner-etcd/actions/workflows/test.yml)
-[![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go)](https://go.dev)
+[![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-v1.33-326CE5?logo=kubernetes)](https://kubernetes.io)
 

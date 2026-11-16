@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Go 1.21+
+- Go 1.26.11 or newer (see `go` in go.mod; an older local toolchain downloads the right one automatically)
 - Google Cloud project with Spanner enabled
 - [Spanner emulator](https://cloud.google.com/spanner/docs/emulator) for local testing
 
