@@ -3,6 +3,7 @@ package server_test
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"os"
 	"strings"
@@ -26,23 +27,39 @@ const (
 	testInstance = "test-instance"
 )
 
+// realInstance returns the path of a real Spanner instance to run the tests
+// against (projects/P/instances/I), taken from SPANNER_ETCD_TEST_INSTANCE.
+// Empty means: use the emulator. Real mode uses application default credentials
+// and creates one database per test, so run only the tests you need (-run) and
+// expect each database to take a minute or two to set up. See docs/development.md.
+func realInstance() string { return os.Getenv("SPANNER_ETCD_TEST_INSTANCE") }
+
 func init() {
+	if realInstance() != "" {
+		os.Unsetenv("SPANNER_EMULATOR_HOST") // make sure we do not talk to an emulator
+		return
+	}
 	os.Setenv("SPANNER_EMULATOR_HOST", emulatorHost)
 }
 
 func newTestStore(t *testing.T) *store.Store {
 	t.Helper()
 
-	if !emulatorRunning() {
-		t.Skip("Spanner emulator not running")
-	}
-
 	ctx := context.Background()
-	dbName := fmt.Sprintf("srv-%d", time.Now().UnixNano())
-	dbPath := fmt.Sprintf("projects/%s/instances/%s/databases/%s",
-		testProject, testInstance, dbName)
-
-	ensureInstance(t, ctx)
+	parent := fmt.Sprintf("projects/%s/instances/%s", testProject, testInstance)
+	if inst := realInstance(); inst != "" {
+		parent = inst
+	} else {
+		if !emulatorRunning() {
+			t.Skip("Spanner emulator not running")
+		}
+		ensureInstance(t, ctx)
+	}
+	// Unique across tests and across concurrently running test processes (the
+	// clock has only microsecond resolution on macOS). Spanner database IDs are
+	// limited to 30 characters.
+	dbName := fmt.Sprintf("srv-%d-%04x", time.Now().UnixMilli(), rand.Intn(1<<16))
+	dbPath := fmt.Sprintf("%s/databases/%s", parent, dbName)
 
 	adminClient, err := database.NewDatabaseAdminClient(ctx)
 	if err != nil {
@@ -52,12 +69,22 @@ func newTestStore(t *testing.T) *store.Store {
 
 	log := zap.NewNop()
 	createOp, err := adminClient.CreateDatabase(ctx, &databasepb.CreateDatabaseRequest{
-		Parent:          fmt.Sprintf("projects/%s/instances/%s", testProject, testInstance),
+		Parent:          parent,
 		CreateStatement: fmt.Sprintf("CREATE DATABASE `%s`", dbName),
 	})
 	if err != nil {
 		t.Fatalf("create database: %v", err)
 	}
+	// Register the drop before waiting: Spanner keeps creating the database even
+	// if our wait fails (for example DeadlineExceeded on a busy instance), and a
+	// cleanup registered only after a successful wait would leave it behind.
+	t.Cleanup(func() {
+		dropCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := adminClient.DropDatabase(dropCtx, &databasepb.DropDatabaseRequest{Database: dbPath}); err != nil {
+			t.Logf("DropDatabase %s: %v", dbPath, err)
+		}
+	})
 	if _, err := createOp.Wait(ctx); err != nil {
 		t.Fatalf("wait create database: %v", err)
 	}
@@ -83,7 +110,6 @@ func newTestStore(t *testing.T) *store.Store {
 	t.Cleanup(func() {
 		s.Close()
 		spannerClient.Close()
-		adminClient.DropDatabase(context.Background(), &databasepb.DropDatabaseRequest{Database: dbPath}) //nolint:errcheck
 	})
 	return s
 }
