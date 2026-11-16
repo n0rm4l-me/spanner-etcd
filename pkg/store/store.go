@@ -242,108 +242,27 @@ func (s *Store) Get(ctx context.Context, key string, revision int64) (currentRev
 	return currentRev, kv, nil
 }
 
-// List returns all keys matching the prefix, as of a given revision.
+// List returns the live keys with the given prefix and key >= startKey, as of a
+// given revision. It is a prefix view of Range.
 func (s *Store) List(ctx context.Context, prefix, startKey string, limit, revision int64) (int64, int64, []*KV, error) {
-	currentRev, err := s.CurrentRevision(ctx)
-	if err != nil {
+	start := startKey
+	if start < prefix {
+		start = prefix
+	}
+	res, err := s.Range(ctx, RangeQuery{Start: start, End: PrefixEnd(prefix), Limit: limit, Revision: revision})
+	if res == nil {
 		return 0, 0, nil, err
 	}
-	capTS := revToTS(revCap(revision, currentRev))
-
-	stmt := spanner.Statement{
-		SQL: `SELECT kv.rev, kv.key, kv.value, kv.old_value, kv.lease_id,
-		             kv.deleted, kv.created, kv.create_revision, kv.prev_revision
-		      FROM kv
-		      INNER JOIN (
-		        SELECT key, MAX(rev) AS max_rev
-		        FROM kv
-		        WHERE key LIKE @prefix AND key >= @start_key
-		          AND rev <= @cap
-		        GROUP BY key
-		      ) AS latest ON kv.key = latest.key AND kv.rev = latest.max_rev
-		      WHERE kv.deleted = false
-		      ORDER BY kv.key ASC` + limitClause(limit),
-		Params: map[string]interface{}{
-			"prefix":    likePrefix(prefix),
-			"start_key": startKey,
-			"cap":       capTS,
-		},
-	}
-
-	compactRev, err := s.compactRevision(ctx)
-	if err != nil {
-		return 0, 0, nil, err
-	}
-	if compactRev > 1 && revision > 0 && revision <= compactRev {
-		return currentRev, compactRev, nil, ErrCompacted
-	}
-
-	iter := s.client.Single().Query(ctx, stmt)
-	defer iter.Stop()
-
-	var kvs []*KV
-	for {
-		row, err := iter.Next()
-		if errors.Is(err, iterator.Done) {
-			break
-		}
-		if err != nil {
-			return 0, 0, nil, fmt.Errorf("list %s: %w", prefix, err)
-		}
-		kv, err := scanKV(row)
-		if err != nil {
-			return 0, 0, nil, err
-		}
-		kvs = append(kvs, kv)
-	}
-	return currentRev, compactRev, kvs, nil
+	return res.CurrentRev, res.CompactRev, res.Kvs, err
 }
 
-// Count returns (currentRev, count) for keys matching prefix.
+// Count returns (currentRev, count) for keys with the given prefix and key >= startKey.
 func (s *Store) Count(ctx context.Context, prefix, startKey string, revision int64) (int64, int64, error) {
-	currentRev, err := s.CurrentRevision(ctx)
-	if err != nil {
-		return 0, 0, err
+	start := startKey
+	if start < prefix {
+		start = prefix
 	}
-	if revision > 0 {
-		compactRev, cerr := s.compactRevision(ctx)
-		if cerr != nil {
-			return 0, 0, fmt.Errorf("get compact revision: %w", cerr)
-		}
-		if compactRev > 1 && revision <= compactRev {
-			return currentRev, 0, ErrCompacted
-		}
-	}
-	capTS := revToTS(revCap(revision, currentRev))
-
-	stmt := spanner.Statement{
-		SQL: `SELECT COUNT(*) FROM (
-		        SELECT key FROM kv
-		        INNER JOIN (
-		          SELECT key AS k2, MAX(rev) AS max_rev
-		          FROM kv WHERE key LIKE @prefix AND key >= @start_key AND rev <= @cap
-		          GROUP BY key
-		        ) AS latest ON kv.key = latest.k2 AND kv.rev = latest.max_rev
-		        WHERE kv.deleted = false
-		      )`,
-		Params: map[string]interface{}{
-			"prefix":    likePrefix(prefix),
-			"start_key": startKey,
-			"cap":       capTS,
-		},
-	}
-
-	iter := s.client.Single().Query(ctx, stmt)
-	defer iter.Stop()
-	row, err := iter.Next()
-	if err != nil {
-		return 0, 0, fmt.Errorf("count %s: %w", prefix, err)
-	}
-	var count int64
-	if err := row.Column(0, &count); err != nil {
-		return 0, 0, err
-	}
-	return currentRev, count, nil
+	return s.CountRange(ctx, start, PrefixEnd(prefix), revision)
 }
 
 // Create inserts key only if it does not currently exist.
@@ -610,64 +529,9 @@ func (s *Store) Delete(ctx context.Context, key string, revision int64) (int64, 
 	return rev, prev, true, nil
 }
 
-// After returns all events with rev > afterRev matching prefix.
+// After returns all events with rev > afterRev for keys with the given prefix.
 func (s *Store) After(ctx context.Context, prefix string, afterRev, limit int64) (int64, []*Event, error) {
-	currentRev, err := s.CurrentRevision(ctx)
-	if err != nil {
-		return 0, nil, err
-	}
-	// afterRev=0 means "from beginning" — used by the poll loop, not for client replay.
-	// Only check compaction for explicit client-supplied revisions.
-	if afterRev > 0 {
-		compactRev, cerr := s.compactRevision(ctx)
-		if cerr != nil {
-			return 0, nil, fmt.Errorf("get compact revision: %w", cerr)
-		}
-		// afterRev is exclusive (returns rev > afterRev). etcd compaction is
-		// inclusive: reads at compactRev itself are disallowed. So we error when
-		// afterRev < compactRev (meaning the first possible event is at or below
-		// the compact horizon).
-		if afterRev < compactRev {
-			return currentRev, nil, ErrCompacted
-		}
-	}
-
-	afterTS := revToTS(afterRev)
-	stmt := spanner.Statement{
-		SQL: `SELECT rev, key, value, old_value, lease_id, deleted, created, create_revision, prev_revision
-		      FROM kv
-		      WHERE key LIKE @prefix
-		        AND rev > @after_rev
-		      ORDER BY rev ASC` + limitClause(limit),
-		Params: map[string]interface{}{
-			"prefix":    likePrefix(prefix),
-			"after_rev": afterTS,
-		},
-	}
-
-	iter := s.client.Single().Query(ctx, stmt)
-	defer iter.Stop()
-
-	var events []*Event
-	for {
-		row, err := iter.Next()
-		if errors.Is(err, iterator.Done) {
-			break
-		}
-		if err != nil {
-			return 0, nil, fmt.Errorf("after %s: %w", prefix, err)
-		}
-		kv, err := scanKV(row)
-		if err != nil {
-			return 0, nil, err
-		}
-		evType := EventPut
-		if kv.Deleted {
-			evType = EventDelete
-		}
-		events = append(events, &Event{KV: kv, Type: evType})
-	}
-	return currentRev, events, nil
+	return s.AfterRange(ctx, prefix, PrefixEnd(prefix), afterRev, limit)
 }
 
 // TxnOp represents a single operation within an atomic Txn.
@@ -967,7 +831,13 @@ func (s *Store) CompactRevision(ctx context.Context) (int64, error) {
 
 // Watch returns a channel of events for keys matching prefix, starting at afterRev.
 func (s *Store) Watch(ctx context.Context, prefix string, afterRev int64) <-chan []*Event {
-	return s.watcher.subscribe(ctx, prefix, afterRev)
+	return s.WatchRange(ctx, prefix, PrefixEnd(prefix), afterRev)
+}
+
+// WatchRange returns a channel of events for keys in [start, end) (end == ""
+// means no upper bound), starting at afterRev. A single key k is [k, k+"\x00").
+func (s *Store) WatchRange(ctx context.Context, start, end string, afterRev int64) <-chan []*Event {
+	return s.watcher.subscribe(ctx, start, end, afterRev)
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -1227,8 +1097,6 @@ func scanKV(row *spanner.Row) (*KV, error) {
 	}
 	return &kv, nil
 }
-
-func likePrefix(prefix string) string { return prefix + "%" }
 
 func limitClause(limit int64) string {
 	if limit <= 0 {

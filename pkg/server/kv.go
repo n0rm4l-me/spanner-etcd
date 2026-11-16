@@ -3,7 +3,7 @@ package server
 import (
 	"context"
 	"errors"
-	"strings"
+	"unicode/utf8"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
@@ -29,6 +29,9 @@ func newKVServer(s *store.Store, log *zap.Logger) *KVServer {
 func (k *KVServer) Range(ctx context.Context, r *etcdserverpb.RangeRequest) (*etcdserverpb.RangeResponse, error) {
 	key := string(r.Key)
 	end := string(r.RangeEnd)
+	if err := validateKeyRange(key, end); err != nil {
+		return nil, err
+	}
 
 	// Single key GET.
 	if end == "" {
@@ -46,12 +49,11 @@ func (k *KVServer) Range(ctx context.Context, r *etcdserverpb.RangeRequest) (*et
 		return resp, nil
 	}
 
-	// Prefix / range GET.
-	prefix := rangeToPrefix(key, end)
-	startKey := key
+	// Range GET: exactly the keys in [key, end).
+	start, upper := rangeBounds(key, end)
 
 	if r.CountOnly {
-		curRev, count, err := k.store.Count(ctx, prefix, startKey, r.Revision)
+		curRev, count, err := k.store.CountRange(ctx, start, upper, r.Revision)
 		if err != nil {
 			return nil, toGRPCErr(err)
 		}
@@ -61,21 +63,34 @@ func (k *KVServer) Range(ctx context.Context, r *etcdserverpb.RangeRequest) (*et
 		}, nil
 	}
 
-	curRev, _, kvs, err := k.store.List(ctx, prefix, startKey, r.Limit, r.Revision)
+	sortBy, desc, err := sortOptions(r)
+	if err != nil {
+		return nil, err
+	}
+	res, err := k.store.Range(ctx, store.RangeQuery{
+		Start: start, End: upper,
+		Limit: r.Limit, Revision: r.Revision,
+		SortBy: sortBy, Desc: desc,
+	})
 	if err != nil {
 		return nil, toGRPCErr(err)
 	}
 
+	// Count is the number of keys returned. etcd reports the size of the whole
+	// range even when a limit cuts it short; computing that here would scan the
+	// entire range on every page of a paginated read, so it is left out. Clients
+	// that page rely on More, which is exact.
 	resp := &etcdserverpb.RangeResponse{
-		Header: header(curRev),
-		Count:  int64(len(kvs)),
+		Header: header(res.CurrentRev),
+		Count:  int64(len(res.Kvs)),
+		More:   res.More,
 	}
 	if !r.KeysOnly {
-		for _, kv := range kvs {
+		for _, kv := range res.Kvs {
 			resp.Kvs = append(resp.Kvs, toProtoKV(kv))
 		}
 	} else {
-		for _, kv := range kvs {
+		for _, kv := range res.Kvs {
 			resp.Kvs = append(resp.Kvs, &mvccpb.KeyValue{Key: []byte(kv.Key)})
 		}
 	}
@@ -101,6 +116,9 @@ func (k *KVServer) Put(ctx context.Context, r *etcdserverpb.PutRequest) (*etcdse
 func (k *KVServer) DeleteRange(ctx context.Context, r *etcdserverpb.DeleteRangeRequest) (*etcdserverpb.DeleteRangeResponse, error) {
 	key := string(r.Key)
 	end := string(r.RangeEnd)
+	if err := validateKeyRange(key, end); err != nil {
+		return nil, err
+	}
 
 	// Single key delete.
 	if end == "" {
@@ -118,9 +136,12 @@ func (k *KVServer) DeleteRange(ctx context.Context, r *etcdserverpb.DeleteRangeR
 		return resp, nil
 	}
 
-	// Range / prefix delete — iterate and delete each key.
-	prefix := rangeToPrefix(key, end)
-	_, _, kvs, err := k.store.List(ctx, prefix, key, 0, 0)
+	// Range / prefix delete: exactly the keys in [key, end), one delete per key.
+	// It is not atomic. It stops at the first error and returns it instead of
+	// reporting a partial delete as success; deleting is idempotent, so the
+	// client can simply repeat the request.
+	start, upper := rangeBounds(key, end)
+	res, err := k.store.Range(ctx, store.RangeQuery{Start: start, End: upper})
 	if err != nil {
 		return nil, toGRPCErr(err)
 	}
@@ -129,10 +150,10 @@ func (k *KVServer) DeleteRange(ctx context.Context, r *etcdserverpb.DeleteRangeR
 	var prevKvs []*mvccpb.KeyValue
 	var lastRev int64
 
-	for _, kv := range kvs {
+	for _, kv := range res.Kvs {
 		rev, prev, ok, err := k.store.Delete(ctx, kv.Key, 0)
 		if err != nil {
-			continue
+			return nil, toGRPCErr(err)
 		}
 		if ok {
 			deleted++
@@ -477,20 +498,6 @@ func (k *KVServer) executeOps(ctx context.Context, ops []*etcdserverpb.RequestOp
 			if err != nil {
 				return nil, 0, err
 			}
-			// Enforce exclusive RangeEnd: rangeToPrefix is an approximation,
-			// List may include keys >= RangeEnd.
-			// Skip filtering for CountOnly (Kvs is empty, Count is already correct).
-			rr := v.RequestRange
-			if rEnd := string(rr.RangeEnd); rEnd != "" && rEnd != "\x00" && !rr.CountOnly {
-				filtered := resp.Kvs[:0]
-				for _, kv := range resp.Kvs {
-					if string(kv.Key) < rEnd {
-						filtered = append(filtered, kv)
-					}
-				}
-				resp.Kvs = filtered
-				resp.Count = int64(len(filtered))
-			}
 			responses = append(responses, &etcdserverpb.ResponseOp{
 				Response: &etcdserverpb.ResponseOp_ResponseRange{ResponseRange: resp},
 			})
@@ -544,55 +551,7 @@ func (k *KVServer) executeOps(ctx context.Context, ops []*etcdserverpb.RequestOp
 			})
 			lastRev = resp.Header.Revision
 		case *etcdserverpb.RequestOp_RequestDeleteRange:
-			// Use fail-fast delete for Txn context: propagate first error rather than
-			// continuing (DeleteRange.continue-on-error is for bare RPC, not Txn).
 			dr := v.RequestDeleteRange
-			if len(dr.RangeEnd) > 0 {
-				// Range delete: iterate and fail on first error.
-				prefix := rangeToPrefix(string(dr.Key), string(dr.RangeEnd))
-				_, _, kvs, err := k.store.List(ctx, prefix, string(dr.Key), 0, 0)
-				if err != nil {
-					return nil, 0, toGRPCErr(err)
-				}
-				var deleted int64
-				var prevKvs []*mvccpb.KeyValue
-				var rev int64
-				rangeEnd := string(dr.RangeEnd)
-				for _, kv := range kvs {
-					// Enforce exclusive RangeEnd: rangeToPrefix is an approximation
-					// and List may include keys >= RangeEnd.
-					if rangeEnd != "\x00" && rangeEnd != "" && kv.Key >= rangeEnd {
-						break // List is ordered by key, no need to continue
-					}
-					r, prev, ok, err := k.store.Delete(ctx, kv.Key, 0)
-					if err != nil {
-						return nil, 0, toGRPCErr(err)
-					}
-					if ok {
-						deleted++
-						rev = r
-						if dr.PrevKv && prev != nil {
-							prevKvs = append(prevKvs, toProtoKV(prev))
-						}
-					}
-				}
-				if rev == 0 {
-					rev, err = k.store.CurrentRevision(ctx)
-					if err != nil {
-						return nil, 0, toGRPCErr(err)
-					}
-				}
-				dresp := &etcdserverpb.DeleteRangeResponse{
-					Header:  header(rev),
-					Deleted: deleted,
-					PrevKvs: prevKvs,
-				}
-				responses = append(responses, &etcdserverpb.ResponseOp{
-					Response: &etcdserverpb.ResponseOp_ResponseDeleteRange{ResponseDeleteRange: dresp},
-				})
-				lastRev = rev
-				continue
-			}
 			resp, err := k.DeleteRange(ctx, dr)
 			if err != nil {
 				return nil, 0, err
@@ -652,19 +611,44 @@ func toProtoKV(kv *store.KV) *mvccpb.KeyValue {
 	}
 }
 
-// rangeToPrefix converts an etcd key range [key, end) to a LIKE prefix.
-// For prefix queries, end = key with last byte incremented.
-func rangeToPrefix(key, end string) string {
-	if end == "\x00" {
-		return ""
+// rangeBounds turns an etcd range request into store bounds [start, upper).
+// range_end "\x00" means "every key from key onward", which the store spells as
+// an empty upper bound. Prefix requests need no special case: etcd clients encode
+// a prefix as the range [prefix, prefix with its last byte incremented).
+func rangeBounds(key, rangeEnd string) (start, upper string) {
+	if rangeEnd == "\x00" {
+		return key, ""
 	}
-	if len(end) > 0 && len(key) > 0 {
-		// Check if this is a simple prefix scan.
-		if strings.HasPrefix(end, key[:len(key)-1]) {
-			return key[:len(key)-1]
-		}
+	return key, rangeEnd
+}
+
+// validateKeyRange rejects keys that Spanner cannot store or compare as STRING.
+func validateKeyRange(key, rangeEnd string) error {
+	if !utf8.ValidString(key) || !utf8.ValidString(rangeEnd) {
+		return status.Error(codes.InvalidArgument, "key and range_end must be valid UTF-8")
 	}
-	return key
+	return nil
+}
+
+// sortOptions maps the request's sort fields to the store's, following etcd:
+// ascending by key is the default (no re-sort), and sorting by any other target
+// without an explicit order means ascending.
+func sortOptions(r *etcdserverpb.RangeRequest) (store.SortTarget, bool, error) {
+	desc := r.SortOrder == etcdserverpb.RangeRequest_DESCEND
+	switch r.SortTarget {
+	case etcdserverpb.RangeRequest_KEY:
+		return store.SortByKey, desc, nil
+	case etcdserverpb.RangeRequest_CREATE:
+		return store.SortByCreate, desc, nil
+	case etcdserverpb.RangeRequest_MOD:
+		return store.SortByMod, desc, nil
+	case etcdserverpb.RangeRequest_VALUE:
+		return store.SortByValue, desc, nil
+	default:
+		// VERSION: the version stored here is a revision difference, not a
+		// modification count, so ordering by it would not mean what clients expect.
+		return 0, false, status.Errorf(codes.Unimplemented, "sorting by %v is not supported", r.SortTarget)
+	}
 }
 
 func compareInt(actual, expected int64, op etcdserverpb.Compare_CompareResult) bool {

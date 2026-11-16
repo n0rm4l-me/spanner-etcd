@@ -144,8 +144,28 @@ loop:
 				nextID++
 
 				key := string(cr.Key)
-				prefix := watchPrefix(key, string(cr.RangeEnd))
 				startRev := cr.StartRevision
+
+				if err := validateKeyRange(key, string(cr.RangeEnd)); err != nil {
+					// Keys Spanner cannot store can never match anything: refuse
+					// the watch the way etcd reports a failed create, in one response.
+					select {
+					case respCh <- &etcdserverpb.WatchResponse{
+						Header:       header(0),
+						WatchId:      id,
+						Created:      true,
+						Canceled:     true,
+						CancelReason: status.Convert(err).Message(),
+					}:
+					case <-ctx.Done():
+						break loop
+					case err := <-sendErrCh:
+						sendErr = err
+						break loop
+					}
+					continue
+				}
+				start, end := watchBounds(key, string(cr.RangeEnd))
 
 				watchCtx, cancel := contextWithCancel(ctx)
 				watches[id] = cancel
@@ -163,7 +183,7 @@ loop:
 					break loop
 				}
 
-				go w.watchLoop(watchCtx, id, prefix, startRev, respCh, cancelledCh)
+				go w.watchLoop(watchCtx, id, start, end, startRev, respCh, cancelledCh)
 
 			case *etcdserverpb.WatchRequest_CancelRequest:
 				id := v.CancelRequest.WatchId
@@ -201,7 +221,7 @@ loop:
 func (w *WatchServer) watchLoop(
 	ctx interface{ Done() <-chan struct{} },
 	watchID int64,
-	prefix string,
+	start, end string,
 	startRev int64,
 	respCh chan<- *etcdserverpb.WatchResponse,
 	cancelledCh chan<- int64,
@@ -223,7 +243,7 @@ func (w *WatchServer) watchLoop(
 	stdCtx, cancel := streamContextWithCancel(goctx)
 	defer cancel()
 
-	eventCh := w.store.Watch(stdCtx, prefix, startRev)
+	eventCh := w.store.WatchRange(stdCtx, start, end, startRev)
 	progressTicker := time.NewTicker(progressNotifyInterval)
 	defer progressTicker.Stop()
 
@@ -313,17 +333,16 @@ func toWatchEvent(ev *store.Event) *mvccpb.Event {
 	return pbEv
 }
 
-// watchPrefix converts etcd [key, rangeEnd) to a prefix string for the store.
-func watchPrefix(key, rangeEnd string) string {
-	if rangeEnd == "" {
-		return key
+// watchBounds converts an etcd watch range to store bounds [start, end), where an
+// empty end means no upper bound. A single key k is the range [k, k+"\x00"), and
+// range_end "\x00" means every key from key onward.
+func watchBounds(key, rangeEnd string) (start, end string) {
+	switch rangeEnd {
+	case "":
+		return key, key + "\x00"
+	case "\x00":
+		return key, ""
+	default:
+		return key, rangeEnd
 	}
-	if rangeEnd == "\x00" {
-		return ""
-	}
-	// Prefix scan: rangeEnd = key with last byte incremented.
-	if len(key) > 0 && len(rangeEnd) == len(key) {
-		return key[:len(key)-1]
-	}
-	return key
 }
