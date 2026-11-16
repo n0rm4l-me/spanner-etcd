@@ -43,7 +43,7 @@ Multiple `spanner-etcd` replicas can run concurrently — all state lives in Spa
 
 | Service | Method | Status | Notes |
 |---------|--------|--------|-------|
-| **KV** | Range (Get/List) | ✅ | Single key, prefix, range, historical (rev=N), count-only |
+| **KV** | Range (Get/List) | ✅ | Single key, prefix, exact `[key, range_end)` ranges, from-key, historical (rev=N), count-only, `limit` with exact `More`, sort by key/create/mod/value |
 | **KV** | Put | ✅ | Create + unconditional update |
 | **KV** | DeleteRange | ✅ | Single key and prefix |
 | **KV** | Txn | ✅ | Compare-and-swap: MOD, VERSION, CREATE, VALUE operators |
@@ -183,6 +183,13 @@ With 10,000+ watchers and 1,000 writes/sec, the synchronous `dispatchEvents` bec
 ### Change Streams not supported on Spanner emulator
 
 The emulator does not support the `READ_kv_changes` TVF. spanner-etcd then relies on the 1-second poll alone: an event from a write made through another replica reaches a watcher within about a second, while a write served by the same replica wakes its watcher immediately. On a real instance the same event arrives in tens of milliseconds when the Change Stream is in its fast mode and within about a second otherwise. Measured end to end (write call to event at the subscriber, through a different replica, from a laptop over the WAN to `asia-northeast1`, 5 events per run, including the write itself): one run gave a median of 102 ms (max 207 ms), other runs on the same instance a median of about 0.7 s (max 1.5 s).
+
+### Range reads
+
+- Ranges are exact: `[key, range_end)` in byte order, and a prefix is the range `[prefix, prefix with its last byte incremented)`. `_` and `%` in keys are ordinary characters. Keys and range ends must be valid UTF-8 (they are stored as Spanner `STRING`); anything else is rejected with `InvalidArgument`.
+- With a `limit`, `Count` is the number of keys returned, whereas etcd reports the size of the whole range. Computing that would scan the entire range on every page of a paginated read. `More` is exact, and it is what paginating clients (the Kubernetes API server, etcdctl) use.
+- Sorting by version is not supported (`Unimplemented`). The stored version is the difference between the modification and creation revisions plus one, not a count of modifications, so a `VERSION` compare in a Txn is only reliable for "does not exist" (`== 0`) and "never modified" (`== 1`).
+- `DeleteRange` over a range is not atomic: it deletes key by key and returns the first error instead of reporting a partial delete as success. It is safe to repeat.
 
 ### Txn with range ops is non-atomic
 

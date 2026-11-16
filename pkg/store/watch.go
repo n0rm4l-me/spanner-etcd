@@ -30,7 +30,6 @@ package store
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,7 +56,8 @@ const (
 
 // subscriber is a single Watch consumer.
 type subscriber struct {
-	prefix string
+	start  string // inclusive
+	end    string // exclusive; "" = unbounded
 	ch     chan []*Event
 	cancel context.CancelFunc
 	closed atomic.Bool // guards against sending to ch after closedSentinel
@@ -133,14 +133,16 @@ func (w *Watcher) wake(u wakeup) {
 	}
 }
 
-// subscribe returns a channel that delivers events for prefix, starting after afterRev.
+// subscribe returns a channel that delivers events for keys in [start, end),
+// starting after afterRev.
 // The channel is never closed — teardown is signalled by sending closedSentinel
 // (an empty non-nil []*Event slice). Callers must select on both the channel and
 // their own context/done signal rather than using for-range semantics.
-func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) <-chan []*Event {
+func (w *Watcher) subscribe(ctx context.Context, start, end string, afterRev int64) <-chan []*Event {
 	subCtx, cancel := context.WithCancel(ctx)
 	sub := &subscriber{
-		prefix: prefix,
+		start:  start,
+		end:    end,
 		ch:     make(chan []*Event, subChannelDepth),
 		cancel: cancel,
 	}
@@ -190,7 +192,7 @@ func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) 
 		// Explicitly check the compaction horizon here to avoid silent empty replay.
 		if compactRev, cerr := w.store.compactRevision(subCtx); cerr != nil {
 			w.log.Warn("watch replay: failed to read compact revision, cancelling watch",
-				zap.String("prefix", prefix), zap.Error(cerr))
+				zap.String("start", start), zap.String("end", end), zap.Error(cerr))
 			return
 		} else if compactRev > 1 && afterRev <= compactRev {
 			w.log.Warn("watch replay: startRevision already compacted",
@@ -203,9 +205,9 @@ func (w *Watcher) subscribe(ctx context.Context, prefix string, afterRev int64) 
 		// batch signals there are no more pages.
 		replayRev := afterRev - 1
 		for {
-			_, events, err := w.store.After(subCtx, prefix, replayRev, pollBatchSize)
+			_, events, err := w.store.AfterRange(subCtx, start, end, replayRev, pollBatchSize)
 			if err != nil {
-				w.log.Warn("watch replay error", zap.String("prefix", prefix), zap.Error(err))
+				w.log.Warn("watch replay error", zap.String("start", start), zap.String("end", end), zap.Error(err))
 				return
 			}
 			if len(events) > 0 {
@@ -274,10 +276,9 @@ func (w *Watcher) dispatchEvents(events []*Event) {
 	w.mu.Unlock()
 
 	for _, sub := range subs {
-		prefix := strings.TrimSuffix(sub.prefix, "%")
 		var matching []*Event
 		for _, ev := range events {
-			if prefix == "" || strings.HasPrefix(ev.KV.Key, prefix) {
+			if InRange(ev.KV.Key, sub.start, sub.end) {
 				matching = append(matching, ev)
 			}
 		}
@@ -295,7 +296,7 @@ func (w *Watcher) dispatchEvents(events []*Event) {
 			// Do NOT close sub.ch here — the channel is never closed; the subscriber
 			// goroutine sends closedSentinel when it exits, preventing a closed-channel panic.
 			w.log.Warn("subscriber channel full, closing watch",
-				zap.String("prefix", sub.prefix))
+				zap.String("start", sub.start), zap.String("end", sub.end))
 			metrics.WatchSubscriberDropsTotal.Inc()
 			sub.cancel()
 		}
