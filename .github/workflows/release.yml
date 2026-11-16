@@ -51,9 +51,12 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          # A tag with a suffix (v0.3.0-rc.1) is a pre-release: it gets its own image
+          # tag but never moves :latest, so trying a release candidate cannot change
+          # what everyone who follows :latest runs. (An empty line is ignored.)
           tags: |
             ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            ghcr.io/${{ github.repository }}:latest
+            ${{ !contains(github.ref_name, '-') && format('ghcr.io/{0}:latest', github.repository) || '' }}
 
       - name: extract changelog
         id: changelog
@@ -71,6 +74,9 @@ jobs:
       - name: create github release
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
+          # Pre-releases are marked as such and never become the "latest" release.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
           body: ${{ steps.changelog.outputs.body }}
           files: |
             spanner-etcd-linux-amd64

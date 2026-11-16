@@ -85,6 +85,14 @@ The release workflow runs the same `test` job first (`workflow_call`) and publis
 
 Actions are pinned by commit SHA (the `# vX.Y.Z` comment names the version) and Dependabot proposes updates weekly (`.github/dependabot.yml`). Minor and patch updates of one ecosystem arrive as a single pull request, major updates stay separate, the etcd api and client modules always move together, a new release waits a week before it is proposed, and the Go image stays on the Go version in `go.mod`. When reviewing: a green grouped minor/patch PR can be merged as is; look at each major update, especially the actions used only by the release workflow (login, build-push, gh-release), which no pull request exercises, so the first release after merging is their first run. To run the race detector locally on macOS, `CGO_ENABLED=1` needs a working SDK; if linking fails with `unknown architecture` errors from the Command Line Tools SDK, point `SDKROOT` at an older one, for example `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk`.
 
+## Releasing
+
+1. Move the entries under `## Unreleased` in `CHANGELOG.md` to a new `## vX.Y.Z - date` section, and bump `version` and `appVersion` (with the `v` prefix) in `helm/spanner-etcd/Chart.yaml`. Both go through a pull request like any other change.
+2. Optionally try a release candidate first: push a tag with a suffix, for example `v0.3.0-rc.1`. The release workflow runs the whole `test` job, then builds and publishes the image for `linux/amd64` and `linux/arm64`, the binaries and a GitHub release. A suffixed tag is treated as a pre-release: its image is tagged with the tag only (`:latest` is not moved) and the GitHub release is marked as a pre-release.
+3. Push the final tag, for example `v0.3.0`. The same workflow publishes it, moves `:latest` and marks the GitHub release as the latest one. The release notes are the section of the CHANGELOG whose heading starts with the tag.
+
+Nothing is published unless the `test` job passes. The release workflow runs only on tags, so no pull request exercises it; a release candidate is how to check changes to it.
+
 ## Makefile targets
 
 | Target | Description |
