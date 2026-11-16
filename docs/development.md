@@ -55,8 +55,10 @@ go run -race ./cmd/server/ \
 
 GitHub Actions runs on every push to `main` and every PR:
 
-- `test` job: `go vet` + all integration tests against the Spanner emulator
+- `test` job: `go vet`, `govulncheck` (fails on a vulnerability the code actually reaches), all integration tests against the Spanner emulator with the race detector, and a check that no test was skipped
 - `bench` job (main only): benchmarks with results in Job Summary + artifact
+
+Actions are pinned by commit SHA (the `# vX.Y.Z` comment names the version) and Dependabot proposes updates weekly. To run the race detector locally on macOS, `CGO_ENABLED=1` needs a working SDK; if linking fails with `unknown architecture` errors from the Command Line Tools SDK, point `SDKROOT` at an older one, for example `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk`.
 
 ## Makefile targets
 
