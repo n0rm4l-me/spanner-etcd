@@ -9,6 +9,10 @@
 - `spanner_etcd_active_leases` is now the cluster-wide count of unexpired leases, refreshed about every 15 seconds, not a per-replica in-memory count.
 - Library users: `LeaseManager.Get` was removed and `GetTTL` now takes a context and returns an error.
 
+### Upgrade notes (flags)
+
+- A deployment that passes a flag the server does not know, an invalid value or half of a TLS pair used to start anyway; it will now fail at startup. Check your arguments before upgrading. The Helm chart in this repository passes only flags that are valid.
+
 ### Upgrade notes (ranges)
 
 - Behaviour change: reads, deletes and watches over a prefix or range now cover exactly the keys etcd would include. Clients that relied on the old over-inclusion (for example a watch on `/a/` that also saw `/ab/`) will no longer see those keys.
@@ -23,6 +27,7 @@
 
 ### Fixed
 
+- **Typos and bad values in server flags were ignored silently.** The hand-written flag parser skipped anything it did not recognise, so `--tls-sert=...` started the server without TLS, `--tls-cert` without `--tls-key` quietly ran in plaintext, and an unparsable `--auth-token-ttl` kept the default without a word. The server now uses the standard `flag` package and refuses to start (exit code 2) on an unknown flag, a stray argument, an unparsable or negative duration, an inconsistent set of TLS flags, or an empty `--spanner-read-location`. `--flag value` now works as well as `--flag=value`, and `--help` lists every flag.
 - **Ranges were approximated with `LIKE 'prefix%'`, so `DeleteRange` could delete keys outside the range.** A prefix was turned into a LIKE pattern with its last character dropped: `DeleteRange` on `/del/a/` also deleted `/del/ab/3` and `/del/a0` (four keys deleted where two were asked for). The same approximation made `Range` return keys beyond `range_end` (an explicit range `[b, d)` included `d` and everything after it), treat `_` and `%` in keys as wildcards, and made Watch on `/wp/a/` deliver events for `/wp/ab/...` and `/wp/a0`. Ranges are now exact: `[key, range_end)` in byte order, with `range_end` `\x00` meaning "from key onward", for Range, Count, DeleteRange, Txn range operations and Watch alike. Keys and range ends that are not valid UTF-8 are rejected with `InvalidArgument`.
 - **Range never set `More`.** A read with a limit therefore looked complete after its first page: the Kubernetes API server, which pages its lists through `More`, and `etcdctl get --limit` would silently see a truncated result on any list longer than the limit. `More` is now exact.
 - **Range ignored the sort options.** `WithLastKey()` returned the first key, and `WithFirstKey()`, `WithSort(...)` and the other sort modes did nothing. Sorting by key, create revision, modification revision and value, ascending and descending, now works; sorting by version returns `Unimplemented` (see docs/architecture.md, Range reads).
