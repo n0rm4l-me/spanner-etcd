@@ -97,15 +97,19 @@ func TestPut_StoresLeaseID(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 
-	if _, _, err := s.Put(ctx, "/put/leased", []byte("v"), 4242); err != nil {
+	lease, err := s.Leases().Grant(ctx, 60)
+	if err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+	if _, _, err := s.Put(ctx, "/put/leased", []byte("v"), lease.ID); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	_, kv, err := s.Get(ctx, "/put/leased", 0)
 	if err != nil || kv == nil {
 		t.Fatalf("get: kv=%v err=%v", kv, err)
 	}
-	if kv.LeaseID != 4242 {
-		t.Errorf("LeaseID: want 4242, got %d", kv.LeaseID)
+	if kv.LeaseID != lease.ID {
+		t.Errorf("LeaseID: want %d, got %d", lease.ID, kv.LeaseID)
 	}
 }
 

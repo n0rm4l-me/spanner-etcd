@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
@@ -698,15 +699,19 @@ func boolToInt(b bool) int64 {
 }
 
 func toGRPCErr(err error) error {
-	switch err {
-	case store.ErrKeyExists:
+	switch {
+	case errors.Is(err, store.ErrKeyExists):
 		return status.Error(codes.AlreadyExists, "key already exists")
-	case store.ErrKeyNotFound:
+	case errors.Is(err, store.ErrKeyNotFound):
 		return status.Error(codes.NotFound, "key not found")
-	case store.ErrRevisionMismatch:
+	case errors.Is(err, store.ErrRevisionMismatch):
 		return status.Error(codes.FailedPrecondition, "revision mismatch")
-	case store.ErrCompacted:
+	case errors.Is(err, store.ErrCompacted):
 		return status.Error(codes.OutOfRange, "requested revision has been compacted")
+	case errors.Is(err, store.ErrLeaseNotFound):
+		// Exact etcd text and code: clients (etcdctl, jetcd) match on it to
+		// decide to grant a new lease.
+		return status.Error(codes.NotFound, "etcdserver: requested lease not found")
 	default:
 		return status.Error(codes.Internal, err.Error())
 	}

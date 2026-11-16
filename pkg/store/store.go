@@ -36,6 +36,10 @@ var ErrKeyExists = errors.New("key already exists")
 // ErrRevisionMismatch is returned by Update/Delete when the CAS check fails.
 var ErrRevisionMismatch = errors.New("revision mismatch")
 
+// ErrLeaseNotFound is returned by a write that attaches a key to a lease which
+// does not exist or has expired (etcd: "requested lease not found").
+var ErrLeaseNotFound = errors.New("requested lease not found")
+
 // ErrCompacted is returned when a requested revision has been compacted away.
 var ErrCompacted = errors.New("requested revision has been compacted")
 
@@ -349,6 +353,9 @@ func (s *Store) Create(ctx context.Context, key string, value []byte, leaseID in
 
 	resp, err := s.client.ReadWriteTransactionWithOptions(ctx,
 		func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			if err := requireLiveLease(ctx, txn, leaseID); err != nil {
+				return err
+			}
 			exists, err := s.keyExistsTxn(ctx, txn, key)
 			if err != nil {
 				return err
@@ -395,6 +402,9 @@ func (s *Store) Update(ctx context.Context, key string, value []byte, revision, 
 
 	resp, err := s.client.ReadWriteTransactionWithOptions(ctx,
 		func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			if err := requireLiveLease(ctx, txn, leaseID); err != nil {
+				return err
+			}
 			var err error
 			prev, err = s.getLatestTxn(ctx, txn, key)
 			if err != nil {
@@ -460,6 +470,9 @@ func (s *Store) Put(ctx context.Context, key string, value []byte, leaseID int64
 		func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 			// Spanner may retry this callback on ABORTED: derive everything from
 			// the read below and never carry state over from a previous attempt.
+			if err := requireLiveLease(ctx, txn, leaseID); err != nil {
+				return err
+			}
 			var err error
 			prev, err = s.getLatestTxn(ctx, txn, key)
 			if err != nil {
@@ -731,12 +744,23 @@ func (s *Store) AtomicTxn(
 			// the same key share the same PCT timestamp, making the final state
 			// nondeterministic (ORDER BY rev DESC LIMIT 1 can return any of them).
 			mutatedKeys := make(map[string]struct{}, len(ops))
+			checkedLeases := make(map[int64]struct{})
 			for _, op := range ops {
 				if op.Type == TxnOpPut || op.Type == TxnOpDelete {
 					if _, dup := mutatedKeys[op.Key]; dup {
 						return fmt.Errorf("duplicate mutation for key %q in single Txn branch", op.Key)
 					}
 					mutatedKeys[op.Key] = struct{}{}
+				}
+				// Fail the whole Txn, before anything is buffered, if a Put
+				// would attach a key to a lease that is gone.
+				if op.Type == TxnOpPut && op.LeaseID != 0 {
+					if _, ok := checkedLeases[op.LeaseID]; !ok {
+						if err := requireLiveLease(ctx, txn, op.LeaseID); err != nil {
+							return err
+						}
+						checkedLeases[op.LeaseID] = struct{}{}
+					}
 				}
 			}
 
