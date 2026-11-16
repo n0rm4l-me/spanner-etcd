@@ -96,6 +96,17 @@ func newTestDB(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("create database: %v", err)
 	}
+	// Register the drop as soon as the database may exist, before waiting for it.
+	// Spanner keeps creating it even if our wait fails (for example with a
+	// DeadlineExceeded on a busy instance), and a cleanup registered only after
+	// a successful wait would leave that database behind on a billed instance.
+	t.Cleanup(func() {
+		dropCtx, dropCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer dropCancel()
+		if err := adminClient.DropDatabase(dropCtx, &databasepb.DropDatabaseRequest{Database: dbPath}); err != nil {
+			t.Logf("DropDatabase %s: %v", dbPath, err)
+		}
+	})
 	if _, err := createOp.Wait(ctx); err != nil {
 		t.Fatalf("wait create database: %v", err)
 	}
@@ -103,14 +114,6 @@ func newTestDB(t *testing.T) string {
 	if err := schema.Ensure(ctx, adminClient, dbPath, zap.NewNop()); err != nil {
 		t.Fatalf("ensure schema: %v", err)
 	}
-
-	t.Cleanup(func() {
-		dropCtx, dropCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer dropCancel()
-		if err := adminClient.DropDatabase(dropCtx, &databasepb.DropDatabaseRequest{Database: dbPath}); err != nil {
-			t.Logf("DropDatabase %s: %v", dbPath, err)
-		}
-	})
 	return dbPath
 }
 
@@ -131,7 +134,14 @@ func openStore(t *testing.T, dbPath string, cfg store.StoreConfig) *store.Store 
 		t.Fatalf("seed rev counter: %v", err)
 	}
 
-	s, err := store.NewWithConfig(ctx, spannerClient, zap.NewNop(), cfg)
+	// SPANNER_ETCD_TEST_DEBUG=1 turns on store debug logging for diagnosing a test.
+	log := zap.NewNop()
+	if os.Getenv("SPANNER_ETCD_TEST_DEBUG") != "" {
+		if dev, err := zap.NewDevelopment(); err == nil {
+			log = dev
+		}
+	}
+	s, err := store.NewWithConfig(ctx, spannerClient, log, cfg)
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
