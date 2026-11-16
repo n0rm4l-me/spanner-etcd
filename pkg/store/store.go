@@ -932,6 +932,23 @@ func (s *Store) autoCompactLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// Compaction is cluster-wide work on shared state, so one replica per
+			// round is enough; the others skip. The holder is whichever replica
+			// ticked first, and if it dies another takes over once the lease runs out.
+			locked, err := s.tryLockCompaction(ctx, s.cfg.AutoCompactInterval-s.cfg.AutoCompactInterval/10)
+			if err != nil {
+				s.log.Warn("auto-compact: failed to take the compaction lease", zap.Error(err))
+				continue
+			}
+			if !locked {
+				continue
+			}
+			if n, err := s.cleanupCursors(ctx); err != nil {
+				s.log.Warn("auto-compact: failed to clean stale Change Stream cursors", zap.Error(err))
+			} else if n > 0 {
+				s.log.Info("removed stale Change Stream cursors", zap.Int64("rows", n))
+			}
+
 			curRev, err := s.CurrentRevision(ctx)
 			if err != nil {
 				s.log.Warn("auto-compact: failed to read current revision", zap.Error(err))
@@ -998,15 +1015,76 @@ func (s *Store) autoCompactLoop(ctx context.Context) {
 	}
 }
 
-// compactRows physically deletes old revisions in batches until none remain.
-// Returns the total number of rows deleted.
+// compactRows physically deletes old revisions in batches until none remain,
+// then the tombstones of keys that no longer have any other row. Returns the
+// total number of rows deleted.
 func (s *Store) compactRows(ctx context.Context, targetRev int64) int {
+	total, ok := s.compactSuperseded(ctx, targetRev)
+	if !ok {
+		return total
+	}
+	return total + s.compactTombstones(ctx, targetRev)
+}
+
+// compactSuperseded deletes every row at or below targetRev that a newer row of
+// the same key has replaced. It reports false if it stopped on an error.
+func (s *Store) compactSuperseded(ctx context.Context, targetRev int64) (int, bool) {
 	targetTS := revToTS(targetRev)
 	total := 0
 	for {
 		ids, err := s.scanCompactBatch(ctx, targetTS)
 		if err != nil {
 			s.log.Warn("compact rows scan failed",
+				zap.Int64("target_rev", targetRev), zap.Error(err))
+			return total, false
+		}
+		if len(ids) == 0 {
+			return total, true
+		}
+
+		mutations := make([]*spanner.Mutation, len(ids))
+		for i, id := range ids {
+			mutations[i] = spanner.Delete("kv", id)
+		}
+		if _, err := s.client.Apply(ctx, mutations); err != nil {
+			s.log.Warn("compact rows delete failed",
+				zap.Int64("target_rev", targetRev), zap.Int("count", len(ids)), zap.Error(err))
+			return total, false
+		}
+		total += len(ids)
+
+		if len(ids) < compactBatchSize {
+			return total, true
+		}
+	}
+}
+
+// compactTombstones deletes the tombstones of keys that were deleted at or below
+// targetRev and have no other row left. Without this a deleted key kept its
+// tombstone forever, and a store with a steady churn of short-lived keys grew
+// without bound.
+//
+// Two rules make it safe:
+//   - Only a tombstone that is its key's only row is removed. An older value
+//     still present would become the latest row again and the key would come
+//     back, so the superseded rows always go first (compactSuperseded) and a
+//     tombstone with company is left for a later round.
+//   - The newest row in the table is never removed. CurrentRevision is the
+//     maximum rev in kv, so deleting the newest row, a tombstone on an idle
+//     store for instance, would move the revision backwards.
+func (s *Store) compactTombstones(ctx context.Context, targetRev int64) int {
+	maxRev, err := s.CurrentRevision(ctx)
+	if err != nil {
+		s.log.Warn("compact tombstones: failed to read current revision", zap.Error(err))
+		return 0
+	}
+	targetTS, maxTS := revToTS(targetRev), revToTS(maxRev)
+
+	total := 0
+	for {
+		ids, err := s.scanTombstoneBatch(ctx, targetTS, maxTS)
+		if err != nil {
+			s.log.Warn("compact tombstones scan failed",
 				zap.Int64("target_rev", targetRev), zap.Error(err))
 			return total
 		}
@@ -1019,7 +1097,7 @@ func (s *Store) compactRows(ctx context.Context, targetRev int64) int {
 			mutations[i] = spanner.Delete("kv", id)
 		}
 		if _, err := s.client.Apply(ctx, mutations); err != nil {
-			s.log.Warn("compact rows delete failed",
+			s.log.Warn("compact tombstones delete failed",
 				zap.Int64("target_rev", targetRev), zap.Int("count", len(ids)), zap.Error(err))
 			return total
 		}
@@ -1031,10 +1109,118 @@ func (s *Store) compactRows(ctx context.Context, targetRev int64) int {
 	}
 }
 
+// scanTombstoneBatch fetches one batch of tombstones that compactTombstones may
+// delete: at or below the target, older than the newest row, and alone.
+func (s *Store) scanTombstoneBatch(ctx context.Context, targetTS, maxTS time.Time) ([]spanner.Key, error) {
+	stmt := spanner.Statement{
+		SQL: `SELECT t.id FROM kv AS t
+		      WHERE t.deleted = true
+		        AND t.rev <= @target
+		        AND t.rev < @max_rev
+		        AND NOT EXISTS (SELECT 1 FROM kv AS o WHERE o.key = t.key AND o.id != t.id)
+		      LIMIT @batch`,
+		Params: map[string]interface{}{
+			"target":  targetTS,
+			"max_rev": maxTS,
+			"batch":   int64(compactBatchSize),
+		},
+	}
+	iter := s.client.Single().Query(ctx, stmt)
+	defer iter.Stop()
+
+	var ids []spanner.Key
+	for {
+		row, err := iter.Next()
+		if errors.Is(err, iterator.Done) {
+			return ids, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		var id int64
+		if err := row.Column(0, &id); err != nil {
+			return nil, fmt.Errorf("decode tombstone row id: %w", err)
+		}
+		ids = append(ids, spanner.Key{id})
+	}
+}
+
+// tryLockCompaction takes the compaction lease for ttl if nobody holds it.
+// The lease is a row in kv_rev whose rev is its expiry on Spanner's clock, so
+// replicas with different local clocks agree on who holds it. It reports whether
+// this call took it.
+func (s *Store) tryLockCompaction(ctx context.Context, ttl time.Duration) (bool, error) {
+	ms := ttl.Milliseconds()
+	if ms < 1 {
+		ms = 1
+	}
+	var acquired bool
+	_, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		acquired = false // reset: Spanner may retry this callback on ABORTED
+
+		iter := txn.Query(ctx, spanner.Statement{
+			SQL:    `SELECT 1 FROM kv_rev WHERE id = @id AND rev > CURRENT_TIMESTAMP()`,
+			Params: map[string]interface{}{"id": schema.CompactLockRow},
+		})
+		_, err := iter.Next()
+		iter.Stop()
+		if err == nil {
+			return nil // held by someone
+		}
+		if !errors.Is(err, iterator.Done) {
+			return err
+		}
+
+		params := map[string]interface{}{"id": schema.CompactLockRow, "ms": ms}
+		n, err := txn.Update(ctx, spanner.Statement{
+			SQL:    `UPDATE kv_rev SET rev = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL @ms MILLISECOND) WHERE id = @id`,
+			Params: params,
+		})
+		if err != nil {
+			return err
+		}
+		if n == 0 { // first use: the row does not exist yet
+			if _, err := txn.Update(ctx, spanner.Statement{
+				SQL:    `INSERT INTO kv_rev (id, rev) VALUES (@id, TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL @ms MILLISECOND))`,
+				Params: params,
+			}); err != nil {
+				return err
+			}
+		}
+		acquired = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return acquired, nil
+}
+
+// cursorMaxAge is how long a Change Stream cursor may go unwritten before it is
+// considered abandoned. A running reader rewrites its cursors every few seconds.
+const cursorMaxAge = 24 * time.Hour
+
+// cleanupCursors deletes Change Stream cursors that have not been written for
+// cursorMaxAge. Their owners are replicas that no longer exist (the cursor key
+// includes a per-process replica id), so without this the table gains rows on
+// every restart and keeps them forever.
+func (s *Store) cleanupCursors(ctx context.Context) (int64, error) {
+	var n int64
+	_, err := s.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		var err error
+		n, err = txn.Update(ctx, spanner.Statement{
+			SQL: fmt.Sprintf(`DELETE FROM kv_cs_cursors WHERE updated_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL %d HOUR)`,
+				int(cursorMaxAge.Hours())),
+		})
+		return err
+	})
+	return n, err
+}
+
 // scanCompactBatch fetches one batch of row IDs eligible for compaction.
-// A row is eligible only if there exists a strictly newer row for the same key.
-// This covers both stale historical revisions AND tombstones — but never deletes
-// the latest row for a key (whether it is a live value or a tombstone).
+// A row is eligible only if there exists a strictly newer row for the same key,
+// so the latest row of a key (a live value or a tombstone) is never returned.
+// Tombstones that have nothing else left are removed afterwards by compactTombstones.
 func (s *Store) scanCompactBatch(ctx context.Context, targetTS time.Time) ([]spanner.Key, error) {
 	stmt := spanner.Statement{
 		SQL: `SELECT kv.id FROM kv
