@@ -80,7 +80,7 @@ etcdctl put /hello world && etcdctl get /hello
 | Background auto-compaction | ✅ Complete |
 | Prometheus metrics + GKE PodMonitoring | ✅ Complete |
 | Helm chart (WIF, PDB, HPA) | ✅ Complete |
-| 84 integration tests | ✅ Passing |
+| 90 integration tests | ✅ Passing |
 | Kubernetes v1.33.12 (kubeadm) | ✅ Validated |
 | 24h soak test (Kubernetes v1.33) | ✅ Complete |
 | TLS / mTLS | ✅ Validated |

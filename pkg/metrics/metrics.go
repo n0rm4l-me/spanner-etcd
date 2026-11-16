@@ -83,11 +83,12 @@ var (
 
 	// ── Leases ────────────────────────────────────────────────────────────────
 
-	// ActiveLeases is the number of leases currently held in memory.
+	// ActiveLeases is the number of unexpired leases in the cluster, as counted
+	// from kv_lease by this replica every few seconds.
 	ActiveLeases = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: "spanner_etcd",
 		Name:      "active_leases",
-		Help:      "Number of active TTL leases.",
+		Help:      "Number of active (unexpired) TTL leases cluster-wide, refreshed periodically.",
 	})
 
 	// LeaseExpirations counts leases that expired naturally (not revoked).

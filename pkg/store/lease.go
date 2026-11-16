@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
+	"math/rand"
 	"sync/atomic"
 	"time"
 
@@ -15,38 +15,54 @@ import (
 	"github.com/n0rm4l-me/spanner-etcd/pkg/metrics"
 )
 
-// Lease represents an active lease.
+const (
+	// leaseReapInterval is how often every replica looks for expired leases.
+	leaseReapInterval = time.Second
+	// leaseCountInterval is how often the active-lease gauge is refreshed.
+	leaseCountInterval = 15 * time.Second
+
+	// leaseExpiryExpr is the SQL expression for a lease's expiry time.
+	// Rows written before expires_at existed (NULL) fall back to granted_at + ttl.
+	leaseExpiryExpr = `COALESCE(expires_at, TIMESTAMP_ADD(granted_at, INTERVAL ttl_sec SECOND))`
+)
+
+// Lease represents a lease as returned by Grant.
 type Lease struct {
-	ID         int64
-	TTL        int64
-	GrantedAt  time.Time
-	ExpiresAt  time.Time
+	ID        int64
+	TTL       int64
+	GrantedAt time.Time
+	ExpiresAt time.Time
 }
 
-// LeaseManager tracks active leases and expires keys when TTL runs out.
-// It is horizontally safe: each replica runs its own expiry goroutines, but
-// deletes are idempotent (CAS on rev=0 means "delete if exists").
+// LeaseManager implements etcd leases on top of the kv_lease table.
+//
+// A lease is cluster state, not replica state: the row in kv_lease (with its
+// expires_at) is the single source of truth. Grant, Keepalive and TimeToLive
+// work on any replica regardless of which replica granted the lease, and every
+// replica runs a reaper that expires leases whose expires_at has passed.
+//
+// All expiry arithmetic is done by Spanner (CURRENT_TIMESTAMP), never by the
+// replica's own clock, so clock skew between pods cannot expire a lease early
+// or keep it alive too long. Expiry is monotonic: Keepalive only extends a
+// lease that has not expired yet, so once expires_at has passed the lease is
+// dead and any number of replicas may race to reap it, which is idempotent.
 type LeaseManager struct {
 	store  *Store
 	log    *zap.Logger
 	nextID atomic.Int64
-	bgCtx  context.Context // long-lived context for expiry goroutines
-
-	mu     sync.Mutex
-	leases map[int64]*Lease
 	stopCh chan struct{}
 }
 
+// newLeaseManager starts the reaper on ctx, which must be the server-lifetime
+// context, not a request context.
 func newLeaseManager(ctx context.Context, s *Store, log *zap.Logger) *LeaseManager {
 	lm := &LeaseManager{
 		store:  s,
 		log:    log,
-		leases: make(map[int64]*Lease),
 		stopCh: make(chan struct{}),
-		bgCtx:  ctx, // server-lifetime context, not request context
 	}
 	lm.nextID.Store(time.Now().UnixNano())
-	go lm.gcLoop(ctx)
+	go lm.reapLoop(ctx)
 	return lm
 }
 
@@ -54,168 +70,226 @@ func (lm *LeaseManager) close() {
 	close(lm.stopCh)
 }
 
-// Grant creates a new lease with the given TTL.
+// Grant creates a new lease with the given TTL (seconds).
 func (lm *LeaseManager) Grant(ctx context.Context, ttl int64) (*Lease, error) {
 	id := lm.nextID.Add(1)
 	now := time.Now()
-	lease := &Lease{
-		ID:        id,
-		TTL:       ttl,
-		GrantedAt: now,
-		ExpiresAt: now.Add(time.Duration(ttl) * time.Second),
-	}
 
-	_, err := lm.store.client.Apply(ctx, []*spanner.Mutation{
-		spanner.InsertMap("kv_lease", map[string]interface{}{
-			"lease_id":   id,
-			"ttl_sec":    ttl,
-			"granted_at": spanner.CommitTimestamp,
-		}),
+	_, err := lm.store.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		_, err := txn.Update(ctx, spanner.Statement{
+			SQL: `INSERT INTO kv_lease (lease_id, ttl_sec, granted_at, expires_at)
+			      VALUES (@id, @ttl, PENDING_COMMIT_TIMESTAMP(),
+			              TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL @ttl SECOND))`,
+			Params: map[string]interface{}{"id": id, "ttl": ttl},
+		})
+		return err
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	lm.mu.Lock()
-	lm.leases[id] = lease
-	lm.mu.Unlock()
-	metrics.ActiveLeases.Inc()
-
-	// Schedule expiry using the server-lifetime context, not the request context.
-	// The request context is cancelled as soon as LeaseGrant returns to the client.
-	go lm.scheduleExpiry(lm.bgCtx, lease)
-	return lease, nil
+	return &Lease{
+		ID:        id,
+		TTL:       ttl,
+		GrantedAt: now,
+		ExpiresAt: now.Add(time.Duration(ttl) * time.Second),
+	}, nil
 }
 
 // Revoke removes a lease and deletes all keys associated with it.
-// The lease is removed from the in-memory map only after expireLeaseKeys
-// succeeds — if the key deletion fails transiently, the lease remains in
-// memory so scheduleExpiry can retry and the gcLoop can reload it on restart.
+// The lease row is removed only after its keys were deleted, so if deletion
+// fails transiently the lease stays in kv_lease and is retried (by the caller,
+// or by the reaper once it has expired).
 func (lm *LeaseManager) Revoke(ctx context.Context, id int64) error {
-	if err := lm.expireLeaseKeys(ctx, id); err != nil {
-		return err
-	}
-
-	lm.mu.Lock()
-	_, existed := lm.leases[id]
-	delete(lm.leases, id)
-	lm.mu.Unlock()
-	if existed {
-		metrics.ActiveLeases.Dec()
-	}
-	return nil
+	_, err := lm.expireLeaseKeys(ctx, id)
+	return err
 }
 
-// Get returns a lease by ID, or nil.
-func (lm *LeaseManager) Get(id int64) *Lease {
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
-	return lm.leases[id]
-}
-
-// LeaseSnapshot is an immutable point-in-time copy of a Lease's fields.
-// Safe to read without holding lm.mu.
+// LeaseSnapshot is an immutable point-in-time copy of a lease's state.
 type LeaseSnapshot struct {
-	ID         int64
-	TTL        int64 // original grant TTL
-	Remaining  int64 // seconds until expiry (0 if already expired)
+	ID        int64
+	TTL       int64 // original grant TTL
+	Remaining int64 // seconds until expiry (0 if already expired)
 }
 
-// GetTTL returns a snapshot of the lease and its remaining TTL.
-// All fields are read under the mutex — no pointer to the live Lease is exposed.
-// Returns (zero, false) if the lease is not found.
-func (lm *LeaseManager) GetTTL(id int64) (LeaseSnapshot, bool) {
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
-	lease, ok := lm.leases[id]
-	if !ok {
-		return LeaseSnapshot{}, false
+// GetTTL returns the lease and its remaining TTL as computed by Spanner.
+// Returns (zero, false, nil) if the lease does not exist.
+func (lm *LeaseManager) GetTTL(ctx context.Context, id int64) (LeaseSnapshot, bool, error) {
+	iter := lm.store.client.Single().Query(ctx, spanner.Statement{
+		SQL: `SELECT ttl_sec, TIMESTAMP_DIFF(` + leaseExpiryExpr + `, CURRENT_TIMESTAMP(), SECOND)
+		      FROM kv_lease WHERE lease_id = @id`,
+		Params: map[string]interface{}{"id": id},
+	})
+	defer iter.Stop()
+
+	row, err := iter.Next()
+	if errors.Is(err, iterator.Done) {
+		return LeaseSnapshot{}, false, nil
 	}
-	remaining := int64(time.Until(lease.ExpiresAt).Seconds())
+	if err != nil {
+		return LeaseSnapshot{}, false, fmt.Errorf("lease ttl %d: %w", id, err)
+	}
+	var ttl, remaining int64
+	if err := row.Columns(&ttl, &remaining); err != nil {
+		return LeaseSnapshot{}, false, err
+	}
 	if remaining < 0 {
 		remaining = 0
 	}
-	return LeaseSnapshot{ID: lease.ID, TTL: lease.TTL, Remaining: remaining}, true
+	return LeaseSnapshot{ID: id, TTL: ttl, Remaining: remaining}, true, nil
 }
 
-// Keepalive resets the expiry time for the lease.
+// Keepalive extends the lease to now + TTL and returns the TTL.
+// It returns 0 (and no error) if the lease does not exist or has already
+// expired; etcd clients read TTL 0 as "lease lost".
+//
+// The extension is persisted on every call, not coalesced: the lease lifetime
+// after the last keepalive is exactly one TTL, as in etcd. Skipping writes
+// would shorten that margin, which matters for clients that send keepalives
+// only a few times per TTL.
 func (lm *LeaseManager) Keepalive(ctx context.Context, id int64) (int64, error) {
-	lm.mu.Lock()
-	lease, ok := lm.leases[id]
-	if !ok {
-		lm.mu.Unlock()
-		return 0, nil
+	var ttl int64
+	_, err := lm.store.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		ttl = 0 // reset: Spanner may retry this callback on ABORTED
+
+		iter := txn.Query(ctx, spanner.Statement{
+			SQL: `SELECT ttl_sec FROM kv_lease
+			      WHERE lease_id = @id AND ` + leaseExpiryExpr + ` > CURRENT_TIMESTAMP()`,
+			Params: map[string]interface{}{"id": id},
+		})
+		row, err := iter.Next()
+		iter.Stop()
+		if errors.Is(err, iterator.Done) {
+			return nil // unknown or expired
+		}
+		if err != nil {
+			return err
+		}
+		var granted int64
+		if err := row.Columns(&granted); err != nil {
+			return err
+		}
+
+		if _, err := txn.Update(ctx, spanner.Statement{
+			SQL: `UPDATE kv_lease
+			      SET expires_at = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL ttl_sec SECOND)
+			      WHERE lease_id = @id`,
+			Params: map[string]interface{}{"id": id},
+		}); err != nil {
+			return err
+		}
+		ttl = granted
+		return nil
+	})
+	if err != nil {
+		return 0, err
 	}
-	lease.ExpiresAt = time.Now().Add(time.Duration(lease.TTL) * time.Second)
-	lm.mu.Unlock()
-	return lease.TTL, nil
+	return ttl, nil
 }
 
-// scheduleExpiry waits for the lease TTL then expires keys.
-func (lm *LeaseManager) scheduleExpiry(ctx context.Context, lease *Lease) {
-	lm.mu.Lock()
-	expiresAt := lease.ExpiresAt
-	lm.mu.Unlock()
-	timer := time.NewTimer(time.Until(expiresAt))
-	defer timer.Stop()
-
-	select {
-	case <-lm.stopCh:
-		return
-	case <-ctx.Done():
-		return
-	case <-timer.C:
-	}
-
-	// Check if lease was already revoked.
-	lm.mu.Lock()
-	current, ok := lm.leases[lease.ID]
-	lm.mu.Unlock()
-	if !ok {
-		return
-	}
-
-	// If keepalive extended it, reschedule.
-	// Read ExpiresAt under the mutex to avoid a data race with Keepalive.
-	lm.mu.Lock()
-	timeUntilExpiry := time.Until(current.ExpiresAt)
-	lm.mu.Unlock()
-	if timeUntilExpiry > time.Second {
-		go lm.scheduleExpiry(ctx, current)
-		return
-	}
-
-	lm.log.Info("lease expired", zap.Int64("lease_id", lease.ID))
-	metrics.LeaseExpirations.Inc()
-
-	// Retry expiry with backoff on transient Spanner errors so a temporary
-	// failure does not leave the lease record and its keys stuck indefinitely.
-	for attempt := 1; attempt <= 5; attempt++ {
-		if err := lm.Revoke(ctx, lease.ID); err == nil {
+// reapLoop expires leases on this replica until the store is closed.
+// Every replica runs it; they may reap the same lease concurrently, which is
+// safe because each step is idempotent. The interval is jittered so replicas
+// started together do not stay in lockstep.
+func (lm *LeaseManager) reapLoop(ctx context.Context) {
+	var lastCount time.Time
+	for {
+		wait := leaseReapInterval + time.Duration(rand.Int63n(int64(leaseReapInterval/2)))
+		select {
+		case <-lm.stopCh:
 			return
-		} else {
-			lm.log.Warn("lease expiry error, retrying",
-				zap.Int64("lease_id", lease.ID),
-				zap.Int("attempt", attempt),
-				zap.Error(err))
-			select {
-			case <-time.After(time.Duration(attempt) * time.Second):
-			case <-lm.stopCh:
-				return
-			case <-ctx.Done():
-				return
-			}
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+
+		lm.reapExpired(ctx)
+		if time.Since(lastCount) >= leaseCountInterval {
+			lm.refreshActiveGauge(ctx)
+			lastCount = time.Now()
 		}
 	}
-	lm.log.Error("lease expiry failed after retries — lease may be stuck",
-		zap.Int64("lease_id", lease.ID))
 }
 
-// expireLeaseKeys deletes all keys whose latest revision still belongs to leaseID.
-// Each deletion is performed by DeleteIfLease — a Spanner RW transaction that
-// re-reads the key and only writes a tombstone when lease_id still matches.
-// This closes the TOCTOU window between the initial scan and the delete.
-func (lm *LeaseManager) expireLeaseKeys(ctx context.Context, leaseID int64) error {
+// reapExpired revokes every lease whose expiry has passed. A failure leaves the
+// lease in kv_lease, so the next tick retries it.
+func (lm *LeaseManager) reapExpired(ctx context.Context) {
+	ids, err := lm.expiredLeaseIDs(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			lm.log.Warn("lease reaper: failed to list expired leases", zap.Error(err))
+		}
+		return
+	}
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			return
+		}
+		removed, err := lm.expireLeaseKeys(ctx, id)
+		if err != nil {
+			if ctx.Err() == nil {
+				lm.log.Warn("lease expiry error, will retry",
+					zap.Int64("lease_id", id), zap.Error(err))
+			}
+			continue
+		}
+		// Only the replica that actually removed the lease row counts it, so
+		// concurrent reapers do not double-count.
+		if removed {
+			lm.log.Info("lease expired", zap.Int64("lease_id", id))
+			metrics.LeaseExpirations.Inc()
+		}
+	}
+}
+
+// expiredLeaseIDs lists leases whose expiry is in the past (Spanner time).
+func (lm *LeaseManager) expiredLeaseIDs(ctx context.Context) ([]int64, error) {
+	iter := lm.store.client.Single().Query(ctx, spanner.Statement{
+		SQL: `SELECT lease_id FROM kv_lease WHERE ` + leaseExpiryExpr + ` <= CURRENT_TIMESTAMP()`,
+	})
+	defer iter.Stop()
+
+	var ids []int64
+	for {
+		row, err := iter.Next()
+		if errors.Is(err, iterator.Done) {
+			return ids, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		var id int64
+		if err := row.Columns(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+}
+
+// refreshActiveGauge sets the active-lease gauge from the cluster-wide count.
+func (lm *LeaseManager) refreshActiveGauge(ctx context.Context) {
+	iter := lm.store.client.Single().Query(ctx, spanner.Statement{
+		SQL: `SELECT COUNT(*) FROM kv_lease WHERE ` + leaseExpiryExpr + ` > CURRENT_TIMESTAMP()`,
+	})
+	defer iter.Stop()
+	row, err := iter.Next()
+	if err != nil {
+		return
+	}
+	var n int64
+	if err := row.Columns(&n); err != nil {
+		return
+	}
+	metrics.ActiveLeases.Set(float64(n))
+}
+
+// expireLeaseKeys deletes all keys whose latest revision still belongs to leaseID
+// and then removes the lease row. It reports whether this call removed the row.
+//
+// Each deletion is performed by DeleteIfLease, a Spanner RW transaction that
+// re-reads the key and only writes a tombstone when lease_id still matches, so
+// the check and the delete are atomic.
+func (lm *LeaseManager) expireLeaseKeys(ctx context.Context, leaseID int64) (removed bool, err error) {
 	// Find all keys where the MAX(rev) row has lease_id=@lid and is not deleted.
 	// Note: the subquery filters MAX(rev) only among rows with lease_id=@lid,
 	// so a key reassigned to a different lease may still appear here.
@@ -254,9 +328,6 @@ func (lm *LeaseManager) expireLeaseKeys(ctx context.Context, leaseID int64) erro
 			deleteErrs++
 			continue
 		}
-		// Atomic lease_id-conditioned delete: only writes the tombstone if the
-		// key's current row still belongs to leaseID. This closes the TOCTOU
-		// window — the check and the delete are a single Spanner RW transaction.
 		if _, err := lm.store.DeleteIfLease(ctx, key, leaseID); err != nil {
 			lm.log.Warn("failed to delete lease key", zap.String("key", key), zap.Error(err))
 			deleteErrs++
@@ -266,87 +337,30 @@ func (lm *LeaseManager) expireLeaseKeys(ctx context.Context, leaseID int64) erro
 	if scanErr != nil {
 		lm.log.Warn("expireLeaseKeys: scan failed, lease record preserved for retry",
 			zap.Int64("lease_id", leaseID), zap.Error(scanErr))
-		return scanErr
+		return false, scanErr
 	}
 	if deleteErrs > 0 {
-		// Some key deletes failed — preserve the lease record so retries can
-		// attempt to delete the remaining keys rather than orphaning them.
+		// Some key deletes failed: keep the lease row so retries can delete the
+		// remaining keys instead of orphaning them.
 		lm.log.Warn("expireLeaseKeys: some key deletes failed, lease record preserved",
 			zap.Int64("lease_id", leaseID), zap.Int("failed", deleteErrs))
-		return fmt.Errorf("expireLeaseKeys: %d key delete(s) failed for lease %d", deleteErrs, leaseID)
+		return false, fmt.Errorf("expireLeaseKeys: %d key delete(s) failed for lease %d", deleteErrs, leaseID)
 	}
 
-	// All keys processed successfully — remove the lease record.
-	if _, err := lm.store.client.Apply(ctx, []*spanner.Mutation{
-		spanner.Delete("kv_lease", spanner.Key{leaseID}),
-	}); err != nil {
+	// All keys processed: remove the lease row. The affected-row count tells us
+	// whether a concurrent reaper or Revoke got there first.
+	_, err = lm.store.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		n, err := txn.Update(ctx, spanner.Statement{
+			SQL:    `DELETE FROM kv_lease WHERE lease_id = @id`,
+			Params: map[string]interface{}{"id": leaseID},
+		})
+		removed = n > 0
+		return err
+	})
+	if err != nil {
 		lm.log.Warn("expireLeaseKeys: failed to delete lease record",
 			zap.Int64("lease_id", leaseID), zap.Error(err))
-		return err
+		return false, err
 	}
-	return nil
-}
-
-// gcLoop reloads active leases on startup in case this replica restarted.
-// Retries on transient Spanner errors so a mid-scan failure does not silently
-// orphan the remaining leases.
-func (lm *LeaseManager) gcLoop(ctx context.Context) {
-	stmt := spanner.Statement{
-		SQL: `SELECT lease_id, ttl_sec, granted_at FROM kv_lease`,
-	}
-
-	for attempt := 1; ; attempt++ {
-		done, err := lm.loadLeases(ctx, stmt)
-		if done || ctx.Err() != nil {
-			return
-		}
-		if err != nil {
-			lm.log.Warn("gcLoop: failed to reload leases, retrying",
-				zap.Int("attempt", attempt), zap.Error(err))
-			select {
-			case <-time.After(time.Duration(attempt) * time.Second):
-			case <-lm.stopCh:
-				return
-			case <-ctx.Done():
-				return
-			}
-		}
-	}
-}
-
-// loadLeases performs one scan of kv_lease and schedules expiry for each entry.
-// Returns (true, nil) when the scan completes successfully.
-// Returns (false, err) on a Spanner error so gcLoop can retry.
-func (lm *LeaseManager) loadLeases(ctx context.Context, stmt spanner.Statement) (bool, error) {
-	iter := lm.store.client.Single().Query(ctx, stmt)
-	defer iter.Stop()
-
-	for {
-		row, err := iter.Next()
-		if errors.Is(err, iterator.Done) {
-			return true, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		var id, ttl int64
-		var grantedAt time.Time
-		if err := row.Columns(&id, &ttl, &grantedAt); err != nil {
-			lm.log.Warn("gcLoop: failed to decode lease row", zap.Error(err))
-			continue
-		}
-		lease := &Lease{
-			ID:        id,
-			TTL:       ttl,
-			GrantedAt: grantedAt,
-			ExpiresAt: grantedAt.Add(time.Duration(ttl) * time.Second),
-		}
-		lm.mu.Lock()
-		if _, exists := lm.leases[id]; !exists {
-			lm.leases[id] = lease
-			metrics.ActiveLeases.Inc()
-			go lm.scheduleExpiry(ctx, lease)
-		}
-		lm.mu.Unlock()
-	}
+	return removed, nil
 }

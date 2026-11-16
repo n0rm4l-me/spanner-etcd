@@ -85,8 +85,16 @@ func TestLease_Keepalive(t *testing.T) {
 
 func TestLease_GetUnknown(t *testing.T) {
 	s := newTestStore(t)
-	got := s.Leases().Get(99999)
-	if got != nil {
-		t.Fatalf("want nil for unknown lease, got %+v", got)
+	snap, ok, err := s.Leases().GetTTL(context.Background(), 99999)
+	if err != nil {
+		t.Fatalf("GetTTL: %v", err)
+	}
+	if ok {
+		t.Fatalf("want not found for unknown lease, got %+v", snap)
+	}
+
+	ttl, err := s.Leases().Keepalive(context.Background(), 99999)
+	if err != nil || ttl != 0 {
+		t.Fatalf("keepalive of unknown lease: want ttl=0 err=nil, got ttl=%d err=%v", ttl, err)
 	}
 }
