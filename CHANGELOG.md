@@ -25,6 +25,12 @@
 - `spanner_etcd_watch_events_total{source}` now says which signal triggered the read that delivered the events: `change_stream` for a Change Stream wake-up, `poll` for a local write or the timer. All events come from the same ordered read.
 - With the Change Stream working, each replica reads every partition of `kv_changes`, so expect more `READ_kv_changes` traffic than before on instances with many partitions.
 
+### Dependencies and tooling
+
+- Go modules: `google.golang.org/grpc` 1.83.2 to 1.85.0, the Spanner client 1.91.0 to 1.96.1 (checked on the emulator only), etcd `api` and `client` 3.6.11 to 3.7.3 (moved together; the pair builds and passes the whole suite), `prometheus/client_golang` 1.23.2 to 1.25.0.
+- GitHub Actions to their current major versions: `checkout` 7, `upload-artifact` 7, `docker/login-action` 4, `docker/build-push-action` 7, `softprops/action-gh-release` 3 (all still pinned by commit SHA). The release workflow runs only on tags, so the first release is the first run of its updated actions.
+- Dependabot now groups minor and patch updates into one pull request per ecosystem, keeps the etcd modules together, waits a week before proposing a new release and no longer proposes a newer Go image than `go.mod` declares.
+
 ### Fixed
 
 - **Typos and bad values in server flags were ignored silently.** The hand-written flag parser skipped anything it did not recognise, so `--tls-sert=...` started the server without TLS, `--tls-cert` without `--tls-key` quietly ran in plaintext, and an unparsable `--auth-token-ttl` kept the default without a word. The server now uses the standard `flag` package and refuses to start (exit code 2) on an unknown flag, a stray argument, an unparsable or negative duration, an inconsistent set of TLS flags, or an empty `--spanner-read-location`. `--flag value` now works as well as `--flag=value`, and `--help` lists every flag.
