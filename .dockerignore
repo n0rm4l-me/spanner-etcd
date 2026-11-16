@@ -1,0 +1,34 @@
+# Keep the build context small and free of local-only files. `COPY . .` in the
+# Dockerfile would otherwise copy all of this into the build stage.
+
+# Version control, CI and editor state
+.git
+.github
+.claude
+.idea
+.vscode
+
+# Secrets and TLS material (never needed in an image build)
+certs/
+*.key
+*.crt
+*.csr
+*.pem
+*.p12
+*.srl
+
+# Local build output and notes
+/spanner-etcd
+/spanner-etcd-migrate
+/spanner-etcd-linux-amd64
+/spanner-etcd-migrate-linux-amd64
+/bench-linux-amd64
+/migrate
+Makefile.local
+*.local.md
+blogpost-draft.md
+
+# Not needed to compile, and changing them should not invalidate the build cache
+docs/
+helm/
+*.md
