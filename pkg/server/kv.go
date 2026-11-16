@@ -84,32 +84,15 @@ func (k *KVServer) Range(ctx context.Context, r *etcdserverpb.RangeRequest) (*et
 // Put handles create/update requests. Kubernetes always uses Txn, but etcdctl
 // can use Put directly.
 func (k *KVServer) Put(ctx context.Context, r *etcdserverpb.PutRequest) (*etcdserverpb.PutResponse, error) {
-	key := string(r.Key)
-	rev, err := k.store.Create(ctx, key, r.Value, r.Lease)
-	if err == store.ErrKeyExists {
-		curRev, kv, gerr := k.store.Get(ctx, key, 0)
-		if gerr != nil {
-			return nil, toGRPCErr(gerr)
-		}
-		var prevModRev int64
-		if kv != nil {
-			prevModRev = kv.Rev
-		}
-		rev, kv, _, err = k.store.Update(ctx, key, r.Value, prevModRev, r.Lease)
-		if err != nil {
-			return nil, toGRPCErr(err)
-		}
-		resp := &etcdserverpb.PutResponse{Header: header(rev)}
-		if r.PrevKv && kv != nil {
-			resp.PrevKv = toProtoKV(kv)
-		}
-		_ = curRev
-		return resp, nil
-	}
+	rev, prev, err := k.store.Put(ctx, string(r.Key), r.Value, r.Lease)
 	if err != nil {
 		return nil, toGRPCErr(err)
 	}
-	return &etcdserverpb.PutResponse{Header: header(rev)}, nil
+	resp := &etcdserverpb.PutResponse{Header: header(rev)}
+	if r.PrevKv && prev != nil {
+		resp.PrevKv = toProtoKV(prev)
+	}
+	return resp, nil
 }
 
 // DeleteRange handles bare delete-range requests (e.g. from etcdctl del).

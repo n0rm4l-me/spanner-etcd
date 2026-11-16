@@ -438,6 +438,70 @@ func (s *Store) Update(ctx context.Context, key string, value []byte, revision, 
 	return rev, prev, true, nil
 }
 
+// Put writes key unconditionally (create or overwrite) in a single Spanner
+// read-write transaction. It returns the new revision and the previous KV
+// (nil if the key did not exist or its latest row was a tombstone).
+//
+// This replaces the former Create-then-Update sequence used by the bare Put
+// RPC. That sequence read the current revision outside the write transaction
+// and then did a CAS Update; when another writer slipped in between, the CAS
+// failed and the Put was acknowledged without writing anything. Reading the
+// latest row and inserting the new one in the same transaction makes
+// concurrent Puts to one key serialize in Spanner, so every acknowledged Put
+// produces exactly one row.
+func (s *Store) Put(ctx context.Context, key string, value []byte, leaseID int64) (int64, *KV, error) {
+	var prev *KV
+
+	resp, err := s.client.ReadWriteTransactionWithOptions(ctx,
+		func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			// Spanner may retry this callback on ABORTED: derive everything from
+			// the read below and never carry state over from a previous attempt.
+			var err error
+			prev, err = s.getLatestTxn(ctx, txn, key)
+			if err != nil {
+				return err
+			}
+
+			var createRev interface{} = spanner.CommitTimestamp
+			var prevRev interface{} = (*time.Time)(nil)
+			var oldValue []byte
+			if prev != nil {
+				createRev = revToTS(prev.CreateRevision)
+				prevRev = revToTS(prev.Rev)
+				oldValue = prev.Value
+			}
+			return txn.BufferWrite([]*spanner.Mutation{
+				spanner.Insert("kv",
+					[]string{"rev", "key", "value", "old_value", "lease_id",
+						"deleted", "created", "create_revision", "prev_revision"},
+					[]interface{}{
+						spanner.CommitTimestamp,
+						key, value, oldValue, leaseID,
+						false,
+						prev == nil, // created=true only on the first write of a key
+						createRev,
+						prevRev,
+					},
+				),
+			})
+		}, spanner.TransactionOptions{})
+
+	status := "ok"
+	if err != nil {
+		status = "error"
+	}
+	metrics.KVOperationsTotal.WithLabelValues("put", status).Inc()
+	metrics.SpannerTransactions.WithLabelValues(status).Inc()
+
+	if err != nil {
+		return 0, nil, err
+	}
+	rev := tsToRev(resp.CommitTs)
+	metrics.CurrentRevision.Set(float64(rev))
+	s.watcher.notify(rev)
+	return rev, prev, nil
+}
+
 // DeleteIfLease removes key only if its current row's lease_id matches leaseID.
 // Returns (true, nil) if the tombstone was written, (false, nil) if the key
 // was missing or belonged to a different lease, and (false, err) on failure.

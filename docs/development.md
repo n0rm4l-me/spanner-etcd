@@ -46,12 +46,16 @@ go run -race ./cmd/server/ \
 
 ### Test coverage
 
-78 integration tests against the Spanner emulator.
+84 integration tests against the Spanner emulator.
 
 | Package | Tests | What's covered |
 |---------|-------|----------------|
-| `pkg/store` | 37 | Create/Get/Update/Delete/List/Count/After/Compact/Watch/Lease/Lease+Watch/AutoCompact/ErrCompacted |
-| `pkg/server` | 38 + 3 auth | Full gRPC stack, Txn atomic/non-atomic/concurrent, Watch cancel/fanout/replay-pagination, graceful shutdown, auth token expiry, LeaseTimeToLive, IgnoreValue/IgnoreLease, range delete boundary |
+| `pkg/store` | 42 | Create/Put/Get/Update/Delete/List/Count/After/Compact/Watch/Lease/Lease+Watch/AutoCompact/ErrCompacted |
+| `pkg/server` | 39 + 3 auth | Full gRPC stack, Put (concurrent, PrevKv), Txn atomic/non-atomic/concurrent, Watch cancel/fanout/replay-pagination, graceful shutdown, auth token expiry, LeaseTimeToLive, IgnoreValue/IgnoreLease, range delete boundary |
+
+The emulator tests skip silently when the emulator is not reachable, so a green
+run with no emulator proves nothing. Check for skips with
+`go test ./pkg/... -v | grep -c SKIP` (expect 0).
 
 ## CI
 
