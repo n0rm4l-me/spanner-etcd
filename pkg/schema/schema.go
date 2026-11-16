@@ -38,6 +38,10 @@ import (
 
 const (
 	CompactRevRow = int64(1) // kv_rev row that stores the last compact revision
+	// CompactLockRow is the kv_rev row used as a lease on the background
+	// compactor: its rev is the time (Spanner clock) until which one replica holds
+	// the right to compact. It is created on first use.
+	CompactLockRow = int64(2)
 )
 
 // RevCounterRow kept for backward compatibility during migration.
