@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
@@ -53,17 +54,32 @@ type Server struct {
 	auth     *AuthServer
 	config   Config
 	log      *zap.Logger
-	listener net.Listener // set during Serve, used by Addr()
+
+	// listener is set by Serve and read by Addr, possibly from another goroutine
+	// (tests start Serve in the background and ask for the address). mu orders the
+	// two; without it the race detector rightly flags every such read.
+	mu        sync.RWMutex
+	listener  net.Listener
+	ready     chan struct{} // closed once Serve has bound its listener
+	readyOnce sync.Once
 }
 
-// Addr returns the address the server is listening on.
-// Only valid after Serve has been called.
+// Addr returns the address the server is listening on. Before Serve has bound
+// its listener it returns the configured address, which for ":0" is not the real
+// one; wait for Ready first when that matters.
 func (s *Server) Addr() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.listener != nil {
 		return s.listener.Addr().String()
 	}
 	return s.config.ListenAddr
 }
+
+// Ready returns a channel that is closed once Serve has bound its listener, after
+// which Addr reports the real address. It is never closed if Serve fails to
+// listen, so wait on it together with a timeout or Serve's error.
+func (s *Server) Ready() <-chan struct{} { return s.ready }
 
 // New creates a Server. Call Serve to start accepting connections.
 func New(ctx context.Context, s *store.Store, cfg Config, log *zap.Logger) (*Server, error) {
@@ -123,7 +139,7 @@ func New(ctx context.Context, s *store.Store, cfg Config, log *zap.Logger) (*Ser
 	// Reflection for grpcurl / debugging.
 	reflection.Register(grpcServer)
 
-	return &Server{grpc: grpcServer, store: s, auth: auth, config: cfg, log: log}, nil
+	return &Server{grpc: grpcServer, store: s, auth: auth, config: cfg, log: log, ready: make(chan struct{})}, nil
 }
 
 // buildServerCreds builds gRPC server TLS credentials.
@@ -159,7 +175,10 @@ func (s *Server) Serve(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", s.config.ListenAddr, err)
 	}
+	s.mu.Lock()
 	s.listener = lis
+	s.mu.Unlock()
+	s.readyOnce.Do(func() { close(s.ready) })
 	s.log.Info("spanner-etcd listening", zap.String("addr", lis.Addr().String()))
 
 	// Start metrics server if configured.
