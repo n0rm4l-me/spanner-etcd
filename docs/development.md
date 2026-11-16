@@ -62,11 +62,12 @@ run with no emulator proves nothing. Check for skips with
 ### Running against a real Spanner instance
 
 The emulator differs from production Spanner in SQL dialect details and has no
-Change Streams. The `pkg/store` tests can run against a real instance:
+Change Streams. The `pkg/store` and `pkg/server` tests can run against a real
+instance:
 
 ```bash
 SPANNER_ETCD_TEST_INSTANCE=projects/PROJECT/instances/INSTANCE \
-  go test ./pkg/store/ -run 'TestLease' -timeout 20m -v
+  go test ./pkg/store/ ./pkg/server/ -run 'TestLease|TestRange_' -timeout 20m -v
 ```
 
 This uses application default credentials (`gcloud auth application-default login`)
