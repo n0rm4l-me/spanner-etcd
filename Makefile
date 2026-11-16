@@ -1,7 +1,20 @@
-IMAGE_REPO ?= asia-docker.pkg.dev/onepoint-paas-tardis-4492/docker-paas-tardis-asia-1/spanner-etcd
-VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+# Container registry for `make docker` / `make push`. The real value is not kept
+# in the repository: put it in an untracked Makefile.local, for example
+#   IMAGE_REPO ?= europe-docker.pkg.dev/MY_PROJECT/MY_REPO/spanner-etcd
+# or pass it on the command line: make push IMAGE_REPO=...
+-include Makefile.local
 
-.PHONY: build build-linux vendor docker push test lint clean
+IMAGE_REPO    ?= YOUR_REGISTRY/spanner-etcd
+REGISTRY_HOST ?= $(firstword $(subst /, ,$(IMAGE_REPO)))
+VERSION       ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+
+.PHONY: build build-linux vendor docker push test lint clean check-registry
+
+## Fail early if the registry is still the placeholder
+check-registry:
+	@case "$(IMAGE_REPO)" in \
+	  YOUR_REGISTRY*) echo "IMAGE_REPO is not set: create Makefile.local or pass IMAGE_REPO=..."; exit 1;; \
+	esac
 
 ## Build local binary (host OS/arch)
 build:
@@ -22,16 +35,16 @@ vendor:
 
 ## Build Docker image for linux/amd64
 ## Requires: make vendor first (or GOPROXY set)
-docker: vendor
+docker: check-registry vendor
 	podman build --platform linux/amd64 \
 	  -f Dockerfile \
 	  -t $(IMAGE_REPO):$(VERSION) \
 	  .
 
 ## Push image to registry (re-login if needed)
-push:
+push: check-registry
 	@gcloud auth print-access-token | \
-	  podman login asia-docker.pkg.dev \
+	  podman login $(REGISTRY_HOST) \
 	    --username=oauth2accesstoken --password-stdin
 	podman push $(IMAGE_REPO):$(VERSION)
 

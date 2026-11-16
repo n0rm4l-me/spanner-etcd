@@ -19,6 +19,8 @@ make docker VERSION=0.4.0
 make release VERSION=0.4.0
 ```
 
+> **Registry**: `make docker`, `make push` and `make release` need `IMAGE_REPO`, which defaults to the placeholder `YOUR_REGISTRY/spanner-etcd` and makes them stop with a message. Put your registry in an untracked `Makefile.local` (`IMAGE_REPO ?= your-registry/path/spanner-etcd`) or pass `IMAGE_REPO=...` on the command line. `make push` logs in to the host part of `IMAGE_REPO` with a `gcloud` access token, so it expects a Google Artifact Registry host.
+
 > **Note on vendor**: `vendor/` is not committed. `make docker` runs `make vendor` automatically.
 > In corporate networks with custom CA certificates, `go mod download` inside Docker
 > fails — vendoring locally avoids this.

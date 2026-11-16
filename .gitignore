@@ -39,3 +39,6 @@ coverage.html
 blogpost-draft.md
 TESTING.local.md
 TEST_PLAN.local.md
+
+# Local build overrides (registry etc.)
+Makefile.local
