@@ -53,6 +53,8 @@ go run -race ./cmd/server/ \
 | `pkg/store` | 65 | Create/Put/Get/Update/Delete/List/Count/After/Compact/Watch/Lease/Lease+Watch/AutoCompact/ErrCompacted, Watch exactly-once and in-order delivery, exact ranges (`PrefixEnd`, non-ASCII, historical, single-key watch, continuation keys ending in NUL), Change Stream events as hints only, remote-write latency, multi-replica leases (keepalive on another replica, restart, owner death), legacy `kv_lease` rows, schema upgrade, writes to dead leases (Put/Create/Update/Txn, race with Revoke) |
 | `pkg/server` | 50 + 3 auth | Full gRPC stack, exact ranges (sibling prefixes, wildcards, limit/More paging, sorting, DeleteRange, Watch), Put (concurrent, PrevKv, lease-not-found and re-grant), Txn atomic/non-atomic/concurrent, Watch cancel/fanout/replay-pagination, graceful shutdown, auth token expiry, LeaseTimeToLive, IgnoreValue/IgnoreLease, range delete boundary |
 
+Unit tests that need no Spanner: `cmd/server` (flag and environment parsing and validation) and the pure `PrefixEnd`/`InRange` tests in `pkg/store`.
+
 The emulator tests skip silently when the emulator is not reachable, so a green
 run with no emulator proves nothing. Check for skips with
 `go test ./pkg/... -v | grep -c SKIP` (expect 0).

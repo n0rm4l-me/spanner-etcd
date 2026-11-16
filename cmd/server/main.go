@@ -14,12 +14,12 @@ package main
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
-	"time"
 
 	"cloud.google.com/go/spanner"
 	sppb "cloud.google.com/go/spanner/apiv1/spannerpb"
@@ -33,7 +33,14 @@ import (
 )
 
 func main() {
-	cfg := parseFlags()
+	cfg, err := parseConfig(os.Args[1:], os.Getenv, os.Stderr)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			os.Exit(0)
+		}
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(2)
+	}
 
 	log, err := buildLogger(cfg.logLevel)
 	if err != nil {
@@ -132,124 +139,6 @@ func run(ctx context.Context, cfg appConfig, log *zap.Logger) error {
 	}
 
 	return srv.Serve(ctx)
-}
-
-// ─── Config ───────────────────────────────────────────────────────────────────
-
-type appConfig struct {
-	listenAddr           string
-	metricsAddr          string
-	spannerDatabase      string
-	spannerChannels      int
-	spannerMinSessions   uint64
-	spannerMaxSessions   uint64
-	spannerNativeMetrics bool
-	spannerReadLocation  string // e.g. "us-east1" for directed reads
-	tlsCert              string
-	tlsKey               string
-	tlsCA                string
-	authUsers            string        // "user1:pass1,user2:pass2" — from env ETCD_AUTH_USERS
-	authTokenTTL         time.Duration // 0 = DefaultTokenTTL (5m)
-	peerURLs             []string
-	logLevel             string
-	autoCompactInterval  time.Duration // 0 = unset (use default 5m); any negative = disabled
-	autoCompactAge       time.Duration // 0 = DefaultAutoCompactAge (5m)
-}
-
-func parseFlags() appConfig {
-	cfg := appConfig{
-		listenAddr:         envOr("LISTEN_ADDR", "0.0.0.0:2379"),
-		metricsAddr:        envOr("METRICS_ADDR", "0.0.0.0:2381"),
-		authUsers:          envOr("ETCD_AUTH_USERS", ""),
-		spannerDatabase:    envOr("SPANNER_DATABASE", ""),
-		spannerChannels:    4,
-		spannerMinSessions: 10,
-		spannerMaxSessions: 100,
-		tlsCert:            envOr("TLS_CERT", ""),
-		tlsKey:             envOr("TLS_KEY", ""),
-		tlsCA:              envOr("TLS_CA", ""),
-		peerURLs:           splitCSV(envOr("PEER_URLS", "")),
-		logLevel:           envOr("LOG_LEVEL", "info"),
-	}
-
-	// Basic flag parsing (no external flag lib dependency).
-	for i, arg := range os.Args[1:] {
-		switch {
-		case strings.HasPrefix(arg, "--listen-address="):
-			cfg.listenAddr = strings.TrimPrefix(arg, "--listen-address=")
-		case strings.HasPrefix(arg, "--metrics-addr="):
-			cfg.metricsAddr = strings.TrimPrefix(arg, "--metrics-addr=")
-		case arg == "--spanner-native-metrics":
-			cfg.spannerNativeMetrics = true
-		case strings.HasPrefix(arg, "--spanner-read-location="):
-			val := strings.TrimSpace(strings.TrimPrefix(arg, "--spanner-read-location="))
-			if val == "" {
-				fmt.Fprintln(os.Stderr, "error: --spanner-read-location requires a non-empty GCP region (e.g. us-east1)")
-				os.Exit(1)
-			}
-			cfg.spannerReadLocation = val
-		case strings.HasPrefix(arg, "--spanner-database="):
-			cfg.spannerDatabase = strings.TrimPrefix(arg, "--spanner-database=")
-		case strings.HasPrefix(arg, "--tls-cert="):
-			cfg.tlsCert = strings.TrimPrefix(arg, "--tls-cert=")
-		case strings.HasPrefix(arg, "--tls-key="):
-			cfg.tlsKey = strings.TrimPrefix(arg, "--tls-key=")
-		case strings.HasPrefix(arg, "--tls-ca="):
-			cfg.tlsCA = strings.TrimPrefix(arg, "--tls-ca=")
-		case strings.HasPrefix(arg, "--auth-users="):
-			cfg.authUsers = strings.TrimPrefix(arg, "--auth-users=")
-		case strings.HasPrefix(arg, "--auth-token-ttl="):
-			d, err := time.ParseDuration(strings.TrimPrefix(arg, "--auth-token-ttl="))
-			if err == nil {
-				cfg.authTokenTTL = d
-			}
-		case strings.HasPrefix(arg, "--log-level="):
-			cfg.logLevel = strings.TrimPrefix(arg, "--log-level=")
-		case strings.HasPrefix(arg, "--peer-urls="):
-			cfg.peerURLs = splitCSV(strings.TrimPrefix(arg, "--peer-urls="))
-		case strings.HasPrefix(arg, "--auto-compact-interval="):
-			val := strings.TrimPrefix(arg, "--auto-compact-interval=")
-			if val == "0" || val == "off" || val == "disable" {
-				cfg.autoCompactInterval = -1 // sentinel: disabled
-			} else if d, err := time.ParseDuration(val); err != nil {
-				fmt.Fprintf(os.Stderr, "error: invalid --auto-compact-interval=%q: %v\n", val, err)
-				os.Exit(1)
-			} else if d == 0 {
-				cfg.autoCompactInterval = -1 // "0s" also disables
-			} else {
-				cfg.autoCompactInterval = d
-			}
-		case strings.HasPrefix(arg, "--auto-compact-age="):
-			val := strings.TrimPrefix(arg, "--auto-compact-age=")
-			d, err := time.ParseDuration(val)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "error: invalid --auto-compact-age=%q: %v\n", val, err)
-				os.Exit(1)
-			}
-			cfg.autoCompactAge = d
-		}
-		_ = i
-	}
-
-	if cfg.spannerDatabase == "" {
-		fmt.Fprintln(os.Stderr, "error: --spanner-database is required (e.g. projects/P/instances/I/databases/D)")
-		os.Exit(1)
-	}
-	return cfg
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-func splitCSV(s string) []string {
-	if s == "" {
-		return nil
-	}
-	return strings.Split(s, ",")
 }
 
 // buildLogger creates a production JSON logger compatible with Google Cloud Logging.

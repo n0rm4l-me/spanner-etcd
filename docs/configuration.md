@@ -18,6 +18,15 @@
 | `--spanner-native-metrics` | — | `false` | Enable Spanner client-side metrics (requires `roles/monitoring.metricWriter`) |
 | `--spanner-read-location` | — | — | GCP region for directed reads (e.g. `us-east1`). Use with multi-region Spanner to serve reads from the local replica instead of the leader. Writes always go to the leader regardless. |
 
+Flags may be written `--flag=value` or `--flag value`; a flag takes precedence over its environment variable. `spanner-etcd --help` lists them all.
+
+Configuration is checked strictly at startup, and an error stops the server with exit code 2:
+
+- an unknown flag (a typo such as `--tls-sert=...` no longer starts the server without TLS) or a stray argument;
+- a value that cannot be parsed (a bad `--auth-token-ttl` no longer silently keeps the default) or a negative duration;
+- `--tls-cert` without `--tls-key` or the other way round, and `--tls-ca` without a server certificate (mutual TLS needs TLS);
+- an empty `--spanner-read-location`.
+
 ## Workload Identity Federation (WIF)
 
 spanner-etcd authenticates to Spanner via WIF — no service account key files needed.
