@@ -226,18 +226,15 @@ func (lm *LeaseManager) reapExpired(ctx context.Context) {
 			return
 		}
 		removed, err := lm.expireLeaseKeys(ctx, id)
-		if err != nil {
-			if ctx.Err() == nil {
-				lm.log.Warn("lease expiry error, will retry",
-					zap.Int64("lease_id", id), zap.Error(err))
-			}
-			continue
-		}
 		// Only the replica that actually removed the lease row counts it, so
 		// concurrent reapers do not double-count.
 		if removed {
 			lm.log.Info("lease expired", zap.Int64("lease_id", id))
 			metrics.LeaseExpirations.Inc()
+		}
+		if err != nil && ctx.Err() == nil {
+			lm.log.Warn("lease expiry error",
+				zap.Int64("lease_id", id), zap.Bool("lease_row_removed", removed), zap.Error(err))
 		}
 	}
 }
@@ -283,13 +280,76 @@ func (lm *LeaseManager) refreshActiveGauge(ctx context.Context) {
 	metrics.ActiveLeases.Set(float64(n))
 }
 
+// requireLiveLease returns ErrLeaseNotFound unless leaseID is 0 (no lease) or
+// names a lease that exists and has not expired.
+//
+// It must run inside the same read-write transaction as the write that attaches
+// a key to the lease. Reading the lease row takes a lock that conflicts with the
+// reaper deleting that row, so a Put cannot slip a key under a lease that is
+// being torn down without either failing here or being seen by the reaper's
+// second pass (see expireLeaseKeys).
+func requireLiveLease(ctx context.Context, txn *spanner.ReadWriteTransaction, leaseID int64) error {
+	if leaseID == 0 {
+		return nil
+	}
+	iter := txn.Query(ctx, spanner.Statement{
+		SQL: `SELECT 1 FROM kv_lease
+		      WHERE lease_id = @id AND ` + leaseExpiryExpr + ` > CURRENT_TIMESTAMP()`,
+		Params: map[string]interface{}{"id": leaseID},
+	})
+	defer iter.Stop()
+	_, err := iter.Next()
+	if errors.Is(err, iterator.Done) {
+		return ErrLeaseNotFound
+	}
+	return err
+}
+
 // expireLeaseKeys deletes all keys whose latest revision still belongs to leaseID
 // and then removes the lease row. It reports whether this call removed the row.
 //
+// The key scan runs twice: before and after the lease row is removed. A Put that
+// validated the lease just before the row was deleted commits after the first
+// scan; once the row is gone no new Put can validate, so the second scan sees
+// everything that slipped in and deletes it. If it fails the row is already
+// gone, so the error is returned to the caller: Revoke can simply be retried
+// (the scans do not depend on the row), the reaper cannot.
+func (lm *LeaseManager) expireLeaseKeys(ctx context.Context, leaseID int64) (removed bool, err error) {
+	if err := lm.deleteLeaseKeys(ctx, leaseID); err != nil {
+		return false, err
+	}
+
+	// Remove the lease row. The affected-row count tells us whether a
+	// concurrent reaper or Revoke got there first.
+	_, err = lm.store.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		n, err := txn.Update(ctx, spanner.Statement{
+			SQL:    `DELETE FROM kv_lease WHERE lease_id = @id`,
+			Params: map[string]interface{}{"id": leaseID},
+		})
+		removed = n > 0
+		return err
+	})
+	if err != nil {
+		lm.log.Warn("expireLeaseKeys: failed to delete lease record",
+			zap.Int64("lease_id", leaseID), zap.Error(err))
+		return false, err
+	}
+
+	if err := lm.deleteLeaseKeys(ctx, leaseID); err != nil {
+		lm.log.Error("expireLeaseKeys: lease row removed but cleanup pass failed; retry Revoke to finish",
+			zap.Int64("lease_id", leaseID), zap.Error(err))
+		return removed, err
+	}
+	return removed, nil
+}
+
+// deleteLeaseKeys deletes all keys whose latest revision still belongs to leaseID.
+//
 // Each deletion is performed by DeleteIfLease, a Spanner RW transaction that
 // re-reads the key and only writes a tombstone when lease_id still matches, so
-// the check and the delete are atomic.
-func (lm *LeaseManager) expireLeaseKeys(ctx context.Context, leaseID int64) (removed bool, err error) {
+// the check and the delete are atomic. It returns an error if the scan or any
+// delete failed, so the caller keeps the lease row and retries.
+func (lm *LeaseManager) deleteLeaseKeys(ctx context.Context, leaseID int64) error {
 	// Find all keys where the MAX(rev) row has lease_id=@lid and is not deleted.
 	// Note: the subquery filters MAX(rev) only among rows with lease_id=@lid,
 	// so a key reassigned to a different lease may still appear here.
@@ -335,32 +395,14 @@ func (lm *LeaseManager) expireLeaseKeys(ctx context.Context, leaseID int64) (rem
 	}
 
 	if scanErr != nil {
-		lm.log.Warn("expireLeaseKeys: scan failed, lease record preserved for retry",
+		lm.log.Warn("deleteLeaseKeys: scan failed",
 			zap.Int64("lease_id", leaseID), zap.Error(scanErr))
-		return false, scanErr
+		return scanErr
 	}
 	if deleteErrs > 0 {
-		// Some key deletes failed: keep the lease row so retries can delete the
-		// remaining keys instead of orphaning them.
-		lm.log.Warn("expireLeaseKeys: some key deletes failed, lease record preserved",
+		lm.log.Warn("deleteLeaseKeys: some key deletes failed",
 			zap.Int64("lease_id", leaseID), zap.Int("failed", deleteErrs))
-		return false, fmt.Errorf("expireLeaseKeys: %d key delete(s) failed for lease %d", deleteErrs, leaseID)
+		return fmt.Errorf("expireLeaseKeys: %d key delete(s) failed for lease %d", deleteErrs, leaseID)
 	}
-
-	// All keys processed: remove the lease row. The affected-row count tells us
-	// whether a concurrent reaper or Revoke got there first.
-	_, err = lm.store.client.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
-		n, err := txn.Update(ctx, spanner.Statement{
-			SQL:    `DELETE FROM kv_lease WHERE lease_id = @id`,
-			Params: map[string]interface{}{"id": leaseID},
-		})
-		removed = n > 0
-		return err
-	})
-	if err != nil {
-		lm.log.Warn("expireLeaseKeys: failed to delete lease record",
-			zap.Int64("lease_id", leaseID), zap.Error(err))
-		return false, err
-	}
-	return removed, nil
+	return nil
 }
