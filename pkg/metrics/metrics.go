@@ -20,12 +20,12 @@ var (
 
 	// ── KV operations ─────────────────────────────────────────────────────────
 
-	// KVOperationsTotal counts Create/Update/Delete/Get/List/Txn/Compact.
+	// KVOperationsTotal counts Create/Put/Update/Delete/Get/List/Txn/Compact.
 	KVOperationsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "spanner_etcd",
 		Name:      "kv_operations_total",
 		Help:      "Total number of KV operations.",
-	}, []string{"operation", "status"}) // operation: create|update|delete|get|list|txn|compact
+	}, []string{"operation", "status"}) // operation: create|put|update|delete|get|list|txn|compact
 
 	// CurrentRevision is the latest global revision seen by this replica.
 	CurrentRevision = promauto.NewGauge(prometheus.GaugeOpts{

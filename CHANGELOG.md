@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Bare `Put` could be acknowledged without writing anything.** The Put RPC used a create-then-CAS-update sequence. When another writer changed the same key between the read and the update, the CAS failed silently and the client still got a success response carrying someone else's revision. In a regression test with 8 concurrent writers on one key, only 12 of 40 acknowledged Puts were actually written. Put now reads the latest row and inserts the new one in a single Spanner read-write transaction, so concurrent Puts serialize and every acknowledged Put produces exactly one revision. Kubernetes is not affected (it writes through `Txn`); clients that use plain `Put` (etcdctl, jetcd) are.
+
 ## v0.2.0 — 2026-06-09
 
 ### New

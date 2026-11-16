@@ -2,6 +2,8 @@ package server_test
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,11 +13,20 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/n0rm4l-me/spanner-etcd/pkg/server"
+	"github.com/n0rm4l-me/spanner-etcd/pkg/store"
 )
 
 // testServer starts a real spanner-etcd gRPC server against the Spanner
 // emulator and returns an etcd client connected to it.
 func testServer(t *testing.T) *clientv3.Client {
+	t.Helper()
+	cli, _ := testServerWithStore(t)
+	return cli
+}
+
+// testServerWithStore is testServer plus direct access to the backing store,
+// for tests that need to inspect what was physically written.
+func testServerWithStore(t *testing.T) (*clientv3.Client, *store.Store) {
 	t.Helper()
 
 	s := newTestStore(t)
@@ -58,7 +69,90 @@ func testServer(t *testing.T) *clientv3.Client {
 		t.Fatalf("etcd client: %v", err)
 	}
 	t.Cleanup(func() { cli.Close() })
-	return cli
+	return cli, s
+}
+
+// TestKV_Put_ConcurrentSameKey_NoLostWrites guards against a bare Put that
+// reports success without writing a row. Every acknowledged Put must produce
+// exactly one row (one revision) for the key, as in etcd.
+func TestKV_Put_ConcurrentSameKey_NoLostWrites(t *testing.T) {
+	cli, s := testServerWithStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	const (
+		workers   = 8
+		perWorker = 5
+		key       = "/put/race"
+	)
+
+	var (
+		mu   sync.Mutex
+		revs = map[int64]int{} // response header revision -> times seen
+		wg   sync.WaitGroup
+	)
+	errCh := make(chan error, workers*perWorker)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				resp, err := cli.Put(ctx, key, fmt.Sprintf("w%d-%d", w, i))
+				if err != nil {
+					errCh <- err
+					continue
+				}
+				mu.Lock()
+				revs[resp.Header.Revision]++
+				mu.Unlock()
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Errorf("put: %v", err)
+	}
+
+	want := workers * perWorker
+	_, events, err := s.After(ctx, key, 0, 0)
+	if err != nil {
+		t.Fatalf("after: %v", err)
+	}
+	if len(events) != want {
+		t.Errorf("lost writes: %d Puts acknowledged, %d rows written", want, len(events))
+	}
+	for rev, n := range revs {
+		if n > 1 {
+			t.Errorf("revision %d returned to %d different Puts (acknowledged without its own commit)", rev, n)
+		}
+	}
+}
+
+// TestKV_Put_PrevKv checks that a bare Put returns the previous value on
+// request, and nothing for the first write of a key.
+func TestKV_Put_PrevKv(t *testing.T) {
+	cli := testServer(t)
+	ctx := context.Background()
+
+	r1, err := cli.Put(ctx, "/put/prev", "v1", clientv3.WithPrevKV())
+	if err != nil {
+		t.Fatalf("put v1: %v", err)
+	}
+	if r1.PrevKv != nil {
+		t.Fatalf("first put: want no PrevKv, got %v", r1.PrevKv)
+	}
+
+	r2, err := cli.Put(ctx, "/put/prev", "v2", clientv3.WithPrevKV())
+	if err != nil {
+		t.Fatalf("put v2: %v", err)
+	}
+	if r2.PrevKv == nil || string(r2.PrevKv.Value) != "v1" {
+		t.Fatalf("second put: want PrevKv=v1, got %v", r2.PrevKv)
+	}
+	if r2.PrevKv.ModRevision != r1.Header.Revision {
+		t.Fatalf("PrevKv.ModRevision=%d, want %d", r2.PrevKv.ModRevision, r1.Header.Revision)
+	}
 }
 
 func TestKV_PutGet(t *testing.T) {
