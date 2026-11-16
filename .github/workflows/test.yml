@@ -6,9 +6,25 @@ on:
   pull_request:
     branches: [main]
 
+# Read-only by default; no job here needs more.
+permissions:
+  contents: read
+
+# A newer push to the same ref makes the older run pointless.
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Explicit bash adds -o pipefail. Without it a failing `go test ... | tee` step
+# reports the exit status of tee, so a red test would not fail the job.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     services:
       spanner-emulator:
@@ -18,9 +34,9 @@ jobs:
           - 9020:9020
 
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: actions/setup-go@v5.4.0
+      - uses: actions/setup-go@0aaccfd150d50ccaeb58ebd88d36e91967a5f35b # v5.4.0
         with:
           go-version-file: go.mod
           cache: true
@@ -28,21 +44,37 @@ jobs:
       - name: vet
         run: go vet ./...
 
+      # Fails on a vulnerability the code actually reaches (not on one that is
+      # merely present in a dependency). Update the dependency or the Go version.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+
+      # -race needs cgo, which the runner has. It slows the suite down several
+      # times, hence the generous per-package timeout.
       - name: test
-        run: go test ./... -timeout=180s -count=1 -v 2>&1 | tee /tmp/test-output.txt
+        run: go test ./... -race -timeout=10m -count=1 -v 2>&1 | tee /tmp/test-output.txt
         env:
           SPANNER_EMULATOR_HOST: localhost:9010
+
+      # The emulator tests skip silently when the emulator is unreachable, which
+      # would turn a broken service container into a green run.
+      - name: no skipped tests
+        run: |
+          skipped=$(grep -cE '^\s*--- SKIP' /tmp/test-output.txt || true)
+          echo "skipped tests: $skipped"
+          test "$skipped" -eq 0
 
       - name: summary
         if: always()
         run: |
           echo "## Test Results" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          grep -E "^(--- PASS|--- FAIL|FAIL|ok )" /tmp/test-output.txt >> $GITHUB_STEP_SUMMARY || true
+          grep -E "^(--- PASS|--- FAIL|--- SKIP|FAIL|ok )" /tmp/test-output.txt >> $GITHUB_STEP_SUMMARY || true
           echo '```' >> $GITHUB_STEP_SUMMARY
 
   bench:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: github.ref == 'refs/heads/main'
 
     services:
@@ -53,9 +85,9 @@ jobs:
           - 9020:9020
 
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: actions/setup-go@v5.4.0
+      - uses: actions/setup-go@0aaccfd150d50ccaeb58ebd88d36e91967a5f35b # v5.4.0
         with:
           go-version-file: go.mod
           cache: true
@@ -77,7 +109,7 @@ jobs:
 
       - name: upload
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bench-results
           path: /tmp/bench-output.txt

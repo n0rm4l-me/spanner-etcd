@@ -1,0 +1,16 @@
+# Keeps pinned GitHub Actions, Go modules and the build image current. Because the
+# workflows pin actions by commit SHA, this is what moves them forward.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
