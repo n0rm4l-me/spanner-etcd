@@ -18,7 +18,7 @@ graph LR
         subgraph STORE["SpannerStore"]
             direction LR
             WR["Write\nrev=PCT()"]
-            WC["Watch\nCS ~30ms"]
+            WC["Watch\nordered poll,\nCS wake-up"]
             LT["Lease\nTTL"]
         end
         API --> STORE
