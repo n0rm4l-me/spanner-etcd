@@ -83,7 +83,7 @@ GitHub Actions runs on every push to `main` and every PR:
 
 The release workflow runs the same `test` job first (`workflow_call`) and publishes the image and binaries only if it passes.
 
-Actions are pinned by commit SHA (the `# vX.Y.Z` comment names the version) and Dependabot proposes updates weekly. To run the race detector locally on macOS, `CGO_ENABLED=1` needs a working SDK; if linking fails with `unknown architecture` errors from the Command Line Tools SDK, point `SDKROOT` at an older one, for example `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk`.
+Actions are pinned by commit SHA (the `# vX.Y.Z` comment names the version) and Dependabot proposes updates weekly (`.github/dependabot.yml`). Minor and patch updates of one ecosystem arrive as a single pull request, major updates stay separate, the etcd api and client modules always move together, a new release waits a week before it is proposed, and the Go image stays on the Go version in `go.mod`. When reviewing: a green grouped minor/patch PR can be merged as is; look at each major update, especially the actions used only by the release workflow (login, build-push, gh-release), which no pull request exercises, so the first release after merging is their first run. To run the race detector locally on macOS, `CGO_ENABLED=1` needs a working SDK; if linking fails with `unknown architecture` errors from the Command Line Tools SDK, point `SDKROOT` at an older one, for example `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk`.
 
 ## Makefile targets
 

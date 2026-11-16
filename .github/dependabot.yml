@@ -1,16 +1,48 @@
-# Keeps pinned GitHub Actions, Go modules and the build image current. Because the
-# workflows pin actions by commit SHA, this is what moves them forward.
+# Keeps pinned GitHub Actions, Go modules and the build image current without a
+# flood of pull requests (the first run, with no grouping, opened eleven):
+#
+#  - Minor and patch updates of one ecosystem arrive as ONE pull request.
+#  - Major updates stay separate, so each gets a deliberate look.
+#  - The etcd api and client modules always move together; api 3.7 does not
+#    compile against client 3.6.
+#  - A new release waits a week before it is proposed. Security updates ignore
+#    this delay.
+#  - The Go image stays on the Go version declared in go.mod; move both by hand
+#    when the project is ready for a new Go release.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    groups:
+      actions-minor-and-patch:
+        update-types: [minor, patch]
+
   - package-ecosystem: gomod
     directory: /
     schedule:
       interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    groups:
+      etcd:
+        patterns: ["go.etcd.io/etcd/*"]
+      go-minor-and-patch:
+        update-types: [minor, patch]
+        exclude-patterns: ["go.etcd.io/etcd/*"]
+
   - package-ecosystem: docker
     directory: /
     schedule:
       interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    ignore:
+      - dependency-name: golang
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
