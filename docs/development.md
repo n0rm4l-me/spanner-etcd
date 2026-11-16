@@ -13,10 +13,10 @@
 make build
 
 # Build Docker image (linux/amd64) — runs 'make vendor' automatically
-make docker VERSION=0.4.0
+make docker VERSION=v0.3.0
 
 # Build + push to registry
-make release VERSION=0.4.0
+make release VERSION=v0.3.0
 ```
 
 > **Registry**: `make docker`, `make push` and `make release` need `IMAGE_REPO`, which defaults to the placeholder `YOUR_REGISTRY/spanner-etcd` and makes them stop with a message. Put your registry in an untracked `Makefile.local` (`IMAGE_REPO ?= your-registry/path/spanner-etcd`) or pass `IMAGE_REPO=...` on the command line. `make push` logs in to the host part of `IMAGE_REPO` with a `gcloud` access token, so it expects a Google Artifact Registry host.
@@ -46,12 +46,12 @@ go run -race ./cmd/server/ \
 
 ### Test coverage
 
-118 integration tests against the Spanner emulator.
+125 integration tests against the Spanner emulator (the count is of `Test` functions in `pkg/`; refresh it with `grep -h '^func Test' pkg/*/*_test.go | wc -l` whenever tests are added or removed).
 
 | Package | Tests | What's covered |
 |---------|-------|----------------|
-| `pkg/store` | 65 | Create/Put/Get/Update/Delete/List/Count/After/Compact/Watch/Lease/Lease+Watch/AutoCompact/ErrCompacted, Watch exactly-once and in-order delivery, exact ranges (`PrefixEnd`, non-ASCII, historical, single-key watch, continuation keys ending in NUL), Change Stream events as hints only, remote-write latency, multi-replica leases (keepalive on another replica, restart, owner death), legacy `kv_lease` rows, schema upgrade, writes to dead leases (Put/Create/Update/Txn, race with Revoke) |
-| `pkg/server` | 50 + 3 auth | Full gRPC stack, exact ranges (sibling prefixes, wildcards, limit/More paging, sorting, DeleteRange, Watch), Put (concurrent, PrevKv, lease-not-found and re-grant), Txn atomic/non-atomic/concurrent, Watch cancel/fanout/replay-pagination, graceful shutdown, auth token expiry, LeaseTimeToLive, IgnoreValue/IgnoreLease, range delete boundary |
+| `pkg/store` | 71 | Create/Put/Get/Update/Delete/List/Count/After/Compact/Watch/Lease/Lease+Watch/AutoCompact/ErrCompacted, Watch exactly-once and in-order delivery, exact ranges (`PrefixEnd`, non-ASCII, historical, single-key watch, continuation keys ending in NUL), Change Stream events as hints only, remote-write latency, multi-replica leases (keepalive on another replica, restart, owner death), legacy `kv_lease` rows, schema upgrade, writes to dead leases (Put/Create/Update/Txn, race with Revoke), compaction (deleted keys removed completely, newest tombstone kept so the revision never moves back, compaction lease, stale cursor cleanup) |
+| `pkg/server` | 51 + 3 auth | Full gRPC stack, exact ranges (sibling prefixes, wildcards, limit/More paging, sorting, DeleteRange, Watch), Put (concurrent, PrevKv, lease-not-found and re-grant), `Server.Addr` against `Serve` (race detector), Txn atomic/non-atomic/concurrent, Watch cancel/fanout/replay-pagination, graceful shutdown, auth token expiry, LeaseTimeToLive, IgnoreValue/IgnoreLease, range delete boundary |
 
 Unit tests that need no Spanner: `cmd/server` (flag and environment parsing and validation) and the pure `PrefixEnd`/`InRange` tests in `pkg/store`.
 
