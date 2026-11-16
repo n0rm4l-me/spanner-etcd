@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Called by the release workflow, so a tag cannot publish untested code.
+  workflow_call:
 
 # Read-only by default; no job here needs more.
 permissions:

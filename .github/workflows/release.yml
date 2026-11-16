@@ -10,8 +10,16 @@ permissions:
   packages: write
 
 jobs:
+  # The same checks as for a pull request (vet, govulncheck, tests with -race,
+  # no skipped tests). Nothing below runs unless they pass, so a tag on a commit
+  # that was never tested, or a red one, publishes nothing.
+  test:
+    uses: ./.github/workflows/test.yml
+
   release:
+    needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
