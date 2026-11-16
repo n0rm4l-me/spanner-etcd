@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/spanner"
@@ -95,6 +96,7 @@ type Store struct {
 	cfg       StoreConfig
 	watcher   *Watcher
 	leasesMgr *LeaseManager
+	closeOnce sync.Once
 }
 
 // New creates a Store with default configuration. The caller is responsible for calling Close.
@@ -145,11 +147,13 @@ func NewWithConfig(ctx context.Context, client *spanner.Client, log *zap.Logger,
 	return s, nil
 }
 
-// Close shuts down background goroutines.
+// Close shuts down background goroutines. It is safe to call more than once.
 func (s *Store) Close() {
-	s.bgCancel()
-	s.watcher.close()
-	s.leasesMgr.close()
+	s.closeOnce.Do(func() {
+		s.bgCancel()
+		s.watcher.close()
+		s.leasesMgr.close()
+	})
 }
 
 // Leases returns the lease manager.

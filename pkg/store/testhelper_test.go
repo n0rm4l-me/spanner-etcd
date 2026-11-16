@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"os"
 	"strings"
@@ -26,7 +27,18 @@ const (
 	testInstance = "test-instance"
 )
 
+// realInstance returns the path of a real Spanner instance to run the tests
+// against (projects/P/instances/I), taken from SPANNER_ETCD_TEST_INSTANCE.
+// Empty means: use the emulator. Real mode uses application default
+// credentials and creates one database per test, so run only the tests you
+// need (-run) and expect each database to take a minute or two to set up.
+func realInstance() string { return os.Getenv("SPANNER_ETCD_TEST_INSTANCE") }
+
 func init() {
+	if realInstance() != "" {
+		os.Unsetenv("SPANNER_EMULATOR_HOST") // make sure we do not talk to an emulator
+		return
+	}
 	os.Setenv("SPANNER_EMULATOR_HOST", emulatorHost)
 }
 
@@ -34,20 +46,42 @@ func init() {
 // a ready-to-use Store. The database is dropped when t.Cleanup runs.
 func newTestStore(t *testing.T) *store.Store {
 	t.Helper()
+	return openStore(t, newTestDB(t), store.StoreConfig{})
+}
 
-	if !emulatorRunning() {
-		t.Skip("Spanner emulator not running — set SPANNER_EMULATOR_HOST or start it")
-	}
+// newTestStoreWithConfig creates a Store with explicit StoreConfig for tests that
+// need to tune auto-compaction or other store-level settings.
+func newTestStoreWithConfig(t *testing.T, ctx context.Context, cfg store.StoreConfig) *store.Store {
+	t.Helper()
+	_ = ctx
+	return openStore(t, newTestDB(t), cfg)
+}
+
+// newTestDB creates a fresh database with the full schema on the emulator and
+// returns its path. The database is dropped when t.Cleanup runs, after every
+// store opened on it via openStore has been closed (cleanups run in LIFO order).
+//
+// Use it together with openStore to simulate several replicas, or a replica
+// restart, against one database.
+func newTestDB(t *testing.T) string {
+	t.Helper()
 
 	ctx := context.Background()
-	dbName := fmt.Sprintf("test-%d", time.Now().UnixNano())
-	dbPath := fmt.Sprintf("projects/%s/instances/%s/databases/%s",
-		testProject, testInstance, dbName)
+	parent := fmt.Sprintf("projects/%s/instances/%s", testProject, testInstance)
+	if inst := realInstance(); inst != "" {
+		parent = inst
+	} else {
+		if !emulatorRunning() {
+			t.Skip("Spanner emulator not running: start it on localhost:9010 (see docs/development.md)")
+		}
+		ensureInstance(t, ctx)
+	}
+	// Unique across tests AND across concurrently running test processes: the
+	// clock has only microsecond resolution on macOS, so a timestamp alone can
+	// collide. Spanner database IDs are limited to 30 characters.
+	dbName := fmt.Sprintf("test-%d-%04x", time.Now().UnixMilli(), rand.Intn(1<<16))
+	dbPath := fmt.Sprintf("%s/databases/%s", parent, dbName)
 
-	// Ensure instance exists.
-	ensureInstance(t, ctx)
-
-	// Create database.
 	adminClient, err := database.NewDatabaseAdminClient(ctx)
 	if err != nil {
 		t.Fatalf("admin client: %v", err)
@@ -56,7 +90,7 @@ func newTestStore(t *testing.T) *store.Store {
 
 	// Create the database first, then apply DDL.
 	createOp, err := adminClient.CreateDatabase(ctx, &databasepb.CreateDatabaseRequest{
-		Parent:          fmt.Sprintf("projects/%s/instances/%s", testProject, testInstance),
+		Parent:          parent,
 		CreateStatement: fmt.Sprintf("CREATE DATABASE `%s`", dbName),
 	})
 	if err != nil {
@@ -66,12 +100,28 @@ func newTestStore(t *testing.T) *store.Store {
 		t.Fatalf("wait create database: %v", err)
 	}
 
-	log := zap.NewNop()
-	if err := schema.Ensure(ctx, adminClient, dbPath, log); err != nil {
+	if err := schema.Ensure(ctx, adminClient, dbPath, zap.NewNop()); err != nil {
 		t.Fatalf("ensure schema: %v", err)
 	}
 
-	// Spanner client.
+	t.Cleanup(func() {
+		dropCtx, dropCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer dropCancel()
+		if err := adminClient.DropDatabase(dropCtx, &databasepb.DropDatabaseRequest{Database: dbPath}); err != nil {
+			t.Logf("DropDatabase %s: %v", dbPath, err)
+		}
+	})
+	return dbPath
+}
+
+// openStore opens an independent Store (its own Spanner client, watcher and
+// lease manager) on an existing database, as a separate replica would. It is
+// closed on t.Cleanup; tests may also Close it earlier to simulate a replica
+// going away (Store.Close is idempotent).
+func openStore(t *testing.T, dbPath string, cfg store.StoreConfig) *store.Store {
+	t.Helper()
+	ctx := context.Background()
+
 	spannerClient, err := spanner.NewClient(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("spanner client: %v", err)
@@ -81,7 +131,7 @@ func newTestStore(t *testing.T) *store.Store {
 		t.Fatalf("seed rev counter: %v", err)
 	}
 
-	s, err := store.New(ctx, spannerClient, log)
+	s, err := store.NewWithConfig(ctx, spannerClient, zap.NewNop(), cfg)
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
@@ -89,76 +139,7 @@ func newTestStore(t *testing.T) *store.Store {
 	t.Cleanup(func() {
 		s.Close()
 		spannerClient.Close()
-		dropCtx, dropCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer dropCancel()
-		if err := adminClient.DropDatabase(dropCtx, &databasepb.DropDatabaseRequest{Database: dbPath}); err != nil {
-			t.Logf("DropDatabase %s: %v", dbPath, err)
-		}
 	})
-	return s
-}
-
-// newTestStoreWithConfig creates a Store with explicit StoreConfig for tests that
-// need to tune auto-compaction or other store-level settings.
-func newTestStoreWithConfig(t *testing.T, ctx context.Context, cfg store.StoreConfig) *store.Store {
-	t.Helper()
-
-	if !emulatorRunning() {
-		t.Skip("Spanner emulator not running — set SPANNER_EMULATOR_HOST or start it")
-	}
-
-	dbName := fmt.Sprintf("test-%d", time.Now().UnixNano())
-	dbPath := fmt.Sprintf("projects/%s/instances/%s/databases/%s",
-		testProject, testInstance, dbName)
-
-	ensureInstance(t, ctx)
-
-	adminClient, err := database.NewDatabaseAdminClient(ctx)
-	if err != nil {
-		t.Fatalf("admin client: %v", err)
-	}
-	t.Cleanup(func() { adminClient.Close() })
-
-	createOp, err := adminClient.CreateDatabase(ctx, &databasepb.CreateDatabaseRequest{
-		Parent:          fmt.Sprintf("projects/%s/instances/%s", testProject, testInstance),
-		CreateStatement: fmt.Sprintf("CREATE DATABASE `%s`", dbName),
-	})
-	if err != nil {
-		t.Fatalf("create database: %v", err)
-	}
-	if _, err := createOp.Wait(ctx); err != nil {
-		t.Fatalf("wait create database: %v", err)
-	}
-
-	log := zap.NewNop()
-	if err := schema.Ensure(ctx, adminClient, dbPath, log); err != nil {
-		t.Fatalf("ensure schema: %v", err)
-	}
-
-	spannerClient, err := spanner.NewClient(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("spanner client: %v", err)
-	}
-
-	if err := schema.SeedRevCounter(ctx, spannerClient); err != nil {
-		t.Fatalf("seed rev counter: %v", err)
-	}
-
-	s, err := store.NewWithConfig(ctx, spannerClient, log, cfg)
-	if err != nil {
-		t.Fatalf("new store with config: %v", err)
-	}
-
-	t.Cleanup(func() {
-		s.Close()
-		spannerClient.Close()
-		dropCtx, dropCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer dropCancel()
-		if err := adminClient.DropDatabase(dropCtx, &databasepb.DropDatabaseRequest{Database: dbPath}); err != nil {
-			t.Logf("DropDatabase %s: %v", dbPath, err)
-		}
-	})
-
 	return s
 }
 

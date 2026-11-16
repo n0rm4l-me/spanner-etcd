@@ -117,6 +117,11 @@ roles/spanner.databaseUser   # on the database
 roles/iam.workloadIdentityUser  # for WIF
 ```
 
+The DDL is idempotent. If the runtime service account has no DDL permission, re-apply
+it **before** rolling out a new version that changes the schema (for example the
+`kv_lease.expires_at` column added after v0.2.0), otherwise the new replicas fail on
+the missing column. See [CHANGELOG.md](../CHANGELOG.md) for per-release upgrade notes.
+
 ## Multi-Region Setup
 
 Spanner supports multi-region instances out of the box — no code changes needed.

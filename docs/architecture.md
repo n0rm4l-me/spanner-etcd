@@ -50,8 +50,8 @@ Multiple `spanner-etcd` replicas can run concurrently — all state lives in Spa
 | **KV** | Compact | ✅ | Async GC of old revisions |
 | **Watch** | Watch | ✅ | Live streaming, prefix filter, revision replay, PrevKv |
 | **Lease** | LeaseGrant/Revoke | ✅ | TTL leases with immediate key deletion on revoke |
-| **Lease** | LeaseKeepAlive | ✅ | Bidirectional streaming keepalive |
-| **Lease** | LeaseTimeToLive | ✅ | TTL query |
+| **Lease** | LeaseKeepAlive | ✅ | Bidirectional streaming keepalive; persisted, works on any replica |
+| **Lease** | LeaseTimeToLive | ✅ | TTL query, answered from Spanner on any replica |
 | **Auth** | Authenticate | ✅ | Username/password → token; clients auto-re-authenticate on expiry |
 | **Auth** | AuthEnable/Disable/Status | ✅ | Stubs — auth controlled via `--auth-users` flag |
 | **Cluster** | MemberList | ✅ | Returns self as single member |
@@ -132,6 +132,8 @@ sequenceDiagram
 **Append-only log**: Like etcd, rows in `kv` are never updated — each write appends a new row. Compaction physically deletes old rows asynchronously.
 
 **Change Streams for Watch**: Each replica streams all partitions of `kv_changes`. Spanner pushes records as writes commit (~10–50ms). Partition cursors are persisted every 5s so replicas resume from the correct position after restart. The poll loop (1s) runs as a fallback when Change Streams are unavailable (Spanner emulator).
+
+**Leases are cluster state**: a lease is one row in `kv_lease` with an `expires_at` deadline. Grant, every keepalive and every expiry check compute time with Spanner's `CURRENT_TIMESTAMP()`, never with a replica's clock, so skew between pods cannot expire a lease early or keep it alive too long. Any replica serves Keepalive and TimeToLive for any lease. Every replica runs a reaper (about once a second) that revokes leases whose `expires_at` has passed and deletes their keys; concurrent reapers are safe because each step is idempotent and a keepalive can only extend a lease that has not expired yet, so an expired lease cannot come back. Keepalives are written on every call (not batched), so a lease lives exactly one TTL after the last keepalive, as in etcd. Rows written by versions without `expires_at` are treated as `granted_at + ttl`.
 
 ## Horizontal Scaling
 

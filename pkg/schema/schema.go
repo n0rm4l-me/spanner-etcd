@@ -73,11 +73,19 @@ var statements = []string{
 		rev TIMESTAMP NOT NULL
 	) PRIMARY KEY (id)`,
 
+	// expires_at is the lease deadline in Spanner time, extended by every
+	// keepalive. It is nullable: rows written before it existed fall back to
+	// granted_at + ttl_sec.
 	`CREATE TABLE IF NOT EXISTS kv_lease (
 		lease_id   INT64 NOT NULL,
 		ttl_sec    INT64 NOT NULL,
-		granted_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp = true)
+		granted_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp = true),
+		expires_at TIMESTAMP
 	) PRIMARY KEY (lease_id)`,
+
+	// CREATE TABLE IF NOT EXISTS does not alter an existing table, so databases
+	// created by an older version get the column here. No-op on new databases.
+	`ALTER TABLE kv_lease ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP`,
 
 	// STORING includes value/old_value (BYTES(MAX)) so Spanner can serve Get/List
 	// reads from the index without a back-join when the optimizer chooses this index.
