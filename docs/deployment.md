@@ -117,7 +117,7 @@ roles/spanner.databaseUser   # on the database
 roles/iam.workloadIdentityUser  # for WIF
 ```
 
-The DDL is idempotent. If the runtime service account has no DDL permission, re-apply
+The DDL is idempotent, and replicas that start together on a new database do not fail on each other: a replica whose schema change is rejected because another one is in progress waits and tries again for up to five minutes. If the runtime service account has no DDL permission, re-apply
 it **before** rolling out a new version that changes the schema (for example the
 `kv_lease.expires_at` column added in v0.3.0), otherwise the new replicas fail on
 the missing column. See [CHANGELOG.md](../CHANGELOG.md) for per-release upgrade notes.
