@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased
+## v0.3.1 - 2026-11-17
+
+A small follow-up to v0.3.0: replicas that start together no longer crash each other on an empty database, and the release workflow's two third-party actions that still ran on the deprecated Node 20 are updated. No schema change, nothing to do when upgrading from v0.3.0.
+
+### Dependencies and tooling
+
+- `actions/setup-go` 5.4.0 to 7.0.0 and `docker/setup-buildx-action` 3.12.0 to 4.4.1, both pinned by commit SHA as before. The v0.3.0-rc.2 run warned that the old versions target Node 20, which GitHub is retiring, and forced them onto Node 24. The test job exercised setup-go 7 in a pull request; setup-buildx runs only on a tag, so its first run is the `v0.3.1-rc.1` release candidate.
+- Dependabot now puts the Google Cloud client libraries (`cloud.google.com/go/*`, `google.golang.org/api`, `google.golang.org/grpc`, `google.golang.org/genproto*`) in one group of their own. They carry the authentication and transport of the real Spanner connection, which the emulator-based CI cannot exercise, so a pull request for them is reviewed together with a run against a real instance and not merged with the other updates.
+
+### Other
+
+- The LICENSE and README now carry the copyright line (Copyright 2026 Petr Petrenko).
 
 ### Fixed
 

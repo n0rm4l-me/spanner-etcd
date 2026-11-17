@@ -88,4 +88,4 @@ etcdctl put /hello world && etcdctl get /hello
 
 ## License
 
-Apache 2.0
+Apache 2.0, Copyright 2026 Petr Petrenko. See [LICENSE](LICENSE).

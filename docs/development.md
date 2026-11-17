@@ -13,10 +13,10 @@
 make build
 
 # Build Docker image (linux/amd64) — runs 'make vendor' automatically
-make docker VERSION=v0.3.0
+make docker VERSION=v0.3.1
 
 # Build + push to registry
-make release VERSION=v0.3.0
+make release VERSION=v0.3.1
 ```
 
 > **Registry**: `make docker`, `make push` and `make release` need `IMAGE_REPO`, which defaults to the placeholder `YOUR_REGISTRY/spanner-etcd` and makes them stop with a message. Put your registry in an untracked `Makefile.local` (`IMAGE_REPO ?= your-registry/path/spanner-etcd`) or pass `IMAGE_REPO=...` on the command line. `make push` logs in to the host part of `IMAGE_REPO` with a `gcloud` access token, so it expects a Google Artifact Registry host.
@@ -90,8 +90,8 @@ Actions are pinned by commit SHA (the `# vX.Y.Z` comment names the version) and 
 ## Releasing
 
 1. Move the entries under `## Unreleased` in `CHANGELOG.md` to a new `## vX.Y.Z - date` section, and bump `version` and `appVersion` (with the `v` prefix) in `helm/spanner-etcd/Chart.yaml`. Both go through a pull request like any other change.
-2. Optionally try a release candidate first: push a tag with a suffix, for example `v0.3.0-rc.1`. The release workflow runs the whole `test` job, then builds and publishes the image for `linux/amd64` and `linux/arm64`, the binaries and a GitHub release. A suffixed tag is treated as a pre-release: its image is tagged with the tag only (`:latest` is not moved) and the GitHub release is marked as a pre-release.
-3. Push the final tag, for example `v0.3.0`. The same workflow publishes it, moves `:latest` and marks the GitHub release as the latest one. The release notes are the section of the CHANGELOG whose heading starts with the tag.
+2. Optionally try a release candidate first: push a tag with a suffix, for example `v0.3.1-rc.1`. The release workflow runs the whole `test` job, then builds and publishes the image for `linux/amd64` and `linux/arm64`, the binaries and a GitHub release. A suffixed tag is treated as a pre-release: its image is tagged with the tag only (`:latest` is not moved) and the GitHub release is marked as a pre-release.
+3. Push the final tag, for example `v0.3.1`. The same workflow publishes it, moves `:latest` and marks the GitHub release as the latest one. The release notes are the section of the CHANGELOG whose heading starts with the tag.
 
 Nothing is published unless the `test` job passes. The release workflow runs only on tags, so no pull request exercises it; a release candidate is how to check changes to it.
 
