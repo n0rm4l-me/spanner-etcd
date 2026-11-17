@@ -65,6 +65,18 @@ func newTestStoreWithConfig(t *testing.T, ctx context.Context, cfg store.StoreCo
 // restart, against one database.
 func newTestDB(t *testing.T) string {
 	t.Helper()
+	dbPath, adminClient := newEmptyTestDB(t)
+	if err := schema.Ensure(context.Background(), adminClient, dbPath, zap.NewNop()); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
+	return dbPath
+}
+
+// newEmptyTestDB creates a database with no tables at all and returns its path
+// together with an admin client for it, for tests that run the schema setup
+// themselves. The database is dropped when t.Cleanup runs.
+func newEmptyTestDB(t *testing.T) (string, *database.DatabaseAdminClient) {
+	t.Helper()
 
 	ctx := context.Background()
 	parent := fmt.Sprintf("projects/%s/instances/%s", testProject, testInstance)
@@ -110,11 +122,7 @@ func newTestDB(t *testing.T) string {
 	if _, err := createOp.Wait(ctx); err != nil {
 		t.Fatalf("wait create database: %v", err)
 	}
-
-	if err := schema.Ensure(ctx, adminClient, dbPath, zap.NewNop()); err != nil {
-		t.Fatalf("ensure schema: %v", err)
-	}
-	return dbPath
+	return dbPath, adminClient
 }
 
 // openStore opens an independent Store (its own Spanner client, watcher and

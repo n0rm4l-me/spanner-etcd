@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Replicas started together on an empty database crashed.** Every replica applies the schema at startup, and Spanner rejects a schema change while another one is in progress (`FailedPrecondition: ... a concurrent schema change operation ... is already in progress`). The replicas that lost the race exited with a fatal error and relied on the orchestrator restarting them, which is what a first rollout of several replicas on a new database (or an upgrade that adds a column while replicas start together) hit. The schema statements are idempotent, so a replica that is rejected now waits and tries again (0.5 s, doubling up to 5 s, for at most 5 minutes) and comes up once the other has finished. Found by starting two replicas of the published `v0.3.0-rc.2` image on an empty database; reproduced on the emulator only, it is not known whether a real instance rejects concurrent schema changes the same way.
+
 ## v0.3.0 - 2026-11-17
 
 The first release since v0.2.0. It fixes data-loss and correctness bugs found in a systematic review, makes Watch and leases work correctly with more than one replica, and clears 24 vulnerabilities that the code actually reached. Read the upgrade notes below before rolling out, in particular the one about the schema.

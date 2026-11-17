@@ -26,6 +26,7 @@ package schema
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/spanner"
@@ -116,7 +117,23 @@ var statements = []string{
 	) PRIMARY KEY (replica_id, partition_token)`,
 }
 
+// Pauses between attempts to apply the schema while another replica is changing
+// it, and how long to keep trying. The first schema change of a new database
+// (tables, indexes, the Change Stream) can take a minute or two on a real
+// instance, and the replicas that lost the race wait for it.
+const (
+	ensureRetryMin    = 500 * time.Millisecond
+	ensureRetryMax    = 5 * time.Second
+	ensureRetryWindow = 5 * time.Minute
+)
+
 // Ensure creates or updates the schema.
+//
+// Replicas of a new deployment start together and all call this. Spanner
+// rejects a schema change while another one is in progress, so the replicas
+// that lose the race retry: the statements are idempotent, and once the winner
+// has finished the retry changes nothing.
+//
 // Note: CREATE INDEX IF NOT EXISTS does not update an existing index definition.
 // Upgrading an existing database requires manually dropping and recreating
 // kv_key_rev (to add STORING) and dropping the obsolete kv_rev_idx if present.
@@ -124,6 +141,31 @@ var statements = []string{
 func Ensure(ctx context.Context, adminClient *database.DatabaseAdminClient, dbPath string, log *zap.Logger) error {
 	log.Info("ensuring schema", zap.String("database", dbPath))
 
+	deadline := time.Now().Add(ensureRetryWindow)
+	delay := ensureRetryMin
+	for {
+		err := ensureOnce(ctx, adminClient, dbPath, log)
+		if err == nil {
+			return nil
+		}
+		if !isConcurrentSchemaChange(err) || time.Now().Add(delay).After(deadline) {
+			return err
+		}
+		log.Warn("another schema change is in progress, retrying",
+			zap.Error(err), zap.Duration("retry_in", delay))
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return fmt.Errorf("%w (while waiting to retry: %v)", err, ctx.Err())
+		}
+		if delay *= 2; delay > ensureRetryMax {
+			delay = ensureRetryMax
+		}
+	}
+}
+
+// ensureOnce applies the schema statements once and waits for the result.
+func ensureOnce(ctx context.Context, adminClient *database.DatabaseAdminClient, dbPath string, log *zap.Logger) error {
 	op, err := adminClient.UpdateDatabaseDdl(ctx, &databasepb.UpdateDatabaseDdlRequest{
 		Database:   dbPath,
 		Statements: statements,
@@ -147,6 +189,24 @@ func Ensure(ctx context.Context, adminClient *database.DatabaseAdminClient, dbPa
 
 	log.Info("schema up to date")
 	return nil
+}
+
+// isConcurrentSchemaChange reports whether err means that another schema change
+// or transaction is in progress, which goes away by itself: Aborted, or
+// FailedPrecondition with "concurrent" in the message. Other
+// FailedPrecondition errors are real and are not retried.
+func isConcurrentSchemaChange(err error) bool {
+	s, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	switch s.Code() {
+	case codes.Aborted:
+		return true
+	case codes.FailedPrecondition:
+		return strings.Contains(strings.ToLower(s.Message()), "concurrent")
+	}
+	return false
 }
 
 func isPermissionDenied(err error) bool {
