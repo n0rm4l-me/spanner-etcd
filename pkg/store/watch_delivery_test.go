@@ -22,9 +22,9 @@ import (
 // to become the primary event source, because duplicates can come from the
 // overlap of the two delivery paths.
 //
-// The emulator has no Change Streams, so there it only exercises the poll path
-// and runs briefly. Against a real instance (SPANNER_ETCD_TEST_INSTANCE) it
-// runs long enough to cover the slow poll interval.
+// On the emulator it runs briefly. Against a real instance
+// (SPANNER_ETCD_TEST_INSTANCE) it runs long enough to cover the slow poll
+// interval.
 func TestWatch_LiveEventsDeliveredExactlyOnceInOrder(t *testing.T) {
 	gap, listen := 2*time.Second, 6*time.Second
 	if realInstance() != "" {

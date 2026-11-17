@@ -182,9 +182,9 @@ Auth tokens are stored in memory. A client that connected to replica-1 and switc
 
 With 10,000+ watchers and 1,000 writes/sec, the synchronous `dispatchEvents` becomes a goroutine scheduling bottleneck. Mitigation: add more replicas — each handles an independent subset of Watch connections.
 
-### Change Streams not supported on Spanner emulator
+### When the Change Stream is unavailable
 
-The emulator does not support the `READ_kv_changes` TVF. spanner-etcd then relies on the 1-second poll alone: an event from a write made through another replica reaches a watcher within about a second, while a write served by the same replica wakes its watcher immediately. On a real instance the same event arrives in tens of milliseconds when the Change Stream is in its fast mode and within about a second otherwise. Measured end to end (write call to event at the subscriber, through a different replica, from a laptop over the WAN to `asia-northeast1`, 5 events per run, including the write itself): one run gave a median of 102 ms (max 207 ms), other runs on the same instance a median of about 0.7 s (max 1.5 s).
+If `READ_kv_changes` cannot be read (the stream is missing from a schema managed outside spanner-etcd, a transient Spanner error, or a start within a second of the stream being created), spanner-etcd relies on the 1-second poll alone and retries the stream after 2 s, 4 s and so on up to once a minute; the log says "change stream unavailable, using poll fallback and retrying" and `spanner_etcd_change_stream_active` stays 0 until it attaches. Recent emulator releases do serve the stream; an older one may not, and then the poll is all there is. With the poll alone, an event from a write made through another replica reaches a watcher within about a second, while a write served by the same replica wakes its watcher immediately. On a real instance the same event arrives in tens of milliseconds when the Change Stream is in its fast mode and within about a second otherwise. Measured end to end (write call to event at the subscriber, through a different replica, from a laptop over the WAN to `asia-northeast1`, 5 events per run, including the write itself): one run gave a median of 102 ms (max 207 ms), other runs on the same instance a median of about 0.7 s (max 1.5 s).
 
 ### Range reads
 
