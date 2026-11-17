@@ -46,11 +46,11 @@ go run -race ./cmd/server/ \
 
 ### Test coverage
 
-125 integration tests against the Spanner emulator (the count is of `Test` functions in `pkg/`; refresh it with `grep -h '^func Test' pkg/*/*_test.go | wc -l` whenever tests are added or removed).
+126 integration tests against the Spanner emulator (the count is of `Test` functions in `pkg/`; refresh it with `grep -h '^func Test' pkg/*/*_test.go | wc -l` whenever tests are added or removed).
 
 | Package | Tests | What's covered |
 |---------|-------|----------------|
-| `pkg/store` | 71 | Create/Put/Get/Update/Delete/List/Count/After/Compact/Watch/Lease/Lease+Watch/AutoCompact/ErrCompacted, Watch exactly-once and in-order delivery, exact ranges (`PrefixEnd`, non-ASCII, historical, single-key watch, continuation keys ending in NUL), Change Stream events as hints only, remote-write latency, multi-replica leases (keepalive on another replica, restart, owner death), legacy `kv_lease` rows, schema upgrade, writes to dead leases (Put/Create/Update/Txn, race with Revoke), compaction (deleted keys removed completely, newest tombstone kept so the revision never moves back, compaction lease, stale cursor cleanup) |
+| `pkg/store` | 72 | Create/Put/Get/Update/Delete/List/Count/After/Compact/Watch/Lease/Lease+Watch/AutoCompact/ErrCompacted, Watch exactly-once and in-order delivery, exact ranges (`PrefixEnd`, non-ASCII, historical, single-key watch, continuation keys ending in NUL), Change Stream events as hints only, the Change Stream attaching on a fresh database (start retry), remote-write latency, multi-replica leases (keepalive on another replica, restart, owner death), legacy `kv_lease` rows, schema upgrade, writes to dead leases (Put/Create/Update/Txn, race with Revoke), compaction (deleted keys removed completely, newest tombstone kept so the revision never moves back, compaction lease, stale cursor cleanup) |
 | `pkg/server` | 51 + 3 auth | Full gRPC stack, exact ranges (sibling prefixes, wildcards, limit/More paging, sorting, DeleteRange, Watch), Put (concurrent, PrevKv, lease-not-found and re-grant), `Server.Addr` against `Serve` (race detector), Txn atomic/non-atomic/concurrent, Watch cancel/fanout/replay-pagination, graceful shutdown, auth token expiry, LeaseTimeToLive, IgnoreValue/IgnoreLease, range delete boundary |
 
 Unit tests that need no Spanner: `cmd/server` (flag and environment parsing and validation) and the pure `PrefixEnd`/`InRange` tests in `pkg/store`.
@@ -61,9 +61,10 @@ run with no emulator proves nothing. Check for skips with
 
 ### Running against a real Spanner instance
 
-The emulator differs from production Spanner in SQL dialect details and has no
-Change Streams. The `pkg/store` and `pkg/server` tests can run against a real
-instance:
+The emulator differs from production Spanner in SQL dialect details, and its
+Change Stream is not a substitute for the real one (for example, the hint
+latency measured on a real instance does not carry over). The `pkg/store` and
+`pkg/server` tests can run against a real instance:
 
 ```bash
 SPANNER_ETCD_TEST_INSTANCE=projects/PROJECT/instances/INSTANCE \

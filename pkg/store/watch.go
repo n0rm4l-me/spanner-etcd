@@ -17,8 +17,8 @@
 //     the hint arrives either within ~15 ms of the commit or about one heartbeat
 //     interval (2 s) later, and which of the two you get is not predictable.
 //   - A timer wakes it every second. It is the guaranteed upper bound on
-//     delivery latency, the safety net for lost hints, and the only mechanism on
-//     the emulator, which has no Change Streams. It never slows down: a slower
+//     delivery latency, the safety net for lost hints, and the only mechanism
+//     while the Change Stream is unavailable. It never slows down: a slower
 //     timer would turn a slow Change Stream into slow watchers.
 //
 // Delivering Change Stream events directly would add a second path: they arrive
@@ -104,10 +104,9 @@ func newWatcher(ctx context.Context, store *Store, log *zap.Logger) *Watcher {
 	// Always start poll loop — acts as fallback / transition safety net.
 	go w.pollLoop(ctx)
 
-	// Attempt to start Change Stream reader.
-	// If the Spanner backend doesn't support Change Streams (e.g. emulator),
-	// startChangeStream logs a warning and returns silently, leaving the poll
-	// loop as the sole event source.
+	// Start the Change Stream reader. While the stream is unavailable
+	// startChangeStream logs a warning and keeps retrying, and the poll loop is
+	// the sole event source.
 	go w.startChangeStream(ctx)
 
 	return w
@@ -395,24 +394,57 @@ func (w *Watcher) doPoll(ctx context.Context, lastRev int64, source string) int6
 
 // ── Change Stream ──────────────────────────────────────────────────────────────
 
-// startChangeStream starts the ChangeStreamReader. If the backend does not
-// support Change Streams (emulator, missing DDL) it logs and returns silently,
-// leaving the poll loop as the only event source.
+// Pauses between attempts to start the Change Stream reader. The first attempt
+// can fail for a reason that goes away on its own (see the retry loop), so the
+// first pause is short; a stream that stays unavailable is retried once a
+// minute at most.
+const (
+	csRetryMin = 2 * time.Second
+	csRetryMax = time.Minute
+)
+
+// startChangeStream runs the ChangeStreamReader until ctx is done. While the
+// stream is unavailable (missing DDL, a transient Spanner error, or a start
+// right after the stream was created) the poll loop is the only event source,
+// and the reader is started again after a growing pause.
+//
+// Giving up after the first failure used to leave the replica on the poll loop
+// until its pod restarted: on a fresh database the reader asked for records
+// from one second before "now", which is before the stream existed, and Spanner
+// refused with OutOfRange.
 func (w *Watcher) startChangeStream(ctx context.Context) {
 	// Unique replica ID derived from the store pointer — stable within a process.
 	replicaID := fmt.Sprintf("replica-%p", w.store)
 
-	reader := NewChangeStreamReader(
-		w.store.client,
-		replicaID,
-		w.dispatchFromCS, // turns events into poll-loop wakeups
-		w.log,
-	)
-	// The reader reports every record it reads, which feeds the
-	// change_stream_active metric (see csFresh).
-	reader.activity = &w.csActivity
+	delay := csRetryMin
+	for {
+		// A reader can be started only once, so every attempt gets a new one.
+		reader := NewChangeStreamReader(
+			w.store.client,
+			replicaID,
+			w.dispatchFromCS, // turns events into poll-loop wakeups
+			w.log,
+		)
+		// The reader reports every record it reads, which feeds the
+		// change_stream_active metric (see csFresh).
+		reader.activity = &w.csActivity
 
-	if err := reader.Start(ctx); err != nil {
-		w.log.Warn("change stream unavailable, using poll fallback", zap.Error(err))
+		err := reader.Start(ctx)
+		if err == nil || ctx.Err() != nil {
+			return // stopped on purpose
+		}
+		w.log.Warn("change stream unavailable, using poll fallback and retrying",
+			zap.Error(err), zap.Duration("retry_in", delay))
+
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return
+		case <-w.stopCh:
+			return
+		}
+		if delay *= 2; delay > csRetryMax {
+			delay = csRetryMax
+		}
 	}
 }
