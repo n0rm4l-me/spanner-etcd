@@ -5,6 +5,7 @@
 #  - Major updates stay separate, so each gets a deliberate look.
 #  - The etcd api and client modules always move together; api 3.7 does not
 #    compile against client 3.6.
+#  - The Google Cloud client libraries are a group of their own (see below).
 #  - A new release waits a week before it is proposed. Security updates ignore
 #    this delay.
 #  - The Go image stays on the Go version declared in go.mod; move both by hand
@@ -32,6 +33,18 @@ updates:
     groups:
       etcd:
         patterns: ["go.etcd.io/etcd/*"]
+      # Authentication and transport of the real Spanner connection. The
+      # emulator-based CI cannot exercise them, so these updates get their own
+      # pull request and are merged only after the real-Spanner test run
+      # described in docs/development.md. A dependency goes to the first group
+      # it matches, so this one must stay above go-minor-and-patch.
+      google-cloud:
+        patterns:
+          - "cloud.google.com/go*"
+          - "google.golang.org/api"
+          - "google.golang.org/grpc"
+          - "google.golang.org/genproto*"
+        update-types: [minor, patch]
       go-minor-and-patch:
         update-types: [minor, patch]
         exclude-patterns: ["go.etcd.io/etcd/*"]
